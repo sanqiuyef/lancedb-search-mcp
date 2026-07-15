@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "lancedb-search": {
+      "description": "LanceDB knowledge search and content graph tools",
+      "command": "python",
+      "args": [
+        "-X",
+        "utf8",
+        "D:\\path\\to\\lancedb-search-mcp\\server.py"
+      ],
+      "env": {
+        "SILICONFLOW_API_KEY": "replace-with-an-environment-specific-secret",
+        "EMBEDDING_BACKEND": "siliconflow",
+        "RERANKER_BACKEND": "siliconflow",
+        "LANCEDB_OCR": "1",
+        "TESSERACT_CMD": "D:\\path\\to\\tesseract.exe",
+        "LANCEDB_OCR_LANG": "chi_sim+eng",
+        "HF_HOME": "D:\\huggingface",
+        "HF_HUB_CACHE": "D:\\huggingface\\hub",
+        "KMP_DUPLICATE_LIB_OK": "TRUE"
+      }
+    }
+  }
+}
