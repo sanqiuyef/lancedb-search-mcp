@@ -1,0 +1,16 @@
+{
+  "knowledge_bases": {
+    "global": {
+      "path": "D:\\knowledge\\global",
+      "description": "Shared knowledge base"
+    },
+    "project-example": {
+      "path": "D:\\workspace\\example\\.reasonix\\knowledge",
+      "description": "Example project knowledge base",
+      "source_roots": [
+        "D:\\workspace\\example"
+      ]
+    }
+  },
+  "default": "global"
+}

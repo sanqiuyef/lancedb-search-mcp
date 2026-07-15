@@ -1,0 +1,11 @@
+pyinstaller==6.21.0
+PySide6==6.11.1
+lancedb==0.34.0
+numpy
+pyarrow
+requests
+mcp
+pywin32
+python-docx
+beautifulsoup4
+watchdog

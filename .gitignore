@@ -1,0 +1,40 @@
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+.mcp.json
+kb-config.json
+
+# Local databases, knowledge stores, and runtime state
+*.sqlite3
+*.sqlite3-*
+*.lance/
+knowledge/
+lancedb_data/
+*.log
+*.pid
+
+# Python environments and caches
+.venv/
+venv/
+.build-venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output (keep controlled PyInstaller specs)
+dist/
+build/*
+!build/*.spec
+
+# Generated document-processing output
+*.mineru-split-manifest.json
+
+# Editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
