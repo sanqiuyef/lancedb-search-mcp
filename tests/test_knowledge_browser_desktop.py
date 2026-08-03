@@ -5,12 +5,31 @@ import tempfile
 import time
 import unittest
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
-from knowledge_graph_desktop import ALL_BASES_SCOPE, ContentEdgeItem, KnowledgeBrowserWindow
+from knowledge_graph_desktop import (
+    ALL_BASES_SCOPE,
+    ContentEdgeItem,
+    ContentNodeItem,
+    KnowledgeBrowserWindow,
+    UNCATEGORIZED_FILTER,
+    advance_force_layout,
+    document_category_label,
+    translate_to_chinese,
+)
+
+
+class TranslationResponse:
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"choices": [{"message": {"content": "该论文评估了 CNN-LSTM。"}}]}
 
 
 class MiniExtractor:
@@ -67,6 +86,44 @@ class DesktopAsyncTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_category_labels_explain_stored_metadata(self):
+        self.assertEqual("论文 (paper)", document_category_label("paper"))
+        self.assertEqual("API/接口资料 (api)", document_category_label("api"))
+        self.assertIn("路径未命中", document_category_label(""))
+
+    def test_force_layout_frame_moves_nodes_without_invalid_values(self):
+        positions = np.asarray([[0.0, 0.0], [220.0, 0.0], [0.0, 180.0]])
+        pairs = np.asarray([[0, 1], [0, 2]], dtype=np.int64)
+        moved, velocity = advance_force_layout(
+            positions, pairs, np.zeros_like(positions), ideal=95.0, temperature=12.0
+        )
+
+        self.assertEqual(positions.shape, moved.shape)
+        self.assertTrue(np.isfinite(moved).all())
+        self.assertTrue(np.isfinite(velocity).all())
+        self.assertFalse(np.allclose(positions, moved))
+
+    def test_translation_uses_openai_compatible_api_without_thinking(self):
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            return TranslationResponse()
+
+        translated = translate_to_chinese(
+            "The paper evaluates CNN-LSTM.",
+            {
+                "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+                "model": "Qwen/Qwen3-8B",
+                "api_key": "test-secret",
+            },
+            post=post,
+        )
+
+        self.assertEqual("该论文评估了 CNN-LSTM。", translated)
+        self.assertFalse(calls[0][1]["json"]["enable_thinking"])
+        self.assertEqual("Bearer test-secret", calls[0][1]["headers"]["Authorization"])
+
     def test_document_chunks_complete_and_full_text_is_lazy(self):
         relation_path = temporary_db_path()
         content_graph_path = temporary_db_path()
@@ -78,6 +135,12 @@ class DesktopAsyncTests(unittest.TestCase):
                 lambda: window.current_base() == "project-小论文（北松区）"
                 and any("Hybrid CNN-LSTM" in item["source"] for item in window.visible_documents)
             ))
+            uncategorized_index = window.category_filter.findData(UNCATEGORIZED_FILTER)
+            self.assertGreaterEqual(uncategorized_index, 0)
+            window.category_filter.setCurrentIndex(uncategorized_index)
+            self.assertTrue(window.visible_documents)
+            self.assertTrue(all(not item["category"] for item in window.visible_documents))
+            window.category_filter.setCurrentIndex(0)
             row = next(index for index, item in enumerate(window.visible_documents)
                        if "Hybrid CNN-LSTM" in item["source"])
             started = time.perf_counter()
@@ -125,7 +188,11 @@ class DesktopAsyncTests(unittest.TestCase):
             window.graph_scope.setCurrentIndex(window.graph_scope.findData(ALL_BASES_SCOPE))
             window.main_tabs.setCurrentIndex(1)
             self.assertTrue(wait_until(lambda: window.graph_loaded_for == ALL_BASES_SCOPE, 10_000))
-            self.assertEqual(134, len(window.graph["nodes"]))
+            expected_documents = sum(
+                window.data.list_documents(base["name"])["total_documents"]
+                for base in window.data.bases
+            )
+            self.assertEqual(expected_documents, len(window.graph["nodes"]))
             self.assertEqual(
                 {"project-通用", "project-小论文（北松区）", "project-BIMbase"},
                 set(window.graph["knowledge_bases"]),
@@ -180,6 +247,14 @@ class DesktopAsyncTests(unittest.TestCase):
             self.assertTrue({"document", "chunk", "method", "claim"}.issubset(
                 {node["kind"] for node in window.content_graph["nodes"]}
             ))
+            claim_item = next(
+                item for item in window.content_graph_scene.items()
+                if isinstance(item, ContentNodeItem) and item.node["kind"] == "claim"
+            )
+            claim_item.setSelected(True)
+            self.assertIn("观点/结论 (claim)", window.content_graph_detail.toPlainText())
+            self.assertTrue(window.content_translate_button.isEnabled())
+            claim_item.setSelected(False)
             edge_item = next(
                 item for item in window.content_graph_scene.items()
                 if isinstance(item, ContentEdgeItem) and item.edge["relation_type"] == "asserts"

@@ -1,0 +1,14 @@
+# Minimal isolated runtime for the LanceDB Search MCP service.
+# Optional local embedding, MinerU and desktop-packaging dependencies stay out
+# of this environment so unrelated global packages cannot break the server.
+mcp>=1.27.0,<2
+lancedb==0.34.0
+pylance
+numpy
+pyarrow
+requests
+PyMuPDF
+python-docx
+beautifulsoup4
+watchdog
+pandas

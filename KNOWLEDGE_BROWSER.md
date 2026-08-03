@@ -10,17 +10,29 @@
 ## 使用
 
 1. 源码运行：`python -X utf8 knowledge_graph_desktop.py`。
-2. 左侧选择知识库，用文件名、类别和扩展名过滤。
+2. 左侧选择知识库，用文件名、类别和扩展名过滤。“类别”是入库时按来源路径写入的用途标签，不是文件格式；`paper` 表示论文、`api` 表示 API/接口资料，路径未命中规则时显示“未分类”。
 3. 中间的“全文”按 `chunk_index` 拼接；“Chunk”页可上下切换、复制和定位。
 4. 顶部搜索可选 Vector/Text/Hybrid 和 Reranker。右侧保留向量排名、距离、FTS 排名、RRF、类别提升、重排和最终排名。
 5. Reranker 超时或失败时，界面和 MCP 都会显示“已回退”，结果按召回顺序继续可用。
 6. “人工关系”支持 `related` / `supports` / `contradicts` / `depends_on` / `supersedes`，可选绑定当前 Chunk 作为证据。
 7. “文档关系图（旧）”只在打开标签时读取向量，保留用于查看文件平均向量关系和回滚。
-8. “内容图谱（实体/观点）”针对当前文件按需构建 Document、Chunk、Entity、Method、Claim、Topic 和 Dataset 节点；点击关系可查看证据并跳回具体 Chunk。
+8. “内容图谱（实体/观点）”针对当前文件按需构建文件、原文分块、实体、方法、观点、主题和数据集节点；点击节点会聚焦一跳邻域，点击关系可查看证据并跳回具体 Chunk。
 
 ## 内容图谱
 
 内容图谱使用内容 Hash 作为文档身份，来源路径单独记录。同一内容移动位置后会复用已有抽取；同一路径内容变化时会原子切换到新文档。切换 Embedding 模型不会删除实体、观点、证据关系或人工关系。
+
+图谱默认启用类似 Obsidian 的力导向物理动画：节点互相排斥，关系边作为弹簧拉住相连节点。动画约运行数秒后自动稳定，避免长期占用 CPU；可关闭“物理动画”、拖动任意节点，或点击“重新运动”再次布局。选中节点时会脉冲高亮当前节点和一跳邻域，同时淡化无关节点。当前机器针对 249 节点、1056 条关系的离屏基准约为 9.11 ms/帧，低于 45 ms 的刷新间隔。
+
+节点类别含义：
+
+- `document`：当前文件；
+- `chunk`：原文切分后的文本块，右侧“内容/说明”就是保存的原文预览；
+- `entity`：人名、机构、地点、技术术语或领域概念；
+- `method`：模型、算法、框架、网络或研究方法；
+- `claim`：文档提出的观点、结果、发现或结论；
+- `topic`：概括多个内容节点的主题；
+- `dataset`：数据集、样本或数据来源。
 
 默认使用不联网的 `heuristic-v2` 抽取器，适合零成本预览结构，但结果会标记为“待模型或人工确认”。正式抽取可连接任意 OpenAI-compatible Chat Completions 接口：
 
@@ -34,6 +46,18 @@ $env:CONTENT_GRAPH_BATCH_CHARS = "16000"
 ```
 
 只有主动点击“构建/增量更新当前文件”或调用构建 MCP 工具时才会调用模型。读取、搜索和打开图谱不会产生模型费用。
+
+### 节点中文翻译
+
+右侧详情中的“AI翻译为中文（联网）”只发送当前选中节点的标题、说明，或当前关系的备注和证据预览；不发送整库、向量或 API Key。首次点击会显示联网确认，翻译在后台线程中进行，切换节点后旧结果不会覆盖新选择。译文只缓存在当前程序内存中，不写回 LanceDB、内容图谱数据库或源文件。
+
+配置优先级为 `CONTENT_GRAPH_TRANSLATE_*`、`CONTENT_GRAPH_LLM_*`、`SILICONFLOW_API_KEY`。本机 `.mcp.json` 已配置 `SILICONFLOW_API_KEY` 时，程序也可在不显示密钥的情况下复用；默认使用硅基流动 Chat Completions 与 `Qwen/Qwen3-8B`。也可以显式覆盖：
+
+```powershell
+$env:CONTENT_GRAPH_TRANSLATE_URL = "https://api.siliconflow.cn/v1/chat/completions"
+$env:CONTENT_GRAPH_TRANSLATE_MODEL = "Qwen/Qwen3-8B"
+$env:CONTENT_GRAPH_TRANSLATE_API_KEY = "从环境变量提供，不写入仓库"
+```
 
 新增 MCP 工具：
 

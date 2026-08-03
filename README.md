@@ -10,6 +10,7 @@
 - 文档级语义关系图，以及带 Chunk 证据的实体、方法、观点和主题图谱；
 - 独立 SQLite 侧车库存储人工关系与内容图谱，不修改 LanceDB 向量和源文件；
 - MinerU 超过 200 页 PDF 的本地拆分与页码偏移清单。
+- Chunk 文本资产与可切换 Embedding generation：换 Embedding 不再需要源 PDF/Word，Reranker 可独立替换。
 
 详细使用说明见 [KNOWLEDGE_BROWSER.md](KNOWLEDGE_BROWSER.md)。
 
@@ -50,6 +51,24 @@ python -X utf8 server.py
 ```powershell
 python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
+
+## 可恢复知识资产与 Embedding 迁移
+
+`my_docs` 仍是兼容旧 MCP 与浏览器的活动检索表；入库时会同步保存独立的
+Chunk 文本资产。向量只是从这些资产派生出来的 generation。
+
+1. 先用 `verify_knowledge_assets` 检查 Chunk 资产完整性。
+2. 修改 Embedding 配置后调用 `rebuild_knowledge`。它从持久化 Chunk 重建新
+   generation，成功校验前不会删除活动索引。
+3. 用 `list_embedding_generations` 查看新旧模型，必要时调用
+   `switch_embedding_generation` 回滚。若库在旧 generation 之后新增了文本，
+   系统会拒绝切换，以免遗漏新文档；应先对该模型重新构建。
+4. 定期用 `export_knowledge_assets` 导出 ZIP；源文件遗失或数据库重建时，先用
+   `restore_knowledge_assets` 导入，再调用 `rebuild_knowledge`。
+
+资产包包含完整 Chunk 原文、来源、类别、顺序与哈希，不包含向量或原始二进制
+文件。因此它可以跨 Embedding/Reranker 和向量模型维度迁移，但不能还原 PDF 的
+版式、图片或附件。
 
 ## 打包
 

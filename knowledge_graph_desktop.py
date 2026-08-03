@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QGraphicsEllipseItem,
+    QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsPolygonItem,
     QGraphicsScene,
@@ -102,6 +103,54 @@ CONTENT_NODE_COLORS = {
     "topic": "#0891b2",
     "dataset": "#db2777",
 }
+DOCUMENT_CATEGORY_LABELS = {
+    "paper": "论文",
+    "code": "代码",
+    "manual": "手册",
+    "documentation": "说明文档",
+    "note": "笔记",
+    "tutorial": "教程",
+    "api": "API/接口资料",
+}
+CONTENT_NODE_LABELS = {
+    "document": "文件",
+    "chunk": "原文分块",
+    "entity": "实体/术语",
+    "claim": "观点/结论",
+    "method": "方法/模型",
+    "topic": "主题",
+    "dataset": "数据集",
+}
+CONTENT_NODE_HELP = {
+    "document": "当前入库文件，是整张内容图谱的根节点。",
+    "chunk": "原文被切分后的文本块；右侧说明就是该块保存的原文预览。",
+    "entity": "从原文识别出的人名、机构、地点、技术名词或领域概念。",
+    "claim": "论文或文档中提出的观点、发现、结果或结论。",
+    "method": "模型、算法、框架、网络或其他研究方法。",
+    "topic": "用于概括多个内容节点的主题概念。",
+    "dataset": "文档中提到或使用的数据集、样本或数据来源。",
+}
+CONTENT_EDGE_LABELS = {
+    "contains": "包含",
+    "mentions": "提及",
+    "asserts": "提出观点",
+    "about": "关于",
+    "uses": "使用",
+    "supports": "支持",
+    "contradicts": "冲突",
+    "depends_on": "依赖",
+    "supersedes": "替代",
+    "similar_to": "相似",
+    "belongs_to": "属于",
+    "evolves": "演化为",
+}
+CONTENT_ORIGIN_LABELS = {
+    "heuristic": "离线规则抽取",
+    "llm": "模型抽取",
+    "model": "模型抽取",
+    "manual": "人工创建",
+}
+UNCATEGORIZED_FILTER = "__uncategorized__"
 CONTENT_EDGE_COLORS = {
     "contains": "#cbd5e1",
     "mentions": "#a78bfa",
@@ -117,6 +166,104 @@ CONTENT_EDGE_COLORS = {
     "evolves": "#0f766e",
 }
 _FAULT_LOG_STREAM = None
+
+
+def document_category_label(category: str) -> str:
+    category = (category or "").strip()
+    if not category:
+        return "未分类（路径未命中分类规则）"
+    return f"{DOCUMENT_CATEGORY_LABELS.get(category, category)} ({category})"
+
+
+def content_node_label(kind: str) -> str:
+    kind = (kind or "").strip()
+    return f"{CONTENT_NODE_LABELS.get(kind, kind or '未知')} ({kind or 'unknown'})"
+
+
+def content_edge_label(relation: str) -> str:
+    relation = (relation or "").strip()
+    return f"{CONTENT_EDGE_LABELS.get(relation, relation or '未知')} ({relation or 'unknown'})"
+
+
+def translation_settings(config_paths=()) -> dict:
+    """Resolve translation settings without exposing the API key to the UI or logs."""
+    endpoint = (
+        os.environ.get("CONTENT_GRAPH_TRANSLATE_URL", "").strip()
+        or os.environ.get("CONTENT_GRAPH_LLM_URL", "").strip()
+    )
+    model = (
+        os.environ.get("CONTENT_GRAPH_TRANSLATE_MODEL", "").strip()
+        or os.environ.get("CONTENT_GRAPH_LLM_MODEL", "").strip()
+    )
+    api_key = (
+        os.environ.get("CONTENT_GRAPH_TRANSLATE_API_KEY", "").strip()
+        or os.environ.get("CONTENT_GRAPH_LLM_API_KEY", "").strip()
+        or os.environ.get("SILICONFLOW_API_KEY", "").strip()
+    )
+    if not api_key:
+        for path in config_paths:
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                for server in payload.get("mcpServers", {}).values():
+                    local_env = server.get("env", {}) if isinstance(server, dict) else {}
+                    candidate = str(local_env.get("SILICONFLOW_API_KEY", "")).strip()
+                    if candidate:
+                        api_key = candidate
+                        break
+            except (OSError, ValueError, TypeError):
+                continue
+            if api_key:
+                break
+    if api_key and not endpoint:
+        endpoint = "https://api.siliconflow.cn/v1/chat/completions"
+    if api_key and not model:
+        model = "Qwen/Qwen3-8B"
+    return {"endpoint": endpoint, "model": model, "api_key": api_key}
+
+
+def translate_to_chinese(text: str, settings: dict, *, timeout=90, post=None) -> str:
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("没有可翻译的节点内容。")
+    endpoint = str(settings.get("endpoint", "")).strip()
+    model = str(settings.get("model", "")).strip()
+    api_key = str(settings.get("api_key", "")).strip()
+    if not endpoint or not model or not api_key:
+        raise ValueError("未配置翻译模型。请设置 CONTENT_GRAPH_TRANSLATE_* 环境变量或本机 MCP API Key。")
+    if post is None:
+        import requests
+        post = requests.post
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "将用户提供的知识图谱节点内容准确翻译成简体中文。保留模型名、人名、机构名、"
+                    "DOI、URL、数字、Chunk编号和专业缩写；不要总结、扩写或解释，只输出译文。"
+                ),
+            },
+            {"role": "user", "content": text[:6000]},
+        ],
+    }
+    if "siliconflow" in endpoint.casefold():
+        payload["enable_thinking"] = False
+    response = post(
+        endpoint,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        json=payload,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    body = response.json()
+    translated = str(body["choices"][0]["message"]["content"]).strip()
+    if not translated:
+        raise ValueError("翻译模型返回了空内容。")
+    return translated
 
 
 def append_log(message: str):
@@ -218,7 +365,7 @@ class NodeItem(QGraphicsEllipseItem):
 
 
 class ContentNodeItem(QGraphicsEllipseItem):
-    def __init__(self, node, position):
+    def __init__(self, node, position, on_interaction=None):
         radius_by_kind = {
             "document": 20, "chunk": 8, "entity": 13, "claim": 15,
             "method": 14, "topic": 17, "dataset": 14,
@@ -226,11 +373,16 @@ class ContentNodeItem(QGraphicsEllipseItem):
         radius = radius_by_kind.get(node.get("kind"), 11)
         super().__init__(-radius, -radius, radius * 2, radius * 2)
         self.node = node
+        self.edge_items = []
+        self.on_interaction = on_interaction
+        self._physics_move = False
         self.setPos(*position)
         self.setBrush(QColor(CONTENT_NODE_COLORS.get(node.get("kind"), "#64748b")))
         self.setPen(QPen(QColor("#ffffff"), 2))
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsSelectable)
-        self.setToolTip(f"{node.get('kind', '')}: {node.get('label', '')}")
+        self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsMovable)
+        self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setToolTip(f"{content_node_label(node.get('kind', ''))}: {node.get('label', '')}")
         label_text = node.get("label", "")
         if len(label_text) > 46:
             label_text = label_text[:45] + "…"
@@ -240,11 +392,38 @@ class ContentNodeItem(QGraphicsEllipseItem):
         rect = label.boundingRect()
         label.setPos(-rect.width() / 2, radius + 4)
 
+    def add_edge(self, edge_item):
+        self.edge_items.append(edge_item)
+
+    def set_physics_position(self, position):
+        self._physics_move = True
+        try:
+            self.setPos(float(position[0]), float(position[1]))
+        finally:
+            self._physics_move = False
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if (
+            change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged
+            and not self._physics_move
+        ):
+            for edge_item in self.edge_items:
+                edge_item.update_line()
+        return result
+
+    def mousePressEvent(self, event):
+        if self.on_interaction:
+            self.on_interaction()
+        super().mousePressEvent(event)
+
 
 class ContentEdgeItem(QGraphicsLineItem):
-    def __init__(self, edge, line):
-        super().__init__(line)
+    def __init__(self, edge, left, right):
+        super().__init__()
         self.edge = edge
+        self.left = left
+        self.right = right
         relation = edge.get("relation_type", "")
         color = QColor(CONTENT_EDGE_COLORS.get(relation, "#94a3b8"))
         width = 2.2 if relation in {"supports", "contradicts", "supersedes", "evolves"} else 1.2
@@ -252,9 +431,15 @@ class ContentEdgeItem(QGraphicsLineItem):
         self.setZValue(-2)
         self.setFlag(QGraphicsLineItem.GraphicsItemFlag.ItemIsSelectable)
         self.setToolTip(
-            f"{relation} · 置信度 {float(edge.get('confidence', 0)):.2f} · "
+            f"{content_edge_label(relation)} · 置信度 {float(edge.get('confidence', 0)):.2f} · "
             f"证据 Chunk #{edge.get('evidence_chunk_index')}"
         )
+        left.add_edge(self)
+        right.add_edge(self)
+        self.update_line()
+
+    def update_line(self):
+        self.setLine(QLineF(self.left.pos(), self.right.pos()))
 
 
 def force_layout(graph):
@@ -282,6 +467,31 @@ def force_layout(graph):
         magnitude = np.linalg.norm(displacement, axis=1)
         positions += displacement / np.maximum(magnitude[:, None], 1.0) * np.minimum(magnitude, temperature)[:, None]
     return positions
+
+
+def advance_force_layout(positions, pairs, velocity, ideal, temperature):
+    """Advance one vectorised force-directed frame for the interactive graph."""
+    count = len(positions)
+    if count < 2:
+        return positions.copy(), np.zeros_like(positions)
+    delta = positions[:, None, :] - positions[None, :, :]
+    distance = np.linalg.norm(delta, axis=2)
+    np.fill_diagonal(distance, 1.0)
+    displacement = ((delta / distance[:, :, None]) * (ideal ** 2 / distance)[:, :, None]).sum(axis=1)
+    if len(pairs):
+        left_indices = pairs[:, 0]
+        right_indices = pairs[:, 1]
+        vector = positions[left_indices] - positions[right_indices]
+        length = np.maximum(np.linalg.norm(vector, axis=1), 1.0)
+        movement = (vector / length[:, None]) * (length ** 2 / ideal)[:, None]
+        np.add.at(displacement, left_indices, -movement)
+        np.add.at(displacement, right_indices, movement)
+    displacement -= positions * 0.004
+    magnitude = np.linalg.norm(displacement, axis=1)
+    target = displacement / np.maximum(magnitude[:, None], 1.0)
+    target *= np.minimum(magnitude * 0.025, temperature)[:, None]
+    next_velocity = velocity * 0.62 + target * 0.38
+    return positions + next_velocity, next_velocity
 
 
 class RelationDialog(QDialog):
@@ -358,7 +568,26 @@ class KnowledgeBrowserWindow(QMainWindow):
         self.content_graph = {"nodes": [], "edges": [], "document_id": None}
         self.node_items = {}
         self.content_node_items = {}
+        self.content_edge_items = []
         self.current_content_evidence = None
+        self.content_detail_original = ""
+        self.content_translation_source = ""
+        self.content_translation_cache = {}
+        self.content_translation_generation = 0
+        self.translation_notice_accepted = False
+        self.content_focus_node_ids = set()
+        self.content_physics_positions = None
+        self.content_physics_velocity = None
+        self.content_physics_pairs = np.empty((0, 2), dtype=np.int64)
+        self.content_physics_node_ids = []
+        self.content_physics_frame = 0
+        self.content_physics_timer = QTimer(self)
+        self.content_physics_timer.setInterval(45)
+        self.content_physics_timer.timeout.connect(self._content_physics_step)
+        self.content_pulse_phase = 0.0
+        self.content_pulse_timer = QTimer(self)
+        self.content_pulse_timer.setInterval(70)
+        self.content_pulse_timer.timeout.connect(self._pulse_content_selection)
         self.pending_source_jump = None
         self.last_error = None
         self.setWindowTitle("LanceDB 知识浏览器")
@@ -460,6 +689,9 @@ class KnowledgeBrowserWindow(QMainWindow):
         left_layout.addLayout(filter_row)
         self.document_table = QTableWidget(0, 5)
         self.document_table.setHorizontalHeaderLabels(["文件", "Chunk", "类别", "类型", "原件"])
+        self.document_table.horizontalHeaderItem(2).setToolTip(
+            "类别不是文件格式，而是入库时根据来源路径自动写入的用途标签；未命中规则时显示未分类。"
+        )
         self.document_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.document_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.document_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -642,18 +874,30 @@ class KnowledgeBrowserWindow(QMainWindow):
         refresh.clicked.connect(self.load_content_graph)
         fit = QPushButton("适配当前图")
         fit.clicked.connect(lambda: self.content_graph_view.fit_graph())
+        self.content_physics_enabled = QCheckBox("物理动画")
+        self.content_physics_enabled.setChecked(True)
+        self.content_physics_enabled.setToolTip("像 Obsidian 一样使用斥力和弹簧关系自动排布；稳定后自动停止。")
+        self.content_physics_enabled.toggled.connect(self._content_physics_toggled)
+        reheat = QPushButton("重新运动")
+        reheat.setToolTip("给当前图谱重新加入少量扰动并再次运行物理布局。")
+        reheat.clicked.connect(lambda: self.start_content_graph_physics(reheat=True))
         evidence = QPushButton("定位证据Chunk")
         evidence.clicked.connect(self.locate_content_evidence)
+        category_help = QPushButton("类别说明")
+        category_help.clicked.connect(self.show_category_help)
         tools.addWidget(self.content_graph_status)
         tools.addStretch()
         tools.addWidget(build)
         tools.addWidget(refresh)
         tools.addWidget(fit)
+        tools.addWidget(self.content_physics_enabled)
+        tools.addWidget(reheat)
         tools.addWidget(evidence)
+        tools.addWidget(category_help)
         layout.addLayout(tools)
         legend = QLabel(
-            "蓝=文件 · 灰=Chunk · 紫=实体 · 绿=方法 · 橙=观点 · 青=主题 · 粉=数据集；"
-            "点击节点或连线查看详情和证据。"
+            "节点类别：蓝=文件 · 灰=原文分块 · 紫=实体/术语 · 绿=方法/模型 · "
+            "橙=观点/结论 · 青=主题 · 粉=数据集；点击节点可聚焦邻域、拖动节点并查看原文。"
         )
         legend.setStyleSheet("color:#526276")
         layout.addWidget(legend)
@@ -663,12 +907,29 @@ class KnowledgeBrowserWindow(QMainWindow):
         self.content_graph_scene.selectionChanged.connect(self.show_content_graph_selection)
         self.content_graph_view = GraphView(self.content_graph_scene)
         splitter.addWidget(self.content_graph_view)
+        detail_panel = QWidget()
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_tools = QHBoxLayout()
+        self.content_translate_button = QPushButton("AI翻译为中文（联网）")
+        self.content_translate_button.setEnabled(False)
+        self.content_translate_button.clicked.connect(self.translate_content_graph_detail)
+        self.content_original_button = QPushButton("显示原文")
+        self.content_original_button.setEnabled(False)
+        self.content_original_button.clicked.connect(self.show_content_graph_original)
+        self.content_physics_state = QLabel("物理动画：待加载")
+        self.content_physics_state.setStyleSheet("color:#64748b")
+        detail_tools.addWidget(self.content_translate_button)
+        detail_tools.addWidget(self.content_original_button)
+        detail_tools.addStretch()
+        detail_layout.addLayout(detail_tools)
+        detail_layout.addWidget(self.content_physics_state)
         self.content_graph_detail = QTextBrowser()
         self.content_graph_detail.setMinimumWidth(260)
         self.content_graph_detail.setHtml(
             "<h3>内容图谱</h3><p>图谱数据独立存储，不修改LanceDB、向量或源文件。</p>"
         )
-        splitter.addWidget(self.content_graph_detail)
+        detail_layout.addWidget(self.content_graph_detail, 1)
+        splitter.addWidget(detail_panel)
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 1)
@@ -756,7 +1017,10 @@ class KnowledgeBrowserWindow(QMainWindow):
         self.category_filter.clear()
         self.category_filter.addItem("全部类别", "")
         for category in sorted(result["categories"]):
-            self.category_filter.addItem(category, category if category != "未分类" else "")
+            raw_category = category if category != "未分类" else ""
+            self.category_filter.addItem(
+                document_category_label(raw_category), raw_category or UNCATEGORIZED_FILTER
+            )
         self.extension_filter.clear()
         self.extension_filter.addItem("全部类型", "")
         for extension in sorted(result["extensions"]):
@@ -809,13 +1073,15 @@ class KnowledgeBrowserWindow(QMainWindow):
         extension = self.extension_filter.currentData() or ""
         self.visible_documents = [document for document in self.documents
                                   if (not text or text in document["source"].casefold())
-                                  and (not category or document["category"] == category)
+                                  and (not category
+                                       or (category == UNCATEGORIZED_FILTER and not document["category"])
+                                       or document["category"] == category)
                                   and (not extension or document["extension"] == extension)]
         self.document_table.blockSignals(True)
         self.document_table.setRowCount(len(self.visible_documents))
         status_labels = {"resolved": "可打开", "ambiguous": "歧义", "missing": "缺失", "unchecked": "未检查"}
         for row, document in enumerate(self.visible_documents):
-            values = [document["source"], str(document["chunk_count"]), document["category"] or "未分类",
+            values = [document["source"], str(document["chunk_count"]), document_category_label(document["category"]),
                       document["extension"], status_labels.get(document["source_status"], document["source_status"])]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -861,14 +1127,17 @@ class KnowledgeBrowserWindow(QMainWindow):
         self.open_source_button.setEnabled(resolution["status"] in {"resolved", "ambiguous"})
         self.overview.setHtml(
             f"<h3>{document['label']}</h3><p><b>来源：</b>{document['source']}</p>"
-            f"<p><b>类别：</b>{document['category'] or '未分类'} · <b>类型：</b>{document['extension']} "
+            f"<p><b>类别：</b>{document_category_label(document['category'])} · <b>类型：</b>{document['extension']} "
             f"· <b>Chunk：</b>{len(chunks)} · <b>原件：</b>{resolution['status']}</p>"
             "<p>全文与 Chunk 直接来自 LanceDB 的 text/source/chunk_index/category，不读取向量列。</p>"
         )
         self.full_text.setPlainText("切换到“全文”标签后按需生成。")
         self.chunk_list.clear()
         for chunk in chunks:
-            self.chunk_list.addItem(f"Chunk #{chunk['chunk_index']} · {len(chunk['text'])} 字 · {chunk['category'] or '未分类'}")
+            self.chunk_list.addItem(
+                f"Chunk #{chunk['chunk_index']} · {len(chunk['text'])} 字 · "
+                f"{document_category_label(chunk['category'])}"
+            )
         if chunks:
             self.chunk_list.setCurrentRow(0)
         if self.content_tabs.currentIndex() == 1:
@@ -1293,24 +1562,31 @@ class KnowledgeBrowserWindow(QMainWindow):
         self.draw_content_graph()
 
     def _show_content_graph_empty(self, title, detail):
+        self._stop_content_graph_physics("物理动画：待加载")
         self.content_graph = {"nodes": [], "edges": [], "document_id": None}
         self.content_graph_scene.clear()
         self.content_node_items = {}
+        self.content_edge_items = []
         self.current_content_evidence = None
+        self.content_focus_node_ids = set()
         message = self.content_graph_scene.addText(f"{title}\n\n{detail}")
         message.setFont(QFont("Microsoft YaHei", 12))
         message.setDefaultTextColor(QColor("#526276"))
         message.setTextWidth(620)
         message.setPos(36, 36)
-        self.content_graph_detail.setPlainText(
-            f"{title}\n\n{detail}\n\n内容图谱独立存储，不修改 LanceDB、向量或源文件。"
+        self._set_content_graph_detail(
+            f"{title}\n\n{detail}\n\n内容图谱独立存储，不修改 LanceDB、向量或源文件。",
+            "",
         )
         QTimer.singleShot(0, self.content_graph_view.fit_graph)
 
     def draw_content_graph(self):
+        self._stop_content_graph_physics()
         self.content_graph_scene.clear()
         self.content_node_items = {}
+        self.content_edge_items = []
         self.current_content_evidence = None
+        self.content_focus_node_ids = set()
         if not self.content_graph.get("document_id"):
             self.content_graph_status.setText("当前文件尚未构建内容图谱。点击“构建/增量更新当前文件”。")
             source = self.current_document["source"] if self.current_document else "当前文件"
@@ -1323,7 +1599,7 @@ class KnowledgeBrowserWindow(QMainWindow):
         if positions is None:
             positions = force_layout(self.content_graph)
         for node, position in zip(self.content_graph["nodes"], positions):
-            item = ContentNodeItem(node, position)
+            item = ContentNodeItem(node, position, self._pause_content_physics_for_interaction)
             self.content_graph_scene.addItem(item)
             self.content_node_items[node["id"]] = item
         for edge in self.content_graph["edges"]:
@@ -1331,16 +1607,22 @@ class KnowledgeBrowserWindow(QMainWindow):
             right = self.content_node_items.get(edge["to"])
             if not left or not right:
                 continue
-            self.content_graph_scene.addItem(ContentEdgeItem(edge, QLineF(left.pos(), right.pos())))
+            edge_item = ContentEdgeItem(edge, left, right)
+            self.content_graph_scene.addItem(edge_item)
+            self.content_edge_items.append(edge_item)
         counts = {}
         for node in self.content_graph["nodes"]:
             counts[node["kind"]] = counts.get(node["kind"], 0) + 1
-        summary = " · ".join(f"{kind}:{count}" for kind, count in sorted(counts.items()))
+        summary = " · ".join(
+            f"{CONTENT_NODE_LABELS.get(kind, kind)}:{count}" for kind, count in sorted(counts.items())
+        )
         truncated = " · 已按300节点截断" if self.content_graph.get("truncated") else ""
         self.content_graph_status.setText(
             f"{len(self.content_graph['nodes'])} 个节点 · {len(self.content_graph['edges'])} 条关系 · {summary}{truncated}"
         )
         QTimer.singleShot(0, self.content_graph_view.fit_graph)
+        if self.content_physics_enabled.isChecked():
+            QTimer.singleShot(80, lambda: self.start_content_graph_physics(reheat=True))
 
     def show_content_graph_selection(self):
         selected = self.content_graph_scene.selectedItems()
@@ -1348,6 +1630,7 @@ class KnowledgeBrowserWindow(QMainWindow):
         edge_item = next((item for item in selected if isinstance(item, ContentEdgeItem)), None)
         if edge_item:
             edge = edge_item.edge
+            self._highlight_content_neighborhood({edge.get("from", ""), edge.get("to", "")})
             chunk_index = edge.get("evidence_chunk_index")
             if chunk_index is not None and self.current_document:
                 self.current_content_evidence = {
@@ -1355,19 +1638,26 @@ class KnowledgeBrowserWindow(QMainWindow):
                     "source": self.current_document["source"],
                     "chunk_index": int(chunk_index),
                 }
-            self.content_graph_detail.setPlainText(
-                f"关系：{edge.get('relation_type', '')}\n"
+            origin = edge.get("origin", "")
+            original = (
+                f"关系：{content_edge_label(edge.get('relation_type', ''))}\n"
                 f"置信度：{float(edge.get('confidence', 0)):.2f}\n"
-                f"来源：{edge.get('origin', '')}\n"
+                f"来源：{CONTENT_ORIGIN_LABELS.get(origin, origin or '未知')}\n"
                 f"证据：Chunk #{chunk_index}\n"
                 f"备注：{edge.get('note', '')}\n\n"
                 f"{edge.get('evidence_preview', '')}"
             )
+            translation_source = "\n".join(
+                value for value in (edge.get("note", ""), edge.get("evidence_preview", "")) if value
+            )
+            self._set_content_graph_detail(original, translation_source)
             return
         node_item = next((item for item in selected if isinstance(item, ContentNodeItem)), None)
         if not node_item:
+            self._highlight_content_neighborhood(set())
             return
         node = node_item.node
+        self._highlight_content_neighborhood({node.get("id", "")})
         properties = node.get("properties") or {}
         chunk_index = properties.get("chunk_index")
         if chunk_index is not None and self.current_document:
@@ -1376,11 +1666,213 @@ class KnowledgeBrowserWindow(QMainWindow):
                 "source": self.current_document["source"],
                 "chunk_index": int(chunk_index),
             }
-        self.content_graph_detail.setPlainText(
-            f"{node.get('label', '')}\n\n类型：{node.get('kind', '')}\n"
-            f"说明：{node.get('description', '')}\n"
+        original = (
+            f"{node.get('label', '')}\n\n"
+            f"节点类别：{content_node_label(node.get('kind', ''))}\n"
+            f"类别含义：{CONTENT_NODE_HELP.get(node.get('kind', ''), '未提供类别说明。')}\n"
+            f"内容/说明：{node.get('description', '')}\n"
             f"属性：{json.dumps(properties, ensure_ascii=False, indent=2)}"
         )
+        translation_source = "\n\n".join(
+            value for value in (node.get("label", ""), node.get("description", "")) if value
+        )
+        self._set_content_graph_detail(original, translation_source)
+
+    def _set_content_graph_detail(self, original, translation_source):
+        self.content_translation_generation += 1
+        self.content_detail_original = original or ""
+        self.content_translation_source = (translation_source or "").strip()
+        self.content_graph_detail.setPlainText(self.content_detail_original)
+        self.content_translate_button.setText("AI翻译为中文（联网）")
+        self.content_translate_button.setEnabled(bool(self.content_translation_source))
+        self.content_original_button.setEnabled(False)
+
+    def show_content_graph_original(self):
+        self.content_graph_detail.setPlainText(self.content_detail_original)
+        self.content_original_button.setEnabled(False)
+
+    def translate_content_graph_detail(self):
+        source = self.content_translation_source
+        if not source:
+            return
+        if not self.translation_notice_accepted:
+            answer = QMessageBox.question(
+                self,
+                "联网翻译确认",
+                "将把当前选中节点的标题、说明或证据预览发送给配置的翻译模型。\n"
+                "不会发送向量、整库内容或 API Key。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.translation_notice_accepted = True
+        cached = self.content_translation_cache.get(source)
+        if cached:
+            self._content_translation_completed(self.content_translation_generation, source, cached)
+            return
+        settings = translation_settings((
+            os.path.join(data_dir(), ".mcp.json"),
+            os.path.join(RESOURCE_DIR, ".mcp.json"),
+        ))
+        if not settings["api_key"]:
+            QMessageBox.information(
+                self,
+                "尚未配置翻译模型",
+                "没有找到可用的翻译 API Key。可设置 CONTENT_GRAPH_TRANSLATE_URL、"
+                "CONTENT_GRAPH_TRANSLATE_MODEL、CONTENT_GRAPH_TRANSLATE_API_KEY，"
+                "或在本机 .mcp.json 中保留 SILICONFLOW_API_KEY。",
+            )
+            return
+        generation = self.content_translation_generation
+        self.content_translate_button.setText("正在翻译…")
+        self.content_translate_button.setEnabled(False)
+        self._run(
+            lambda: translate_to_chinese(source, settings),
+            lambda translated: self._content_translation_completed(generation, source, translated),
+            lambda details: self._content_translation_failed(generation, details),
+        )
+
+    def _content_translation_completed(self, generation, source, translated):
+        self.content_translation_cache[source] = translated
+        if generation != self.content_translation_generation or source != self.content_translation_source:
+            return
+        self.content_graph_detail.setPlainText(f"中文翻译\n\n{translated}")
+        self.content_translate_button.setText("重新翻译")
+        self.content_translate_button.setEnabled(True)
+        self.content_original_button.setEnabled(True)
+
+    def _content_translation_failed(self, generation, details):
+        append_log(details)
+        if generation != self.content_translation_generation:
+            return
+        self.content_translate_button.setText("重试翻译")
+        self.content_translate_button.setEnabled(bool(self.content_translation_source))
+        message = details.splitlines()[-1] if details else "未知错误"
+        QMessageBox.warning(self, "翻译失败", message)
+
+    def show_category_help(self):
+        QMessageBox.information(
+            self,
+            "类别说明",
+            "文件浏览器中的“类别”是入库时根据来源路径写入的用途标签，不是 PDF、Word 这类文件格式。\n\n"
+            "paper=论文，code=代码，documentation=说明文档，manual=手册，note=笔记，"
+            "tutorial=教程，api=API/接口资料。显示“未分类”表示来源路径没有命中这些规则，"
+            "不代表文件内容有问题。\n\n"
+            "内容图谱中的“节点类别”是另一套概念：document=文件，chunk=原文分块，"
+            "entity=实体/术语，method=方法/模型，claim=观点/结论，topic=主题，dataset=数据集。",
+        )
+
+    def _content_physics_toggled(self, enabled):
+        if enabled:
+            self.start_content_graph_physics(reheat=True)
+        else:
+            self._stop_content_graph_physics("物理动画：已关闭（节点仍可手动拖动）")
+
+    def _pause_content_physics_for_interaction(self):
+        if self.content_physics_timer.isActive():
+            self._stop_content_graph_physics("物理动画：已暂停（可点击“重新运动”恢复）")
+
+    def _stop_content_graph_physics(self, message=None):
+        self.content_physics_timer.stop()
+        if message and hasattr(self, "content_physics_state"):
+            self.content_physics_state.setText(message)
+
+    def start_content_graph_physics(self, reheat=False):
+        if not hasattr(self, "content_physics_enabled") or not self.content_physics_enabled.isChecked():
+            return
+        nodes = [
+            node for node in self.content_graph.get("nodes", [])
+            if node.get("id") in self.content_node_items
+        ]
+        if len(nodes) < 2:
+            self._stop_content_graph_physics("物理动画：节点不足")
+            return
+        self.content_physics_node_ids = [node["id"] for node in nodes]
+        self.content_physics_positions = np.asarray([
+            [self.content_node_items[node_id].pos().x(), self.content_node_items[node_id].pos().y()]
+            for node_id in self.content_physics_node_ids
+        ], dtype=np.float64)
+        index_by_id = {node_id: index for index, node_id in enumerate(self.content_physics_node_ids)}
+        pairs = [
+            (index_by_id[edge["from"]], index_by_id[edge["to"]])
+            for edge in self.content_graph.get("edges", [])
+            if edge.get("from") in index_by_id and edge.get("to") in index_by_id
+        ]
+        self.content_physics_pairs = np.asarray(pairs, dtype=np.int64).reshape((-1, 2))
+        self.content_physics_velocity = np.zeros_like(self.content_physics_positions)
+        if reheat:
+            seed = sum(ord(character) for character in str(self.content_graph.get("document_id", "")))
+            rng = np.random.default_rng(seed or 20260715)
+            self.content_physics_positions += rng.normal(0, 12, self.content_physics_positions.shape)
+        self.content_physics_frame = 0
+        self.content_physics_state.setText("物理动画：运动中（点击节点可暂停）")
+        self.content_physics_timer.start()
+
+    def _content_physics_step(self):
+        positions = self.content_physics_positions
+        velocity = self.content_physics_velocity
+        if positions is None or velocity is None:
+            self._stop_content_graph_physics()
+            return
+        count = len(positions)
+        ideal = max(82.0, 900.0 / math.sqrt(count))
+        temperature = max(1.0, 13.0 * (1.0 - self.content_physics_frame / 95.0))
+        positions, velocity = advance_force_layout(
+            positions, self.content_physics_pairs, velocity, ideal, temperature
+        )
+        self.content_physics_positions = positions
+        self.content_physics_velocity = velocity
+        for index, node_id in enumerate(self.content_physics_node_ids):
+            item = self.content_node_items.get(node_id)
+            if item:
+                item.set_physics_position(positions[index])
+        for edge_item in self.content_edge_items:
+            edge_item.update_line()
+        self.content_physics_frame += 1
+        max_speed = float(np.linalg.norm(velocity, axis=1).max(initial=0.0))
+        if self.content_physics_frame >= 95 or (self.content_physics_frame >= 28 and max_speed < 0.08):
+            self.content_graph["positions"] = positions.copy()
+            self._stop_content_graph_physics("物理动画：已稳定（节点可拖动，点“重新运动”可恢复）")
+
+    def _highlight_content_neighborhood(self, selected_ids):
+        selected_ids = {node_id for node_id in selected_ids if node_id}
+        self.content_focus_node_ids = selected_ids
+        for item in self.content_node_items.values():
+            item.setScale(1.0)
+        if not selected_ids:
+            for item in self.content_node_items.values():
+                item.setOpacity(1.0)
+            for edge_item in self.content_edge_items:
+                edge_item.setOpacity(1.0)
+            self.content_pulse_timer.stop()
+            return
+        neighbours = set(selected_ids)
+        for edge in self.content_graph.get("edges", []):
+            if edge.get("from") in selected_ids:
+                neighbours.add(edge.get("to"))
+            if edge.get("to") in selected_ids:
+                neighbours.add(edge.get("from"))
+        for node_id, item in self.content_node_items.items():
+            item.setOpacity(1.0 if node_id in neighbours else 0.14)
+        for edge_item in self.content_edge_items:
+            edge = edge_item.edge
+            edge_item.setOpacity(
+                1.0 if edge.get("from") in selected_ids or edge.get("to") in selected_ids else 0.08
+            )
+        self.content_pulse_phase = 0.0
+        self.content_pulse_timer.start()
+
+    def _pulse_content_selection(self):
+        if not self.content_focus_node_ids:
+            self.content_pulse_timer.stop()
+            return
+        self.content_pulse_phase += 0.32
+        scale = 1.12 + math.sin(self.content_pulse_phase) * 0.08
+        for node_id in self.content_focus_node_ids:
+            item = self.content_node_items.get(node_id)
+            if item:
+                item.setScale(scale)
 
     def locate_content_evidence(self):
         evidence = self.current_content_evidence
