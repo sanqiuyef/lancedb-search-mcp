@@ -179,21 +179,27 @@ async def _on_roots_changed(notification: RootsListChangedNotification) -> None:
                         switch_knowledge_base(name)
                         return
 
-                # 尝试按项目名匹配
+                # 尝试按项目名匹配：项目根目录存在于 cherry-workplace 即可
+                # （知识库目录未创建时由 get_db() 惰性创建，避免新项目误落 global）
                 base = r"D:\cherry-workplace"
                 project_name = os.path.basename(root_path)
-                for candidate in [
-                    os.path.join(base, project_name, ".reasonix", "knowledge"),
-                    os.path.join(base, project_name, "lancedb_data"),
-                ]:
-                    if os.path.isdir(candidate):
-                        switch_knowledge_base(candidate)
-                        return
+                project_root = os.path.join(base, project_name)
+                if os.path.isdir(project_root):
+                    legacy = os.path.join(project_root, "lancedb_data")
+                    if os.path.isdir(os.path.join(legacy, "my_docs.lance")):
+                        switch_knowledge_base(legacy)
+                    else:
+                        switch_knowledge_base(
+                            os.path.join(project_root, ".reasonix", "knowledge")
+                        )
+                    return
     except LookupError:
         pass
     except Exception:
         pass
 
+
+# ── 以下补丁依赖 mcp._mcp_server 私有 API，需锁定 mcp 版本（升级前请先验证兼容性）──
 
 # 注册 Roots 通知处理器
 mcp._mcp_server.notification_handlers[RootsListChangedNotification] = _on_roots_changed
@@ -277,6 +283,7 @@ _current_kb_name = "自动检测"  # 当前知识库显示名称
 _db = None               # LanceDB 连接单例
 _kb_registry = None      # kb-config.json 的注册表缓存
 _kb_aliases = {}
+_kb_config_stamp = None  # (mtime, size)，用于判断 kb-config.json 是否变化（热重载）
 
 # 文档后缀
 EXTENSIONS = {".md", ".txt", ".docx", ".pdf", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".html", ".htm"}
@@ -416,15 +423,25 @@ _embedding_cache = LRUCache(capacity=2000)
 
 
 def _load_registry() -> dict:
-    """加载 kb-config.json 知识库注册表"""
-    global _kb_registry, _kb_aliases
+    """加载 kb-config.json 知识库注册表（带 mtime 热重载，改配置无需重启进程）"""
+    global _kb_registry, _kb_aliases, _kb_config_stamp
     if _kb_registry is not None:
-        return _kb_registry
+        # 已加载过：仅当文件 mtime/size 变化时才重读，否则直接返回缓存
+        try:
+            st = os.stat(KB_CONFIG_PATH)
+            stamp = (st.st_mtime, st.st_size)
+        except OSError:
+            return _kb_registry
+        if _kb_config_stamp is not None and stamp == _kb_config_stamp:
+            return _kb_registry
     _kb_registry = {}
+    _kb_config_stamp = None
     if os.path.exists(KB_CONFIG_PATH):
         try:
+            st = os.stat(KB_CONFIG_PATH)
             data, _kb_aliases = load_kb_config(KB_CONFIG_PATH, repair=True)
             _kb_registry = data.get("knowledge_bases", {})
+            _kb_config_stamp = (st.st_mtime, st.st_size)
         except Exception as e:
             print(f"[WARN] 知识库配置加载失败: {e}", file=sys.stderr)
     return _kb_registry
@@ -447,15 +464,13 @@ def _detect_db_path() -> str:
 
     # ── 2. 工作区环境变量 ──
     ws = os.environ.get("REASONIX_WORKSPACE") or os.environ.get("REASONIX_CURRENT_PROJECT")
-    if ws:
-        for candidate in [
-            os.path.join(ws, ".reasonix", "knowledge"),
-            os.path.join(ws, "lancedb_data"),
-        ]:
-            if os.path.isdir(os.path.join(candidate, "my_docs.lance")):
-                return candidate
-        # 项目目录存在但无知识库 → 回落，不自动创建空KB
-        pass
+    if ws and os.path.isdir(ws):
+        # 工作区是客户端显式声明的项目上下文：即使知识库目录尚未创建，
+        # 也直接指向它（get_db() 会惰性创建），避免新项目误落 global。
+        legacy = os.path.join(ws, "lancedb_data")
+        if os.path.isdir(os.path.join(legacy, "my_docs.lance")):
+            return legacy
+        return os.path.join(ws, ".reasonix", "knowledge")
 
     # ── 3. CWD 自动匹配 ──
     cwd = os.getcwd()
@@ -470,7 +485,7 @@ def _detect_db_path() -> str:
             project_root = os.path.dirname(os.path.dirname(kb_dir))
         elif kb_dir.endswith("lancedb_data"):
             project_root = os.path.dirname(kb_dir)
-        if cwd.startswith(project_root):
+        if os.path.normcase(cwd).startswith(os.path.normcase(project_root)):
             return kb_dir
 
     # 3b. 智能扫描：自动发现 cherry-workplace 下所有项目
@@ -1219,18 +1234,26 @@ def _resolve_db_path(project: str) -> str | None:
         if clean_name == project or name.lower().endswith(project.lower()):
             return info["path"]
 
-    # 3. 作为文件路径
+    # 3. 作为文件路径（知识库目录尚未创建时也可解析——父级存在且形似知识库目录）
     if os.path.isdir(project):
         return project
+    parent = os.path.dirname(project)
+    base_name = os.path.basename(project).lower()
+    if parent and os.path.isdir(parent):
+        if base_name == "knowledge":
+            return project
+        # 旧式 lancedb_data 库必须已含 my_docs.lance 才算有效（与自动检测的 legacy 策略一致）
+        if base_name == "lancedb_data" and os.path.isdir(os.path.join(project, "my_docs.lance")):
+            return project
 
-    # 4. 作为 cherry-workplace 下的项目名
+    # 4. 作为 cherry-workplace 下的项目名（项目根存在即可，知识库目录由 get_db() 惰性创建）
     base = r"D:\cherry-workplace"
-    for candidate in [
-        os.path.join(base, project, ".reasonix", "knowledge"),
-        os.path.join(base, project, "lancedb_data"),
-    ]:
-        if os.path.isdir(candidate):
-            return candidate
+    project_root = os.path.join(base, project)
+    if os.path.isdir(project_root):
+        legacy = os.path.join(project_root, "lancedb_data")
+        if os.path.isdir(os.path.join(legacy, "my_docs.lance")):
+            return legacy
+        return os.path.join(project_root, ".reasonix", "knowledge")
 
     return None
 
@@ -1486,19 +1509,9 @@ def switch_knowledge_base(name: str = "global") -> str:
     """
     global _current_kb_name, _db, _connected_path, DB_PATH
 
-    # 尝试解析
+    # 尝试解析（_resolve_db_path 已覆盖注册表名、项目简称、完整路径、cherry-workplace 项目名，
+    # 且允许知识库目录尚未创建——切换后由 get_db() 惰性创建）
     target = _resolve_db_path(name)
-    if target is None:
-        # 也可能是 cherry-workplace 下的项目名
-        base = r"D:\cherry-workplace"
-        for candidate in [
-            os.path.join(base, name, ".reasonix", "knowledge"),
-            os.path.join(base, name, "lancedb_data"),
-        ]:
-            if os.path.isdir(candidate):
-                target = candidate
-                break
-
     if target is None:
         registry = _load_registry()
         available = "\n".join(f"  - {n} ({i['description']})" for n, i in sorted(registry.items()))
@@ -1577,23 +1590,26 @@ def add_documents(
         if not db_path:
             return f"❌ 未找到知识库「{project}」。使用 list_knowledge_bases 查看可用知识库。"
         db = lancedb.connect(db_path)
-        if TABLE_NAME in db.table_names():
+        if TABLE_NAME in _db_table_names(db):
             table = db.open_table(TABLE_NAME)
         else:
             table = get_or_create_table(db)
+        kb_label = f"{_guess_kb_name(db_path)}（{db_path}）"
     else:
         db = get_db()
         table = get_or_create_table()
+        kb_label = f"{_current_kb_name}（{DB_PATH}）"
 
     # 如果需要重建
-    if reindex_all and TABLE_NAME in db.table_names():
+    if reindex_all and TABLE_NAME in _db_table_names(db):
         db.drop_table(TABLE_NAME)
-        table = get_or_create_table()
+        # 用同一个 project 库连接重建，避免 drop 后写入全局库
+        table = get_or_create_table(db)
         existing_sources = set()
     else:
         # 优化：只查 source 列，不全量加载
         existing_sources = set()
-        if TABLE_NAME in db.table_names():
+        if TABLE_NAME in _db_table_names(db):
             existing_sources = _get_existing_sources_fast(table)
 
     # 1. 扫描文件
@@ -1617,6 +1633,7 @@ def add_documents(
         msg = f"扫描「{scan_dir}」，共 {len(filepaths)} 个文件，没有新文件需要添加。"
         if existing_sources:
             msg += f"（已有 {len(existing_sources)} 个文件在知识库中）"
+        msg += f"\n📚 当前知识库: {kb_label}"
         return msg
 
     if not reindex_all and existing_sources:
@@ -1666,16 +1683,18 @@ def add_documents(
 
     # 4. 全部添加完成后，尝试创建/更新索引
     _ensure_index(table)
-    _ensure_fts_index(table, force_rebuild=True)
+    _ensure_fts_index(table)
 
     # 5. 最终状态
     final_count = len(table)
     return (
         f"✅ **文档添加完成！**\n"
         f"{'─' * 40}\n"
+        f"📚 知识库: {kb_label}\n"
         f"扫描目录: {scan_dir}\n"
         f"新扫描文件: {len(new_files)}\n"
         f"新提取文本块: {total}\n"
+        f"已保存文本资产: {assets_added}\n"
         f"已向量化入库: {added}\n"
         f"知识库总块数: {final_count}\n"
         f"{msg_extra}"
