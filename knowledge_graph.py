@@ -53,7 +53,9 @@ def available_knowledge_bases(bases: Iterable[Dict[str, str]]) -> List[Dict[str,
     for base in bases:
         try:
             db = lancedb.connect(base["path"])
-            if TABLE_NAME in db.table_names():
+            table_names = db.list_tables()
+            table_names = table_names.tables if hasattr(table_names, "tables") else table_names
+            if TABLE_NAME in table_names:
                 available.append(base)
         except Exception:
             continue
@@ -66,7 +68,9 @@ def _load_documents(bases: Iterable[Dict[str, str]]):
     total_chunks = 0
     for base in bases:
         db = lancedb.connect(base["path"])
-        if TABLE_NAME not in db.table_names():
+        table_names = db.list_tables()
+        table_names = table_names.tables if hasattr(table_names, "tables") else table_names
+        if TABLE_NAME not in table_names:
             continue
         table = db.open_table(TABLE_NAME)
         data = table.to_lance().to_table(columns=["source", "category", "vector"])
