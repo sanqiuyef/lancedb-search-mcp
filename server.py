@@ -35,6 +35,11 @@ import json
 
 from knowledge_browser_core import load_kb_config, search_with_trace
 from content_graph import ContentGraphStore, extractor_from_environment
+from knowledge_assets import (
+    add_assets, activate_generation, build_generation, delete_assets_for_sources,
+    export_assets, list_generations, migrate_active_chunks, register_active_generation,
+    restore_assets, verify_assets,
+)
 
 # =============================================================
 # 可选本地 ML 依赖（sentence-transformers）
@@ -251,6 +256,12 @@ RERANKER_BACKEND = os.environ.get("RERANKER_BACKEND", "api").lower()  # api / lo
 
 # ── API 模式配置（硅基流动） ──
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
+if EMBEDDING_BACKEND == "api" and not SILICONFLOW_API_KEY:
+    print(
+        "[WARN] EMBEDDING_BACKEND=api 但未设置 SILICONFLOW_API_KEY：Embedding/Reranker 调用将失败。"
+        "请配置环境变量 SILICONFLOW_API_KEY，或改用 EMBEDDING_BACKEND=local/ollama。",
+        file=sys.stderr,
+    )
 EMBEDDING_URL = "https://api.siliconflow.cn/v1/embeddings"
 RERANK_URL = "https://api.siliconflow.cn/v1/rerank"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
@@ -299,8 +310,26 @@ OCR_TESSERACT_CMD = os.environ.get(
 )
 OCR_LANG = os.environ.get("LANCEDB_OCR_LANG", "chi_sim+eng")
 OCR_DPI = int(os.environ.get("LANCEDB_OCR_DPI", "300"))
-OCR_MAX_PAGES = int(os.environ.get("LANCEDB_OCR_MAX_PAGES", "0"))  # 0 = 全部页面
+OCR_MAX_PAGES = int(os.environ.get("LANCEDB_OCR_MAX_PAGES", "50"))  # 默认上限 50 页，防止大文件 OCR 耗时过长；0 = 不限制
 OCR_MIN_TEXT_CHARS = int(os.environ.get("LANCEDB_OCR_MIN_TEXT_CHARS", "500"))
+
+# ── MinerU 精准解析 API 配置（优先于 Tesseract 的 OCR 回退方案）──
+MINERU_API_KEY = os.environ.get("MINERU_API_KEY", "")
+MINERU_API_MODEL = os.environ.get("MINERU_API_MODEL", "vlm")
+MINERU_OCR_ENABLED = bool(MINERU_API_KEY)
+MINERU_POLL_TIMEOUT = int(os.environ.get("MINERU_POLL_TIMEOUT", "300"))
+
+# 尝试导入 MinerU SDK（可选依赖）
+try:
+    # 若 SDK 安装在自定义路径，可通过 MINERU_SDK_PATH 指定
+    _mineru_sdk_path = os.environ.get("MINERU_SDK_PATH", "")
+    if _mineru_sdk_path:
+        sys.path.insert(0, _mineru_sdk_path)
+    from mineru import MinerU as _MinerU  # noqa: E402
+    _MINERU_SDK_AVAILABLE = True
+except ImportError:
+    _MinerU = None
+    _MINERU_SDK_AVAILABLE = False
 
 # ── 查询扩展：缩写→完整词（提升 FTS/BM25 准确率） ──
 # 格式：{"缩写": ["展开词1", "展开词2"]}
@@ -323,7 +352,6 @@ QUERY_EXPANSIONS = {
     "gan": ["generative adversarial network", "gan"],
     "vae": ["variational autoencoder", "vae"],
     "nerf": ["neural radiance field", "nerf"],
-    "nerf": ["neural radiance fields", "nerf"],
     "bim": ["building information modeling", "bim"],
     "lod": ["level of detail", "lod"],
     "ifc": ["industry foundation classes", "ifc"],
@@ -376,9 +404,11 @@ KEYWORD_ROUTES = {
 }
 
 HEADERS = {
-    "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
     "Content-Type": "application/json"
 }
+if SILICONFLOW_API_KEY:
+    # 未配置 API Key 时不带空的 Bearer 头
+    HEADERS["Authorization"] = f"Bearer {SILICONFLOW_API_KEY}"
 
 
 # =============================================================
@@ -566,6 +596,12 @@ def _guess_kb_name(path: str) -> str:
     return os.path.basename(path)
 
 
+def _db_table_names(db) -> set[str]:
+    """Return table names without LanceDB's deprecated ``table_names`` API."""
+    listed = db.list_tables()
+    return set(listed.tables if hasattr(listed, "tables") else listed)
+
+
 def _ensure_index(table):
     """确保表有向量索引（IVF-PQ）和全文索引（FTS），没有则自动创建"""
     # 1. 向量索引
@@ -616,7 +652,7 @@ def get_or_create_table(db=None):
     """获取或创建 LanceDB 表"""
     if db is None:
         db = get_db()
-    if TABLE_NAME in db.table_names():
+    if TABLE_NAME in _db_table_names(db):
         tbl = db.open_table(TABLE_NAME)
         _ensure_index(tbl)
         return tbl
@@ -629,6 +665,15 @@ def get_or_create_table(db=None):
         pa.field("category", pa.string()),
     ])
     return db.create_table(TABLE_NAME, schema=schema)
+
+
+def _embedding_identity() -> tuple[str, str, int]:
+    """Return the metadata recorded with a newly built embedding generation."""
+    return (
+        EMBEDDING_BACKEND,
+        EMBED_MODEL if EMBEDDING_BACKEND == "api" else LOCAL_EMBED_MODEL,
+        int(EMBED_DIM),
+    )
 
 
 # =============================================================
@@ -869,10 +914,42 @@ def _pdf_text_needs_ocr(text: str) -> bool:
     return False
 
 
+def _ocr_pdf_mineru(filepath: str) -> str:
+    """使用 MinerU SDK 调用精准解析 API 对扫描件 PDF 进行 OCR，返回 Markdown 文本。
+
+    需要 mineru-open-sdk：pip install mineru-open-sdk
+    失败时抛出异常，由调用方回退到 Tesseract。
+    """
+    if not _MINERU_SDK_AVAILABLE:
+        raise RuntimeError(
+            "MinerU SDK 未安装，请执行: pip install mineru-open-sdk"
+        )
+    if not MINERU_API_KEY:
+        raise RuntimeError("未配置 MINERU_API_KEY")
+
+    filename = os.path.basename(filepath)
+    file_size = os.path.getsize(filepath)
+    print(f"[MinerU] 开始精准解析: {filename} ({file_size / 1024 / 1024:.1f} MB)", file=sys.stderr)
+
+    client = _MinerU(MINERU_API_KEY)
+    result = client.extract(
+        filepath,
+        model=MINERU_API_MODEL,
+        ocr=True,
+        timeout=MINERU_POLL_TIMEOUT,
+    )
+
+    markdown = result.markdown
+    print(f"[MinerU] 解析完成，{len(markdown)} 字符", file=sys.stderr)
+    return markdown
+
+
 def _ocr_pdf(filepath: str) -> str:
     """使用 PyMuPDF 渲染扫描件，再交给本地 Tesseract 逐页识别。"""
     if not os.path.isfile(OCR_TESSERACT_CMD):
-        raise RuntimeError(f"未找到 Tesseract: {OCR_TESSERACT_CMD}")
+        # 优雅降级：不抛异常，返回空文本，由调用方保留 PDF 文本层
+        print(f"[OCR] 未找到 Tesseract: {OCR_TESSERACT_CMD}，跳过 OCR（保留文本层）", file=sys.stderr)
+        return ""
 
     import fitz
     from io import BytesIO
@@ -935,6 +1012,16 @@ def extract_text(filepath: str) -> str:
 
             if OCR_ENABLED and _pdf_text_needs_ocr(text):
                 print(f"[OCR] 检测到扫描件或重复水印，开始识别: {filepath}", file=sys.stderr)
+                # 优先使用 MinerU 精准解析 API（若已配置 API Key）
+                if MINERU_OCR_ENABLED:
+                    try:
+                        ocr_text = _ocr_pdf_mineru(filepath)
+                        if len(ocr_text.strip()) >= 20:
+                            return ocr_text
+                        print(f"[MinerU] 未提取到有效文字，回退到 Tesseract: {filepath}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[MinerU] 识别失败，回退到 Tesseract {filepath}: {e}", file=sys.stderr)
+                # Tesseract 回退
                 try:
                     ocr_text = _ocr_pdf(filepath)
                     if len(ocr_text.strip()) >= 20:
@@ -954,6 +1041,7 @@ def chunk_text(text: str, source: str) -> List[Dict]:
     # .md 文件用 Markdown 感知分块
     if source.lower().endswith(".md"):
         return _chunk_markdown(text, source)
+    cat = _guess_category(source)
     paragraphs = re.split(r"\n\s*\n", text)
     chunks = []
     current = ""
@@ -970,6 +1058,7 @@ def chunk_text(text: str, source: str) -> List[Dict]:
                     "text": current.strip(),
                     "source": source,
                     "chunk_index": len(chunks),
+                    "category": cat,
                 })
                 # overlap：保留最后一段文本作为下一块的开头
                 if CHUNK_OVERLAP > 0 and current.strip():
@@ -982,7 +1071,6 @@ def chunk_text(text: str, source: str) -> List[Dict]:
                 current = para + "\n"
 
     if current.strip():
-        cat = _guess_category(source)
         chunks.append({
             "text": current.strip(),
             "source": source,
@@ -1296,7 +1384,7 @@ def search_knowledge_structured(
         db = lancedb.connect(db_path)
     else:
         db = get_db()
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         raise ValueError("知识库为空，请先添加文档。")
     _ensure_index(db.open_table(TABLE_NAME))
     return search_with_trace(
@@ -1440,7 +1528,7 @@ def get_knowledge_status() -> str:
         + f"\n💡 使用 switch_knowledge_base(name) 切换，或指定 project= 参数"
     ) if registry else ""
 
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return (
             f"📊 **知识库状态**\n"
             f"{'─' * 40}\n"
@@ -1654,6 +1742,8 @@ def add_documents(
     if not all_chunks:
         return f"扫描完成，但没有提取到有效文本内容。"
 
+    assets_added = add_assets(db, all_chunks)
+
     # 3. 批量向量化 + 写入 LanceDB（batch_size=32，吃满 API 限制）
     batch_size = 32
     total = len(all_chunks)
@@ -1745,7 +1835,10 @@ def add_single_document(
         db = lancedb.connect(db_path)
         table = get_or_create_table(db)
     else:
+        db = get_db()
         table = get_or_create_table()
+
+    assets_added = add_assets(db, chunks)
 
     # 批量向量化（batch_size=32），替代逐条调用
     batch_size = 32
@@ -1790,13 +1883,14 @@ def add_single_document(
 
     # 尝试更新索引
     _ensure_index(table)
-    _ensure_fts_index(table, force_rebuild=True)
+    _ensure_fts_index(table)
 
     final_count = len(table)
     result = (
         "[OK] 文档已入库!\n"
         + f"文件名: {fname}\n"
         + f"总文本块: {len(chunks)}\n"
+        + f"已保存文本资产: {assets_added}\n"
         + f"已入库: {added}\n"
     )
     if failed > 0:
@@ -1836,10 +1930,10 @@ def update_document(
         if not db_path:
             return f"❌ 未找到知识库「{project}」。"
         db = lancedb.connect(db_path)
-        table = get_or_create_table(db) if TABLE_NAME in db.table_names() else None
+        table = get_or_create_table(db) if TABLE_NAME in _db_table_names(db) else None
     else:
         db = get_db()
-        table = db.open_table(TABLE_NAME) if TABLE_NAME in db.table_names() else None
+        table = db.open_table(TABLE_NAME) if TABLE_NAME in _db_table_names(db) else None
 
     # 1. 删除旧版本（LanceDB 原生 delete，无需全量加载向量）
     deleted_count = 0
@@ -1852,6 +1946,7 @@ def update_document(
             for src in matched:
                 safe_src = src.replace("'", "''")
                 table.delete(f"source = '{safe_src}'")
+            delete_assets_for_sources(db, matched)
             deleted_count = len(matched)
 
     # 2. 重新添加
@@ -1867,6 +1962,8 @@ def update_document(
         table = get_or_create_table(db)
     else:
         table = get_or_create_table()
+
+    assets_added = add_assets(db, chunks)
 
     # 批量向量化
     batch_size = 32
@@ -1892,7 +1989,7 @@ def update_document(
         added += len(data)
 
     _ensure_index(table)
-    _ensure_fts_index(table, force_rebuild=True)
+    _ensure_fts_index(table)
 
     final_count = len(table)
     return (
@@ -1929,7 +2026,7 @@ def delete_documents(
         db = lancedb.connect(db_path)
     else:
         db = get_db()
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return "知识库为空，无需删除。"
 
     table = db.open_table(TABLE_NAME)
@@ -1947,6 +2044,7 @@ def delete_documents(
         for src in matched_sources:
             safe_src = src.replace("'", "''")
             table.delete(f"source = '{safe_src}'")
+        delete_assets_for_sources(db, matched_sources)
 
         remaining = len(table)
         deleted = total_before - remaining
@@ -1964,6 +2062,7 @@ def delete_documents(
 
     elif confirm_all:
         # 清空全部
+        delete_assets_for_sources(db, _get_existing_sources_fast(table))
         db.drop_table(TABLE_NAME)
         return (
             f"🗑️ **知识库已清空**\n"
@@ -1980,21 +2079,13 @@ def delete_documents(
 
 @mcp.tool(
     name="rebuild_knowledge",
-    description="重建知识库向量索引：读取已有文本，用当前 Embedding 后端重新编码后写回。用于切换模型后修复旧数据。"
+    description="从持久化 Chunk 文本构建并切换新的 Embedding generation；不读取源文件，旧 generation 会保留以便回滚。"
 )
 def rebuild_knowledge(
     project: str = "",
     batch_size: int = 32,
 ) -> str:
-    """
-    重建知识库：用当前 EMBEDDING_BACKEND 重新编码所有已有文本块。
-    切换 Embedding 模型后（如 API → local），旧向量与新模型不兼容，需要用此工具重建。
-
-    Args:
-        project: 指定知识库名称或路径（如 "global"、"project-通用"），空则使用当前知识库
-        batch_size: 每批编码数量（默认 32）
-    """
-    # 1. 获取数据库和表
+    """Build a replacement vector generation from the durable Chunk asset store."""
     if project:
         db_path = _resolve_db_path(project)
         if not db_path:
@@ -2004,75 +2095,33 @@ def rebuild_knowledge(
         db = get_db()
         db_path = DB_PATH
 
-    if TABLE_NAME not in db.table_names():
-        return "❌ 知识库为空，没有需要重建的数据。"
-
-    old_table = db.open_table(TABLE_NAME)
-    total = len(old_table)
-    if total == 0:
-        return "❌ 知识库为空，没有需要重建的数据。"
-
-    # 2. 读取所有记录（只读 text、source、chunk_index，不读旧向量）
+    migrated = migrate_active_chunks(db)
+    backend, model, dimension = _embedding_identity()
+    register_active_generation(db, backend="legacy", model="unknown-before-migration", dimension=dimension)
     try:
-        import pandas as pd
-        df = old_table.to_pandas(columns=["text", "source", "chunk_index"])
-        texts = df["text"].tolist()
-        sources = df["source"].tolist()
-        chunk_indices = [int(x) for x in df["chunk_index"].tolist()]
-    except ImportError:
-        return "❌ 需要 pandas 库。请执行: pip install pandas"
-
-    print(f"[rebuild] 读取 {total} 条记录，开始重新编码...", file=sys.stderr)
-
-    # 3. 批量重新编码
-    all_vectors = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        batch_truncated = [t[:512] for t in batch_texts]
-        try:
-            vecs = get_embeddings_batch(batch_truncated)
-            all_vectors.extend(vecs)
-        except Exception as e:
-            return f"❌ 编码失败（第 {i} 批）: {e}"
-        print(f"[rebuild] 进度: {min(i+batch_size, total)}/{total}", file=sys.stderr)
-
-    # 4. 删除旧表，创建新表
-    db.drop_table(TABLE_NAME)
-    new_table = get_or_create_table(db)
-
-    # 5. 写回新数据
-    records = []
-    for i in range(total):
-        records.append({
-            "vector": all_vectors[i],
-            "text": texts[i],
-            "source": sources[i],
-            "chunk_index": chunk_indices[i],
-            "category": "",
-        })
-
-    new_table.add(records)
-
-    # 6. 重建索引
+        generation = build_generation(
+            db, embedder=get_embeddings_batch, backend=backend, model=model,
+            dimension=dimension, batch_size=min(max(batch_size, 1), 128),
+        )
+        activated = activate_generation(db, generation["generation_id"])
+    except Exception as error:
+        return f"❌ 新 generation 构建失败；现有活动索引未变更: {error}"
+    new_table = db.open_table(TABLE_NAME)
     _ensure_index(new_table)
     _ensure_fts_index(new_table, force_rebuild=True)
-
     global _embedding_cache
-    # 7. 清空 embedding 缓存（旧向量已无效）
     _embedding_cache = LRUCache(capacity=2000)
-
-    final_count = len(new_table)
     display_name = _guess_kb_name(db_path) if project else _current_kb_name
 
     return (
         f"✅ **知识库重建完成！**\n"
         f"{'─' * 40}\n"
         f"知识库: {display_name}\n"
-        f"总记录数: {final_count}\n"
-        f"Embedding 后端: {EMBEDDING_BACKEND}\n"
-        f"模型: {EMBED_MODEL if EMBEDDING_BACKEND == 'api' else LOCAL_EMBED_MODEL} (dim={EMBED_DIM})\n"
-        f"缓存已清空（旧向量已无效）\n"
-        f"💡 现在可用新模型搜索此知识库。"
+        f"从活动表迁移的文本资产: {migrated}\n"
+        f"总记录数: {len(new_table)}\n"
+        f"新 generation: {activated['generation_id']}\n"
+        f"模型: {model} (dim={dimension})\n"
+        f"旧 generation 已保留；可用 switch_embedding_generation 回滚。"
     )
 
 
@@ -2104,7 +2153,7 @@ def list_documents(
     else:
         db = get_db()
 
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return "❌ 知识库为空，没有文档。"
 
     table = db.open_table(TABLE_NAME)
@@ -2113,7 +2162,7 @@ def list_documents(
     # 聚合查询：按 source 分组统计
     try:
         import pandas as pd
-        df = table.to_pandas(columns=["source", "category"])
+        df = table.to_lance().to_table(columns=["source", "category"]).to_pandas()
     except ImportError:
         # 无 pandas 时回退
         sources = _get_existing_sources_fast(table)
@@ -2212,7 +2261,7 @@ def search_similar(
     else:
         db = get_db()
 
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return "❌ 知识库为空。"
 
     tbl = db.open_table(TABLE_NAME)
@@ -2268,7 +2317,7 @@ def get_document(
     else:
         db = get_db()
 
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return "❌ 知识库为空。"
 
     table = db.open_table(TABLE_NAME)
@@ -2439,7 +2488,7 @@ def ingest_url(
         added += len(data)
 
     _ensure_index(table)
-    _ensure_fts_index(table, force_rebuild=True)
+    _ensure_fts_index(table)
 
     final_count = len(table)
     return (
@@ -2530,7 +2579,12 @@ def start_watcher(
 
         def on_created(self, event):
             if not event.is_dir and event.src_path.endswith(tuple(EXTENSIONS)):
-                self._reindex(event.src_path)
+                # 防抖：同一文件 5 秒内不重复处理（与 on_modified 一致）
+                now = __import__("time").time()
+                last = self._debounce.get(event.src_path, 0)
+                if now - last > 5:
+                    self._debounce[event.src_path] = now
+                    self._reindex(event.src_path)
 
         def on_moved(self, event):
             if not event.is_dir and event.dest_path.endswith(tuple(EXTENSIONS)):
@@ -2550,6 +2604,113 @@ def start_watcher(
         f"监听目录: {watch_dir}\n"
         f"文件变更时将自动增量重索引。\n"
         f"💡 使用 stop_watcher 停止监听。"
+    )
+
+
+def _generation_db(project: str):
+    if not project:
+        return get_db(), DB_PATH
+    db_path = _resolve_db_path(project)
+    if not db_path:
+        raise ValueError(f"未找到知识库「{project}」。使用 list_knowledge_bases 查看可用知识库。")
+    return lancedb.connect(db_path), db_path
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True),
+    name="list_embedding_generations",
+    description="列出知识库的 Embedding generation、模型、维度、Chunk 数和当前活动版本。"
+)
+def list_embedding_generations(project: str = "") -> str:
+    """Inspect recoverable text assets and all vector generations without changing data."""
+    try:
+        db, _ = _generation_db(project)
+        migrate_active_chunks(db)
+        backend, model, dimension = _embedding_identity()
+        register_active_generation(db, backend="legacy", model="unknown-before-migration", dimension=dimension)
+        generations = list_generations(db)
+    except Exception as error:
+        return f"❌ 无法读取 generation: {error}"
+    if not generations:
+        return "知识库尚无 generation；先添加文档或从资产包恢复。"
+    lines = ["🧬 **Embedding Generations**", "─" * 40]
+    for item in generations:
+        marker = "⬅️ 活动" if item["is_active"] else "历史"
+        lines.append(
+            f"- {marker} `{item['generation_id']}`\n"
+            f"  模型: {item['model']} | 后端: {item['backend']} | dim={item['dimension']} | Chunk={item['chunk_count']}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="switch_embedding_generation",
+    description="切换到已完成的历史 Embedding generation；当前索引会先归档，失败时不切换。"
+)
+def switch_embedding_generation(generation_id: str, project: str = "") -> str:
+    """Activate a previously built generation without recomputing embeddings or reading source files."""
+    if not generation_id.strip():
+        return "❌ generation_id 不能为空；先调用 list_embedding_generations。"
+    try:
+        db, _ = _generation_db(project)
+        target = activate_generation(db, generation_id.strip())
+        table = db.open_table(TABLE_NAME)
+        _ensure_index(table)
+        _ensure_fts_index(table, force_rebuild=True)
+    except Exception as error:
+        return f"❌ 切换失败，活动索引保持不变: {error}"
+    return f"✅ 已切换到 generation `{target['generation_id']}`（{target['model']}，{target['chunk_count']} 个 Chunk）。"
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True),
+    name="verify_knowledge_assets",
+    description="校验独立 Chunk 资产的哈希完整性，并报告可恢复的文本块和 generation 状态。"
+)
+def verify_knowledge_assets(project: str = "") -> str:
+    """Verify text assets; this does not call embedding services or access source files."""
+    try:
+        db, _ = _generation_db(project)
+        result = verify_assets(db)
+    except Exception as error:
+        return f"❌ 资产校验失败: {error}"
+    if result["invalid_chunk_ids"]:
+        return f"❌ 发现 {len(result['invalid_chunk_ids'])} 个 Chunk 哈希异常；不要重建，先从资产包恢复。"
+    return f"✅ 文本资产完整：{result['chunk_count']} 个 Chunk，{len(result['generations'])} 个 generation。"
+
+
+@mcp.tool(
+    name="export_knowledge_assets",
+    description="导出不依赖向量模型的 Chunk 文本资产包 ZIP；可在源文件丢失后用于恢复和重建。"
+)
+def export_knowledge_assets(output_path: str, project: str = "") -> str:
+    """Create an atomic ZIP containing full chunks, metadata, and an integrity manifest (no vectors)."""
+    if not output_path.strip():
+        return "❌ output_path 不能为空，例如 D:\\backup\\my-kb-assets.zip。"
+    try:
+        db, _ = _generation_db(project)
+        result = export_assets(db, output_path)
+    except Exception as error:
+        return f"❌ 导出失败: {error}"
+    return f"✅ 已导出 {result['chunk_count']} 个 Chunk 到 {result['path']}。此资产包可用于恢复后重新生成任意 Embedding。"
+
+
+@mcp.tool(
+    name="restore_knowledge_assets",
+    description="从知识资产包恢复 Chunk 文本和元数据；恢复后调用 rebuild_knowledge 创建当前模型的向量索引。"
+)
+def restore_knowledge_assets(package_path: str, project: str = "") -> str:
+    """Import an asset package without calling models. Identical chunks are skipped safely."""
+    if not os.path.isfile(package_path):
+        return f"❌ 资产包不存在: {package_path}"
+    try:
+        db, _ = _generation_db(project)
+        result = restore_assets(db, package_path)
+    except Exception as error:
+        return f"❌ 恢复失败: {error}"
+    return (
+        f"✅ 已恢复 {result['imported']}/{result['total_in_package']} 个 Chunk 文本资产。\n"
+        "下一步：调用 rebuild_knowledge，用当前 Embedding 模型生成活动向量索引。"
     )
 
 
@@ -2573,6 +2734,7 @@ def stop_watcher() -> str:
     _FILE_OBSERVER = None
     dir_name = _FILE_OBSERVER_DIR
     _FILE_OBSERVER_DIR = None
+    return f"✅ 已停止文件监听（{dir_name}）。"
 
 @mcp.tool(
     annotations=ToolAnnotations(readOnlyHint=True),
@@ -2601,7 +2763,7 @@ def generate_index(
         db = get_db()
         kb_name = _current_kb_name
 
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return "❌ 知识库为空。"
 
     table = db.open_table(TABLE_NAME)
@@ -2610,7 +2772,7 @@ def generate_index(
     # 2. 读取数据
     try:
         import pandas as pd
-        df = table.to_pandas(columns=["source", "category"])
+        df = table.to_lance().to_table(columns=["source", "category"]).to_pandas()
     except ImportError:
         # 无 pandas 回退
         sources = _get_existing_sources_fast(table)
@@ -2749,7 +2911,7 @@ def extract_to_note(
         db = get_db()
         kb_name = _current_kb_name
 
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return "❌ 知识库为空。"
 
     table = db.open_table(TABLE_NAME)
@@ -2988,7 +3150,7 @@ def _content_graph_document(filepath: str, project: str = ""):
             if os.path.normcase(os.path.abspath(info.get("path", ""))) == target_path:
                 knowledge_base = name
                 break
-    if TABLE_NAME not in db.table_names():
+    if TABLE_NAME not in _db_table_names(db):
         return None, "知识库为空。"
     table = db.open_table(TABLE_NAME)
     sources = _get_existing_sources_fast(table)
