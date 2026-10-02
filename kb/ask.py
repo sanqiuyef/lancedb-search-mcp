@@ -17,7 +17,6 @@ SYSTEM_PROMPT = (
 
 def ask_knowledge(
     query: str,
-    project: str = "",
     limit: int = 5,
     use_reranker: bool = True,
     source_filter: str = "",
@@ -32,7 +31,6 @@ def ask_knowledge(
     try:
         structured = kb_search.search_structured(
             query=query,
-            project=cfg.normalize_project(project),
             limit=min(max(limit, 1), 10),
             use_reranker=use_reranker,
             source_filter=source_filter,

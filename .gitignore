@@ -3,7 +3,6 @@
 .env.*
 !.env.example
 .mcp.json
-kb-config.json
 
 # Local databases, knowledge stores, and runtime state
 *.sqlite3

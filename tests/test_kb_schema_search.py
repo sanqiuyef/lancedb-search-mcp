@@ -18,9 +18,9 @@ from kb import config as cfg  # noqa: E402
 
 
 SAMPLE_DOCS = [
-    ("BIMbase 是国产 BIM 图形平台，支持 IFC 标准与 LOD 分级。", "doc/bim.md", 0, "documentation", "BIMbase"),
-    ("IFC 文件解析需要处理几何实体与属性映射。", "doc/ifc.md", 0, "documentation", "BIMbase"),
-    ("城市洪涝模拟采用 SWMM 模型与神经网络代理模型耦合。", "doc/flood.md", 0, "paper", "小论文（北松区）"),
+    ("BIMbase 是国产 BIM 图形平台，支持 IFC 标准与 LOD 分级。", "doc/bim.md", 0, "documentation"),
+    ("IFC 文件解析需要处理几何实体与属性映射。", "doc/ifc.md", 0, "documentation"),
+    ("城市洪涝模拟采用 SWMM 模型与神经网络代理模型耦合。", "doc/flood.md", 0, "paper"),
 ]
 
 
@@ -30,12 +30,11 @@ class KBEndToEnd(unittest.TestCase):
         cls.db_path = temp_db_env()
         cfg.FTS_BASE_TOKENIZER = "simple"  # 测试环境不依赖 jieba 词典
         cls.table = kb_schema.get_or_create_table()
-        for text, source, idx, cat, proj in SAMPLE_DOCS:
+        for text, source, idx, cat in SAMPLE_DOCS:
             kb_ingest.add_chunks(
                 cls.table,
                 [{"text": text, "source": source, "chunk_index": idx,
-                  "category": cat, "project": proj}],
-                proj,
+                  "category": cat}],
             )
         cls.table = kb_schema.get_or_create_table()  # 取新表对象再建索引
         kb_schema.ensure_fts_index(cls.table)
@@ -43,21 +42,16 @@ class KBEndToEnd(unittest.TestCase):
     def test_schema_fields(self):
         names = {f.name for f in self.table.schema}
         self.assertLessEqual(
-            {"text", "vector", "source", "chunk_index", "category", "project",
+            {"text", "vector", "source", "chunk_index", "category",
              "doc_id", "ingested_at"}, names,
         )
+        self.assertNotIn("project", names)  # 分区机制已移除
 
     def test_fts_search(self):
         r = kb_search.search_structured("IFC 解析", search_mode="fts", limit=3)
         sources = [x["source"] for x in r["results"]]
         self.assertIn("doc/ifc.md", sources)
         self.assertEqual(r["trace"]["mode"], "text")  # fts 为 text 的兼容别名
-
-    def test_vector_search_with_project_filter(self):
-        r = kb_search.search_structured("平台", search_mode="vector",
-                                        limit=5, project="BIMbase")
-        for item in r["results"]:
-            self.assertEqual(item["project"], "BIMbase")
 
     def test_hybrid_search_with_rrf(self):
         r = kb_search.search_structured("BIMbase 平台", search_mode="hybrid",
@@ -157,10 +151,10 @@ class KBEndToEnd(unittest.TestCase):
         kb_schema.reset_db()
 
     def test_delete_and_row_count(self):
-        kb_ingest.delete_documents("flood.md", project="小论文（北松区）")
+        kb_ingest.delete_documents("flood.md")
         self.assertEqual(kb_schema.row_count(), 2)
         fresh = kb_schema.get_or_create_table()  # 重开表避免旧对象缓存
-        sources = kb_schema.existing_sources(fresh, "小论文（北松区）")
+        sources = kb_schema.existing_sources(fresh)
         self.assertNotIn("doc/flood.md", sources)
 
 

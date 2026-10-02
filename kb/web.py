@@ -43,7 +43,7 @@ def fetch_page(url: str, timeout: int = 30) -> tuple[str, str]:
     return title, f"# {title}\n\n来源: {url}\n\n{text}"
 
 
-def ingest_url(url: str, project: str = "") -> str:
+def ingest_url(url: str) -> str:
     """抓取网页内容并索引到知识库。"""
     if not url.startswith(("http://", "https://")):
         return f"❌ 无效的 URL: {url}"
@@ -60,21 +60,19 @@ def ingest_url(url: str, project: str = "") -> str:
     if not chunks:
         return f"❌ 无法从页面提取有效内容: {url}"
 
-    project = project or cfg.guess_project_from_cwd()
     for ch in chunks:
-        ch["project"] = project
         ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
         ch["ingested_at"] = kb_ingest.datetime_now_iso()
 
     table = kb_schema.get_or_create_table()
-    added = kb_ingest.add_chunks(table, chunks, project)
+    added = kb_ingest.add_chunks(table, chunks)
     kb_schema.ensure_vector_index(table)
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
     kb_schema.update_db_readme()
     return (
         f"✅ **网页已索引**\n{'─' * 40}\n"
-        f"标题: {title}\nURL: {url}\n分区: {project}\n"
+        f"标题: {title}\nURL: {url}\n"
         f"文本块: {len(chunks)}\n已入库: {added}\n知识库总块数: {len(table)}\n"
         f"💡 用 search_knowledge 搜索此内容。"
     )

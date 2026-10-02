@@ -303,7 +303,7 @@ def chunk_text(text: str, source: str) -> List[Dict]:
 # 向量化写入（LanceModel 自动向量化）
 # =============================================================
 
-def _rows_from_chunks(chunks: List[Dict], project: str) -> List[Dict]:
+def _rows_from_chunks(chunks: List[Dict]) -> List[Dict]:
     """chunk dict → 表行（vector 由 VectorField 自动补全）。"""
     now = datetime_now_iso()
     rows = []
@@ -313,25 +313,20 @@ def _rows_from_chunks(chunks: List[Dict], project: str) -> List[Dict]:
             "source": ch["source"],
             "chunk_index": int(ch.get("chunk_index", 0)),
             "category": ch.get("category", ""),
-            "project": ch.get("project", project),
             "doc_id": ch.get("doc_id", ""),
             "ingested_at": ch.get("ingested_at", now),
         })
     return rows
 
 
-def add_chunks(table, chunks: List[Dict], project: str, batch_size: int = 32) -> int:
+def add_chunks(table, chunks: List[Dict], batch_size: int = 32) -> int:
     """分块批量入库并返回写入行数；每批触发一次自动向量化。"""
     added = 0
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        table.add(_rows_from_chunks(batch, project))
+        table.add(_rows_from_chunks(batch))
         added += len(batch)
     return added
-
-
-def _safe_project(project: str, fallback: str = "") -> str:
-    return project or fallback
 
 
 # =============================================================
@@ -356,19 +351,16 @@ def scan_files(scan_dir: str) -> List[str]:
     return sorted(set(filepaths))
 
 
-def add_documents(scan_dir: str, project: str = "", reindex_all: bool = False,
+def add_documents(scan_dir: str, reindex_all: bool = False,
                   progress=None) -> str:
     """扫描目录并增量入库。progress: optional callable(done_files, total_files)。"""
     if not os.path.isdir(scan_dir):
         return f"❌ 目录不存在: {scan_dir}"
 
-    project = _safe_project(project, cfg.guess_project_from_cwd())
     table = kb_schema.get_or_create_table()
-    existing = kb_schema.existing_sources(table, project) if not reindex_all else set()
+    existing = kb_schema.existing_sources(table) if not reindex_all else set()
 
-    if reindex_all and project:
-        table.delete(f"project = '{project.replace(chr(39), chr(39) * 2)}'")
-    elif reindex_all:
+    if reindex_all:
         db = kb_schema.get_db()
         db.drop_table(cfg.TABLE_NAME)
         table = kb_schema.get_or_create_table()
@@ -381,8 +373,8 @@ def add_documents(scan_dir: str, project: str = "", reindex_all: bool = False,
     if not new_files:
         msg = f"扫描「{scan_dir}」，共 {len(filepaths)} 个文件，没有新文件需要添加。"
         if existing:
-            msg += f"（已有 {len(existing)} 个文件在分区「{project}」中）"
-        return msg + f"\n📚 当前分区: {project or '（全部）'}"
+            msg += f"（已有 {len(existing)} 个文件在库中）"
+        return msg
 
     all_chunks: List[Dict] = []
     skipped: List[str] = []
@@ -394,7 +386,6 @@ def add_documents(scan_dir: str, project: str = "", reindex_all: bool = False,
         rel_path = os.path.relpath(fp, scan_dir)
         chunks = chunk_text(text, rel_path)
         for ch in chunks:
-            ch["project"] = project
             ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
             ch["ingested_at"] = datetime_now_iso()
         all_chunks.extend(chunks)
@@ -404,7 +395,7 @@ def add_documents(scan_dir: str, project: str = "", reindex_all: bool = False,
     if not all_chunks:
         return "扫描完成，但没有提取到有效文本内容。"
 
-    added = add_chunks(table, all_chunks, project)
+    added = add_chunks(table, all_chunks)
     kb_schema.ensure_vector_index(table)
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
@@ -414,7 +405,6 @@ def add_documents(scan_dir: str, project: str = "", reindex_all: bool = False,
     lines = [
         f"✅ **文档添加完成！**",
         f"{'─' * 40}",
-        f"📚 分区: {project or '（全部）'}",
         f"扫描目录: {scan_dir}",
         f"新扫描文件: {len(new_files)}",
         f"新提取文本块: {len(all_chunks)}",
@@ -428,7 +418,7 @@ def add_documents(scan_dir: str, project: str = "", reindex_all: bool = False,
     return "\n".join(lines)
 
 
-def add_single_document(filepath: str, project: str = "", scan_dir: str = "") -> str:
+def add_single_document(filepath: str, scan_dir: str = "") -> str:
     """向量化单个文档（避免大批量超时）。"""
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
@@ -442,7 +432,6 @@ def add_single_document(filepath: str, project: str = "", scan_dir: str = "") ->
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(filepath)}"
 
-    project = _safe_project(project, cfg.guess_project_from_cwd())
     source = os.path.basename(filepath)
     if scan_dir and os.path.isdir(scan_dir):
         rel = os.path.relpath(filepath, scan_dir)
@@ -453,12 +442,11 @@ def add_single_document(filepath: str, project: str = "", scan_dir: str = "") ->
     if not chunks:
         return f"[ERROR] 分块后无有效内容: {source}"
     for ch in chunks:
-        ch["project"] = project
         ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
         ch["ingested_at"] = datetime_now_iso()
 
     table = kb_schema.get_or_create_table()
-    added = add_chunks(table, chunks, project)
+    added = add_chunks(table, chunks)
     kb_schema.ensure_vector_index(table)
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
@@ -466,14 +454,13 @@ def add_single_document(filepath: str, project: str = "", scan_dir: str = "") ->
     return (
         f"✅ 文档已入库!\n"
         f"文件: {source}\n"
-        f"分区: {project}\n"
         f"新增记录: {added}\n"
         f"知识库总块数: {len(table)}"
     )
 
 
-def update_document(filepath: str, project: str = "") -> str:
-    """更新文档：先按文件名删除旧版本（限定分区），再重新入库。"""
+def update_document(filepath: str) -> str:
+    """更新文档：先按文件名删除旧版本，再重新入库。"""
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
     ext = Path(filepath).suffix.lower()
@@ -481,20 +468,15 @@ def update_document(filepath: str, project: str = "") -> str:
         return f"[ERROR] 不支持的文件格式: {ext}"
 
     fname = os.path.basename(filepath)
-    project = _safe_project(project, cfg.guess_project_from_cwd())
     table = kb_schema.get_or_create_table()
 
     deleted_count = 0
     if kb_schema.table_exists():
-        all_sources = kb_schema.existing_sources(table, project)
+        all_sources = kb_schema.existing_sources(table)
         matched = {s for s in all_sources if fname.lower() in s.lower()}
         for src in matched:
             safe_src = src.replace("'", "''")
-            if project:
-                safe_proj = project.replace("'", "''")
-                table.delete(f"project = '{safe_proj}' AND source = '{safe_src}'")
-            else:
-                table.delete(f"source = '{safe_src}'")
+            table.delete(f"source = '{safe_src}'")
         deleted_count = len(matched)
 
     text = extract_text(filepath)
@@ -505,11 +487,10 @@ def update_document(filepath: str, project: str = "") -> str:
     if not chunks:
         return f"[ERROR] 分块后无有效内容: {fname}"
     for ch in chunks:
-        ch["project"] = project
         ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
         ch["ingested_at"] = datetime_now_iso()
 
-    added = add_chunks(table, chunks, project)
+    added = add_chunks(table, chunks)
     kb_schema.ensure_vector_index(table)
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
@@ -517,17 +498,15 @@ def update_document(filepath: str, project: str = "") -> str:
     return (
         f"✅ 文档已更新!\n"
         f"文件名: {fname}\n"
-        f"分区: {project}\n"
         f"删除旧记录: {deleted_count}\n"
         f"新增记录: {added}\n"
         f"知识库总块数: {kb_schema.row_count()}"
     )
 
 
-def delete_documents(source_pattern: str = "", project: str = "",
+def delete_documents(source_pattern: str = "",
                      confirm_all: bool = False) -> str:
-    """按来源模式删除，或 confirm_all 清空（限定分区）。"""
-    project = cfg.normalize_project(project)
+    """按来源模式删除，或 confirm_all=True 清空整个知识库。"""
     if not kb_schema.table_exists():
         return "知识库为空，无需删除。"
     table = kb_schema.get_or_create_table()
@@ -538,20 +517,21 @@ def delete_documents(source_pattern: str = "", project: str = "",
         table.delete(where)
         return before - len(table)
 
+    if confirm_all:
+        db = kb_schema.get_db()
+        db.drop_table(cfg.TABLE_NAME)
+        kb_schema.update_db_readme()
+        return f"🗑️ **知识库已清空**\n{'─' * 40}\n删除记录数: {total_before}"
+
     if source_pattern:
-        all_sources = kb_schema.existing_sources(table, project)
+        all_sources = kb_schema.existing_sources(table)
         matched = {s for s in all_sources if source_pattern.lower() in s.lower()}
         if not matched:
-            scope = f"分区「{project}」" if project else "知识库"
-            return f"未找到匹配「{source_pattern}」的文档。{scope}中共有 {total_before} 条记录。"
+            return f"未找到匹配「{source_pattern}」的文档。知识库中共有 {total_before} 条记录。"
         deleted = 0
         for src in matched:
             safe_src = src.replace("'", "''")
-            if project:
-                safe_proj = project.replace("'", "''")
-                deleted += _delete_where(f"project = '{safe_proj}' AND source = '{safe_src}'")
-            else:
-                deleted += _delete_where(f"source = '{safe_src}'")
+            deleted += _delete_where(f"source = '{safe_src}'")
         kb_schema.fold_new_rows(table)
         kb_schema.update_db_readme()
         remaining = kb_schema.row_count()
@@ -559,7 +539,6 @@ def delete_documents(source_pattern: str = "", project: str = "",
             f"🗑️ **文档删除完成**\n"
             f"{'─' * 40}\n"
             f"匹配模式: {source_pattern}\n"
-            f"分区: {project or '（全部）'}\n"
             f"匹配到的来源: {len(matched)} 个\n"
             f"删除记录数: {deleted}\n"
             f"剩余记录数: {remaining}\n"
@@ -567,54 +546,30 @@ def delete_documents(source_pattern: str = "", project: str = "",
             + (f"\n... 等共 {len(matched)} 个" if len(matched) > 10 else "")
         )
 
-        if confirm_all:
-            if project:
-                safe_proj = project.replace("'", "''")
-                deleted = _delete_where(f"project = '{safe_proj}'")
-                kb_schema.update_db_readme()
-                return (
-                    f"🗑️ **分区已清空**\n{'─' * 40}\n"
-                    f"分区: {project}\n删除记录数: {deleted}\n剩余记录数: {kb_schema.row_count()}"
-                )
-            db = kb_schema.get_db()
-            deleted = total_before
-            db.drop_table(cfg.TABLE_NAME)
-            kb_schema.update_db_readme()
-            return f"🗑️ **知识库已清空**\n{'─' * 40}\n删除记录数: {deleted}"
-
-    scope = f"分区「{project}」" if project else "知识库"
     return (
         f"⚠️ 请指定 source_pattern 进行选择性删除，或设置 confirm_all=True 清空。\n"
-        f"{scope}共 {total_before} 条记录。"
+        f"知识库共 {total_before} 条记录。"
     )
 
 
-def list_documents(project: str = "", category_filter: str = "", limit: int = 50) -> str:
+def list_documents(category_filter: str = "", limit: int = 50) -> str:
     """按文档聚合列出知识库内容与统计。"""
     limit = min(max(limit, 1), 200)
-    project = cfg.normalize_project(project)
     if not kb_schema.table_exists():
         return "❌ 知识库为空，没有文档。"
 
     table = kb_schema.get_or_create_table()
     total = len(table)
-    if project:
-        arrow = table.to_lance().scanner(
-            columns=["source", "category", "project"],
-            filter=f"project = '{project.replace(chr(39), chr(39) * 2)}'",
-        ).to_table()
-    else:
-        arrow = table.to_lance().to_table(columns=["source", "category", "project"])
+    arrow = table.to_lance().to_table(columns=["source", "category"])
 
     doc_groups: dict[str, dict] = {}
     cat_counts: dict[str, int] = {}
-    for src, cat, proj in zip(
+    for src, cat in zip(
         arrow.column("source").to_pylist(),
         arrow.column("category").to_pylist(),
-        arrow.column("project").to_pylist(),
     ):
         if doc_groups.get(src) is None:
-            doc_groups[src] = {"chunk_count": 0, "category": cat, "project": proj}
+            doc_groups[src] = {"chunk_count": 0, "category": cat}
         doc_groups[src]["chunk_count"] += 1
         if cat:
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
@@ -631,9 +586,8 @@ def list_documents(project: str = "", category_filter: str = "", limit: int = 50
     cat_summary = " | ".join(
         f"{k}: {v}" for k, v in sorted(cat_counts.items(), key=lambda x: -x[1])
     )
-    scope = f"分区「{project}」" if project else "全部分区"
     lines = [
-        f"📄 **文档列表**（{scope}，共 {total_docs} 个，显示前 {min(limit, total_docs)} 个）",
+        f"📄 **文档列表**（共 {total_docs} 个，显示前 {min(limit, total_docs)} 个）",
         f"{'─' * 40}",
         f"知识库总块数: {total}",
     ]
@@ -642,10 +596,8 @@ def list_documents(project: str = "", category_filter: str = "", limit: int = 50
     lines.append("")
     for row in display:
         cat = row["category"]
-        proj = row["project"]
         cat_str = f" [{cat}]" if cat else ""
-        proj_str = f" 📁{proj}" if proj and proj != project else ""
-        lines.append(f"  {row['source']}{cat_str}{proj_str} — {row['chunk_count']} 块")
+        lines.append(f"  {row['source']}{cat_str} — {row['chunk_count']} 块")
     if total_docs > limit:
         lines.append(f"  ... 等共 {total_docs} 个")
     return "\n".join(lines)

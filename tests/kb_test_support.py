@@ -47,20 +47,3 @@ def temp_db_env(monkey_target=None) -> str:
     os.environ["LANCEDB_DB_PATH"] = db_path
     kb_schema.reset_db()
     return db_path
-
-
-def write_registry(tmpdir: str, projects: dict, extra: dict | None = None) -> str:
-    """写一份临时 kb-config.json 并让 kb_config 立即热重载到它。"""
-    import json
-
-    path = os.path.join(tmpdir, "kb-config.json")
-    payload = {"projects": projects}
-    if extra:
-        payload.update(extra)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    cfg.KB_CONFIG_PATH = path
-    cfg._kb_registry = None
-    cfg._kb_config_stamp = None
-    cfg.load_registry(force=True)
-    return path

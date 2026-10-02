@@ -212,11 +212,8 @@ def _sql_escape(value: str) -> str:
     return value.replace("'", "''")
 
 
-def build_where(project: str = "", source_filter: str = "",
-                category_filter: str = "") -> str:
+def build_where(source_filter: str = "", category_filter: str = "") -> str:
     clauses = []
-    if project:
-        clauses.append(f"project = '{_sql_escape(project)}'")
     if source_filter:
         clauses.append(f"source LIKE '%{_sql_escape(source_filter)}%'")
     if category_filter:
@@ -230,7 +227,6 @@ def build_where(project: str = "", source_filter: str = "",
 
 def search_structured(
     query: str,
-    project: str = "",
     limit: int = 20,
     use_reranker: bool = True,
     source_filter: str = "",
@@ -241,14 +237,14 @@ def search_structured(
     if not kb_schema.table_exists():
         raise ValueError("知识库为空，请先添加文档。")
     table = kb_schema.get_or_create_table()
-    where = build_where(project, source_filter, category_filter)
+    where = build_where(source_filter, category_filter)
     mode = (search_mode or "vector").lower()
     if mode == "fts":  # 兼容别名：官方 query_type 与旧工具命名
         mode = "text"
     if mode not in ("vector", "text", "hybrid"):
         mode = "vector"
 
-    trace: Dict = {"mode": mode, "project": project, "limit": limit,
+    trace: Dict = {"mode": mode, "limit": limit,
                    "reranker": "none", "warning": ""}
     try:
         if mode == "hybrid":
@@ -275,7 +271,6 @@ def search_structured(
             "source": row.get("source", ""),
             "chunk_index": int(row.get("chunk_index", 0) or 0),
             "category": row.get("category", ""),
-            "project": row.get("project", ""),
         }
         if "_relevance_score" in row and row["_relevance_score"] is not None:
             item["relevance_score"] = round(float(row["_relevance_score"]), 4)
@@ -291,7 +286,7 @@ def search_structured(
 # 以文搜文
 # =============================================================
 
-def search_similar(filepath: str, project: str = "", max_results: int = 5) -> List[Dict]:
+def search_similar(filepath: str, max_results: int = 5) -> List[Dict]:
     """以文搜文：参考文档前 512 字符向量化后做纯向量检索。"""
     import os
 
@@ -308,9 +303,6 @@ def search_similar(filepath: str, project: str = "", max_results: int = 5) -> Li
     table = kb_schema.get_or_create_table()
     query_vec = embed_query(text[:512])
     builder = table.search(query_vec)
-    where = build_where(project)
-    if where:
-        builder = builder.where(where)
     rows = builder.limit(min(max(max_results, 1), 20) + 1).to_list()
 
     out = []
@@ -320,7 +312,6 @@ def search_similar(filepath: str, project: str = "", max_results: int = 5) -> Li
             "source": row.get("source", ""),
             "chunk_index": int(row.get("chunk_index", 0) or 0),
             "category": row.get("category", ""),
-            "project": row.get("project", ""),
             "_distance": float(row.get("_distance", 0) or 0),
         })
     return out[:max_results]

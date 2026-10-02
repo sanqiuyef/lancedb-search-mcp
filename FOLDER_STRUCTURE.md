@@ -4,7 +4,7 @@
 lancedb-search/
 ├── server.py                       MCP 薄入口（14 个工具定义）
 ├── kb/                             知识库核心包
-│   ├── config.py                   环境变量、单库路径解析、kb-config.json 分区注册表
+│   ├── config.py                   环境变量与单库路径解析（无分区）
 │   ├── embeddings.py               SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
 │   ├── model_lifecycle.py          本地模型生命周期：用时挂载、闲置自动卸载显存
 │   ├── schema.py                   LanceModel schema、建表、FTS/向量索引、库目录 README
@@ -21,14 +21,13 @@ lancedb-search/
 │   └── mineru_pdf_splitter.py      [自建 OCR 链路] MinerU 大 PDF 预切分工具
 ├── tests/                          unittest 离线测试套件
 │   ├── kb_test_support.py          公共设施：假 embedding、临时库、注册表
-│   ├── test_kb_config.py           分区规范化、库路径优先级
+│   ├── test_kb_config.py           库路径优先级
 │   ├── test_kb_ingest.py           分块、类别推断、文本抽取
 │   ├── test_kb_schema_search.py    schema/检索端到端（FTS/hybrid/过滤/回退）
 │   ├── test_kb_model_lifecycle.py  闲置卸载逻辑 + 本地嵌入懒加载（假模型）
 │   ├── test_kb_ask.py              问答（mock HTTP）
 │   └── test_kb_web.py              网页解析（mock HTTP）
 │
-├── kb-config.json                  本机分区注册表（gitignore，示例为 kb-config.example.json）
 ├── .mcp.json                       本机 MCP 配置（gitignore，示例为 .mcp.example.json）
 ├── requirements-runtime.txt        运行时依赖（本地模型另需 torch/sentence-transformers）
 ├── README.md                       项目说明

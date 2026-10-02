@@ -5,7 +5,7 @@ LanceModel schema、官方 embedding 注册表、原生 BM25 全文检索（jieb
 官方 hybrid 混合检索与 Reranker 接口。
 
 > 2026-10 全面整改：旧版手写 RRF/混合检索/embedding 调度全部替换为官方 API。
-> 工具面从 26 个精简为 14 个。知识库数据按用户决定**全部清空**
+> 工具面从 26 个精简为 13 个（2026-10-02 起移除分区机制，再减 list_knowledge_bases）。知识库数据按用户决定**全部清空**
 > （旧库与新库均已删除，从零开始按需入库）。
 > 桌面浏览器与知识图谱功能已于 2026-10-02 删除（实用性不足）。
 
@@ -20,12 +20,12 @@ LanceModel schema、官方 embedding 注册表、原生 BM25 全文检索（jieb
 - **OCR 链路**：PDF 文本层 → MinerU API → 本地 Tesseract 回退；
 - **网页抓取 + 目录监听**自动重索引（自建）。
 
-## MCP 工具（14 个）
+## MCP 工具（13 个）
 
 | 类别 | 工具 |
 |---|---|
 | 检索问答 | search_knowledge、ask_knowledge、search_similar、get_document |
-| 知识库管理 | get_knowledge_status、list_documents、list_knowledge_bases、add_documents、add_single_document、update_document、delete_documents |
+| 知识库管理 | get_knowledge_status、list_documents、add_documents、add_single_document、update_document、delete_documents |
 | 自建能力 | ingest_url、start_watcher、stop_watcher |
 
 已移除：switch_knowledge_base（legacy shim）、资产/generation 机制 7 工具、
@@ -44,9 +44,9 @@ generate_index、extract_to_note、内容图谱 3 工具（build/get/search_cont
 ## 架构（整改后）
 
 ```
-server.py                MCP 薄入口（14 工具）
+server.py                MCP 薄入口（13 工具）
 kb/                      知识库核心包
-  config.py              环境变量 + kb-config.json 分区注册表（热重载）
+  config.py              环境变量 + 单库路径解析（无分区）
   embeddings.py          SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
   model_lifecycle.py     本地模型生命周期：用时挂载、闲置自动卸载（gc + empty_cache）
   schema.py              LanceModel schema、建表、FTS/向量索引维护、库目录 README
@@ -57,22 +57,22 @@ kb/                      知识库核心包
 scripts/                 rebuild_from_sources.py（批量重建）+ 冒烟脚本 + mineru_pdf_splitter.py（OCR 工具）
 ```
 
-单库分区模式：所有项目分区共存于同一个 LanceDB 库，`project` 列过滤，
-`kb-config.json` 维护 分区名 → 源文件目录 映射。库路径优先级：
-`LANCEDB_DB_PATH 环境变量 > kb-config.json 的 db_path > 默认 knowledge_v2`。
+单库扁平模式（2026-10-02 起移除分区机制）：一个 LanceDB 库一个池子，无 project 列；
+类别（category）按源目录自动标注，可作过滤条件。库路径优先级：
+`LANCEDB_DB_PATH 环境变量 > 默认 knowledge_v2`。
 
 ## 数据状态
 
 - **知识库当前完全为空**（2026-10-02 用户决定清空全部向量数据：旧库与 knowledge_v2 均已删除）；
 - 按需入库：MCP 工具 `add_documents`（扫目录）/ `add_single_document`（单文件）；
 - 批量重建：`D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py`
-  （按 kb-config 分区源目录重建，支持 `--dry-run`、`--project`、`--limit-files`，checkpoint 断点续传）。
+  （直接给源目录，支持 `--dry-run`、`--limit-files`，checkpoint 断点续传）。
 
 ## 安全约定
 
-仓库不提交：API Key、`.mcp.json`、`kb-config.json`（本机路径）、LanceDB 数据、
+仓库不提交：API Key、`.mcp.json`、LanceDB 数据、
 日志、虚拟环境。首次使用复制
-`.mcp.example.json` → `.mcp.json`、`kb-config.example.json` → `kb-config.json` 并按本机修改。
+`.mcp.example.json` → `.mcp.json` 并按本机修改。
 
 ## 源码运行
 

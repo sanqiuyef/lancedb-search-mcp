@@ -32,9 +32,9 @@ class TestAskKnowledge(unittest.TestCase):
         structured = {
             "results": [
                 {"text": "BIMbase 支持国产 BIM。", "source": r"D:\x\bim.md",
-                 "chunk_index": 2, "category": "", "project": "BIMbase"},
+                 "chunk_index": 2, "category": ""},
                 {"text": "洪涝模型很复杂。", "source": "flood.md",
-                 "chunk_index": 0, "category": "", "project": ""},
+                 "chunk_index": 0, "category": ""},
             ],
             "trace": {"mode": "hybrid"},
         }
@@ -53,7 +53,7 @@ class TestAskKnowledge(unittest.TestCase):
 
     def test_chat_failure_reported(self):
         structured = {"results": [{"text": "t", "source": "s", "chunk_index": 0,
-                                   "category": "", "project": ""}], "trace": {}}
+                                   "category": ""}], "trace": {}}
         with mock.patch.object(kb_ask.kb_search, "search_structured",
                                return_value=structured), \
              mock.patch.object(kb_ask.requests, "post",

@@ -25,7 +25,7 @@ def watcher_running() -> tuple[bool, str]:
     return _FILE_OBSERVER is not None, _FILE_OBSERVER_DIR or ""
 
 
-def start_watcher(watch_dir: str = "", project: str = "") -> str:
+def start_watcher(watch_dir: str = "") -> str:
     """启动文件变更监听，自动增量重索引发生变化的文档。"""
     global _FILE_OBSERVER, _FILE_OBSERVER_DIR
 
@@ -44,8 +44,7 @@ def start_watcher(watch_dir: str = "", project: str = "") -> str:
         return f"❌ 目录不存在: {watch_dir}"
 
     class _AutoIndexHandler(FileSystemEventHandler):
-        def __init__(self, proj: str):
-            self.project = proj
+        def __init__(self):
             self._debounce: dict[str, float] = {}
 
         def _reindex(self, filepath: str) -> None:
@@ -60,7 +59,7 @@ def start_watcher(watch_dir: str = "", project: str = "") -> str:
             except OSError:
                 return
             try:
-                result = kb_ingest.update_document(filepath, project=self.project)
+                result = kb_ingest.update_document(filepath)
                 print(f"[watcher] 已更新: {filepath}\n{result.splitlines()[0]}", file=sys.stderr)
             except Exception as e:
                 print(f"[watcher] 更新失败 {filepath}: {e}", file=sys.stderr)
@@ -83,7 +82,7 @@ def start_watcher(watch_dir: str = "", project: str = "") -> str:
             if not event.is_dir:
                 self._reindex(event.dest_path)
 
-    handler = _AutoIndexHandler(cfg.normalize_project(project))
+    handler = _AutoIndexHandler()
     observer = Observer()
     observer.schedule(handler, watch_dir, recursive=True)
     observer.daemon = True

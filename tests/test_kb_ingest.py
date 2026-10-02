@@ -91,10 +91,10 @@ class TestExtractText(unittest.TestCase):
 
     def test_rows_have_all_schema_fields(self):
         rows = kb_ingest._rows_from_chunks(
-            [{"text": "t", "source": "s", "chunk_index": 0}], "P")
+            [{"text": "t", "source": "s", "chunk_index": 0}])
         self.assertEqual(
             set(rows[0].keys()),
-            {"text", "source", "chunk_index", "category", "project", "doc_id", "ingested_at"},
+            {"text", "source", "chunk_index", "category", "doc_id", "ingested_at"},
         )
 
 

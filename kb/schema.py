@@ -54,7 +54,6 @@ def get_chunk_model():
         source: str
         chunk_index: int
         category: str = ""
-        project: str = ""
         doc_id: str = ""
         ingested_at: str = ""
 
@@ -91,15 +90,9 @@ def row_count() -> int:
     return len(get_db().open_table(cfg.TABLE_NAME))
 
 
-def existing_sources(table, project: str = "") -> set[str]:
-    """只读 source 列取全部来源（限定分区），用于增量判断。"""
-    if project:
-        arrow = table.to_lance().scanner(
-            columns=["source"],
-            filter=f"project = '{project.replace(chr(39), chr(39) * 2)}'",
-        ).to_table()
-    else:
-        arrow = table.to_lance().to_table(columns=["source"])
+def existing_sources(table) -> set[str]:
+    """只读 source 列取全部来源，用于增量判断。"""
+    arrow = table.to_lance().to_table(columns=["source"])
     return {
         v if isinstance(v, str) else str(v)
         for v in arrow.column("source").to_pylist()
@@ -166,16 +159,13 @@ def update_db_readme() -> None:
             return
         table = get_or_create_table()
         total = len(table)
-        arrow = table.to_lance().to_table(columns=["source", "project", "category"])
+        arrow = table.to_lance().to_table(columns=["source", "category"])
         sources = arrow.column("source").to_pylist()
-        projects = arrow.column("project").to_pylist()
         categories = arrow.column("category").to_pylist()
 
-        dist: dict[str, int] = {}
         cat_dist: dict[str, int] = {}
         doc_count: dict[str, int] = {}
-        for src, proj, cat in zip(sources, projects, categories):
-            dist[proj or "（未分区）"] = dist.get(proj or "（未分区）", 0) + 1
+        for src, cat in zip(sources, categories):
             if cat:
                 cat_dist[cat] = cat_dist.get(cat, 0) + 1
             doc_count[src] = doc_count.get(src, 0) + 1
@@ -189,12 +179,7 @@ def update_db_readme() -> None:
             f"- 总 chunk 数：{total}",
             f"- 文档数：{len(doc_count)}",
             f"- Embedding：{'/'.join(str(x) for x in kb_embeddings.embedding_identity())}",
-            "",
-            "## 分区分布",
-            "",
         ]
-        for proj, cnt in sorted(dist.items(), key=lambda x: -x[1]):
-            lines.append(f"- {proj}：{cnt} chunks")
         if cat_dist:
             lines += ["", "## 类别分布", ""]
             for cat, cnt in sorted(cat_dist.items(), key=lambda x: -x[1]):
