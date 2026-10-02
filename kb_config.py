@@ -81,11 +81,6 @@ except ImportError:
     _MinerU = None
     _MINERU_SDK_AVAILABLE = False
 
-# ── 内容图谱（自建模块） ──
-CONTENT_GRAPH_PATH = os.environ.get(
-    "CONTENT_GRAPH_PATH", os.path.join(SERVER_DIR, "content_graph.sqlite3")
-)
-
 # ── 目录路径 → 类别 ──
 CATEGORY_MAPPINGS = {
     "论文": "paper",

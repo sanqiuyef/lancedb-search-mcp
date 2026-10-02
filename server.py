@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
-"""LanceDB 知识搜索 MCP Server —— 整改后的薄入口（16 个工具）。
+"""LanceDB 知识搜索 MCP Server —— 整改后的薄入口（14 个工具）。
 
 内核全部基于 lancedb 0.39 官方 API：
   - LanceModel schema + embedding 注册表（kb_schema / kb_embeddings）
   - 原生 BM25 FTS（jieba 分词）+ 官方 hybrid 检索（kb_search）
   - 官方 Reranker 接口实现 SiliconFlow 精排（kb_search.SiliconFlowReranker）
 
-自建模块（待后期单独优化，文件头有标记）：kb_web / kb_watcher /
-content_graph / knowledge_browser_core / knowledge_graph*（桌面端）。
+自建模块（待后期单独优化，文件头有标记）：kb_web（网页入库）/ kb_watcher（目录监听）。
 """
 
-import json
 import os
 from typing import Annotated
 
@@ -24,7 +22,6 @@ import kb_schema
 import kb_search
 import kb_watcher
 import kb_web
-from content_graph import ContentGraphStore, extractor_from_environment
 
 mcp = FastMCP("LanceDB 知识搜索", port=8002)
 
@@ -105,36 +102,6 @@ def search_knowledge(
     except Exception as error:
         return f"❌ 搜索失败: {error}"
     return _fmt_results(query, structured, limit, snippet_mode)
-
-
-def search_knowledge_structured(
-    query: str,
-    project: str = "",
-    search_mode: str = "vector",
-    use_reranker: bool = True,
-    source_filter: str = "",
-    category_filter: str = "",
-    limit: int = 20,
-) -> dict:
-    """桌面浏览器兼容入口：把官方内核结果映射为旧版 payload 形状。"""
-    structured = kb_search.search_structured(
-        query=query,
-        project=_resolve_project(project),
-        limit=max(1, limit),
-        use_reranker=use_reranker,
-        source_filter=source_filter,
-        category_filter=category_filter,
-        search_mode=search_mode,
-    )
-    trace = structured.get("trace", {})
-    return {
-        "results": structured["results"],
-        "mode": trace.get("mode", search_mode),
-        "candidate_count": len(structured["results"]),
-        "reranker_status": trace.get("reranker") or "none",
-        "expanded_query": query,
-        "warning": trace.get("warning", ""),
-    }
 
 
 @mcp.tool(
@@ -370,147 +337,7 @@ def stop_watcher() -> str:
 
 
 # =============================================================
-# 自建能力：内容图谱（GraphRAG）
-# =============================================================
-
-_graph_store = None
-
-
-def _graph_store_instance() -> ContentGraphStore:
-    global _graph_store
-    if _graph_store is None:
-        _graph_store = ContentGraphStore(cfg.CONTENT_GRAPH_PATH)
-    return _graph_store
-
-
-def _content_graph_document(filepath: str, project: str = "") -> dict:
-    """精确定位一个来源并读取图谱输入列；返回 {knowledge_base, source, chunks}。"""
-    project = _resolve_project(project)
-    knowledge_base = project or "global"
-    if not kb_schema.table_exists():
-        raise ValueError("知识库为空。")
-    table = kb_schema.get_or_create_table()
-    sources = kb_schema.existing_sources(table, project)
-    exact = [s for s in sources if s == filepath]
-    if not exact:
-        exact = [s for s in sources if s.casefold() == filepath.casefold()]
-    if not exact:
-        exact = [s for s in sources
-                 if os.path.basename(s).casefold() == os.path.basename(filepath).casefold()]
-    if not exact:
-        exact = [s for s in sources if filepath.casefold() in (s or "").casefold()]
-    exact = sorted(set(exact))
-    if not exact:
-        raise ValueError(f"未找到匹配「{filepath}」的文档。")
-    if len(exact) > 1:
-        preview = "\n".join(f"- {s}" for s in exact[:10])
-        raise ValueError(f"来源匹配不唯一，请传入完整来源路径：\n{preview}")
-    source = exact[0]
-    safe_source = source.replace("'", "''")
-    arrow = table.to_lance().scanner(
-        columns=["source", "text", "chunk_index", "category"],
-        filter=f"source = '{safe_source}'",
-    ).to_table()
-    chunks = [
-        {"source": s, "text": text or "", "chunk_index": int(idx), "category": cat or ""}
-        for s, text, idx, cat in zip(
-            arrow.column("source").to_pylist(),
-            arrow.column("text").to_pylist(),
-            arrow.column("chunk_index").to_pylist(),
-            arrow.column("category").to_pylist(),
-        ) if s == source
-    ]
-    chunks.sort(key=lambda item: item["chunk_index"])
-    return {"knowledge_base": knowledge_base, "source": source, "chunks": chunks}
-
-
-@mcp.tool(
-    name="build_content_graph",
-    description="为一个已入库文档构建或增量更新内容级知识图谱（实体/方法/观点/证据关系，写入独立 SQLite）。",
-)
-def build_content_graph(
-    filepath: Annotated[str, "知识库中的文档路径或文件名"],
-    project: Annotated[str, "分区过滤，空则跨全部分区"] = "",
-    force: Annotated[bool, "内容未变化时是否仍强制重建"] = False,
-) -> str:
-    try:
-        resolved = _content_graph_document(filepath, project)
-        extractor = extractor_from_environment()
-        store = _graph_store_instance()
-        result = store.index_document(
-            resolved["knowledge_base"], resolved["source"], resolved["chunks"],
-            extractor, force=force,
-        )
-        result.update({
-            "knowledge_base": resolved["knowledge_base"], "source": resolved["source"],
-            "extractor": extractor.name,
-        })
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as error:
-        return f"❌ 内容图谱构建失败: {error}"
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True),
-    name="get_content_graph",
-    description="读取某个文档已构建的内容图谱，返回实体、观点、关系、置信度和证据 Chunk。不会触发模型调用。",
-)
-def get_content_graph(
-    filepath: Annotated[str, "知识库中的文档路径或文件名"],
-    project: Annotated[str, "分区过滤，空则跨全部分区"] = "",
-    max_nodes: Annotated[int, "最大返回节点数（10-500，默认 120）"] = 120,
-) -> str:
-    try:
-        resolved = _content_graph_document(filepath, project)
-    except Exception as error:
-        return f"❌ {error}"
-    graph = _graph_store_instance().get_document_graph(
-        resolved["knowledge_base"], resolved["source"], limit=max(10, min(max_nodes, 500))
-    )
-    if not graph["document_id"]:
-        return "当前文档尚未构建内容图谱。请先调用 build_content_graph。"
-    return json.dumps(graph, ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True),
-    name="search_content_graph",
-    description="按名称搜索内容图谱中的实体、方法、观点、主题或数据集；expand=True 时以命中节点为种子展开一跳邻居与关系边（GraphRAG 式检索）。",
-)
-def search_content_graph(
-    query: Annotated[str, "搜索关键词"],
-    kind: Annotated[str, "节点类型过滤（entity/method/claim/topic/dataset）"] = "",
-    project: Annotated[str, "分区过滤（按节点来源位置过滤）"] = "",
-    limit: Annotated[int, "最大返回节点数（默认 20）"] = 20,
-    expand: Annotated[bool, "是否展开一跳邻居与关系边"] = False,
-    max_neighbors: Annotated[int, "展开时的最大邻居数（默认 40）"] = 40,
-) -> str:
-    try:
-        store = _graph_store_instance()
-        if expand:
-            payload = store.search_subgraph(
-                query, kind, limit=max(1, min(limit, 50)), max_neighbors=max_neighbors
-            )
-            return json.dumps({"query": query, "expand": True, **payload},
-                              ensure_ascii=False, indent=2)
-        results = store.search_nodes(query, kind, limit=max(1, min(limit, 100)))
-        if project:
-            for item in results:
-                item["locations"] = [
-                    loc for loc in item["locations"]
-                    if loc["knowledge_base"] == _resolve_project(project)
-                ]
-            results = [item for item in results if item["locations"]]
-        return json.dumps(
-            {"query": query, "count": len(results), "results": results},
-            ensure_ascii=False, indent=2,
-        )
-    except Exception as error:
-        return f"❌ 内容图谱搜索失败: {error}"
-
-
-# =============================================================
-# 注册表工具（桌面端共用）
+# 注册表工具
 # =============================================================
 
 @mcp.tool(
