@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Embedding 后端：自定义 SiliconFlow 函数注册进官方 embedding 注册表。
+"""Embedding 后端：本地 sentence-transformers（全本地化，2026-10-02 起）。
 
-基于 lancedb.embeddings 官方框架：`@register("siliconflow")` 后经
-`get_registry().get("siliconflow").create()` 使用，配合 LanceModel 的
-SourceField/VectorField 在 table.add() 与查询时自动向量化。
+基于 lancedb.embeddings 官方框架：`@register("local-sentence-transformers")`
+注册条目配合 LanceModel 的 SourceField/VectorField 在 table.add() 与查询时
+自动向量化；权重放模块持有器，由 kb_model_lifecycle 闲置卸载。
 """
 
 from __future__ import annotations
@@ -14,8 +14,6 @@ from collections import OrderedDict
 from typing import List, Union
 
 import numpy as np
-
-import requests
 
 from lancedb.embeddings import TextEmbeddingFunction, get_registry, register
 
@@ -60,74 +58,6 @@ def _hash_text(text: str) -> str:
 
 
 _embedding_cache = LRUCache(capacity=2000)
-
-
-def _auth_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if cfg.SILICONFLOW_API_KEY:
-        headers["Authorization"] = f"Bearer {cfg.SILICONFLOW_API_KEY}"
-    return headers
-
-
-# =============================================================
-# 自定义 SiliconFlow EmbeddingFunction（官方注册表条目）
-# =============================================================
-
-@register("siliconflow")
-class SiliconFlowEmbeddings(TextEmbeddingFunction):
-    """SiliconFlow OpenAI 兼容 embedding 接口，默认 Qwen3-Embedding-8B / 1024 维。"""
-
-    name: str = cfg.EMBED_MODEL
-    dimensions: int = cfg.EMBED_DIM
-    batch_size: int = 32
-    api_base: str = cfg.EMBEDDING_URL
-
-    def ndims(self) -> int:
-        return self.dimensions
-
-    def generate_embeddings(
-        self, texts: Union[List[str], np.ndarray]
-    ) -> List[np.array]:
-        """批量生成向量：先查 LRU 缓存，未命中的按 batch_size 分批调 API。"""
-        texts = [str(t) for t in list(texts)]
-        results: list = [None] * len(texts)
-        pending_idx: list[int] = []
-        pending_txt: list[str] = []
-
-        for i, text in enumerate(texts):
-            cached = _embedding_cache.get(_hash_text(text))
-            if cached is not None:
-                results[i] = cached
-            else:
-                pending_idx.append(i)
-                pending_txt.append(text)
-
-        for start in range(0, len(pending_txt), self.batch_size):
-            batch = pending_txt[start:start + self.batch_size]
-            vecs = self._request(batch)
-            for offset, vec in enumerate(vecs):
-                original = pending_idx[start + offset]
-                results[original] = vec
-                _embedding_cache.put(_hash_text(batch[offset]), vec)
-
-        # 全部命中缓存时 results 可能已就绪；不足处兜底（理论不可达）
-        return [np.array(r, dtype=np.float32) for r in results]
-
-    def _request(self, batch: List[str]) -> List[List[float]]:
-        resp = requests.post(
-            self.api_base,
-            headers=_auth_headers(),
-            json={
-                "model": self.name,
-                "input": batch,
-                "encoding_format": "float",
-                "dimensions": self.dimensions,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
 
 
 # =============================================================
@@ -210,30 +140,24 @@ def _resolve_device() -> str:
 
 
 def get_embedding_function():
-    """返回当前激活的官方 EmbeddingFunction（api → siliconflow，local → sentence-transformers）。"""
+    """返回本地 sentence-transformers EmbeddingFunction（全本地化，唯一后端）。"""
     global _embedding_func
     with _embedding_lock:
         if _embedding_func is not None:
             return _embedding_func
-        if cfg.EMBEDDING_BACKEND == "local":
-            func = (
-                get_registry()
-                .get("local-sentence-transformers")
-                .create(name=cfg.LOCAL_EMBED_MODEL, dimensions=cfg.LOCAL_EMBED_DIM,
-                        device=_resolve_device())
-            )
-        else:
-            func = get_registry().get("siliconflow").create()
+        func = (
+            get_registry()
+            .get("local-sentence-transformers")
+            .create(name=cfg.LOCAL_EMBED_MODEL, dimensions=cfg.LOCAL_EMBED_DIM,
+                    device=_resolve_device())
+        )
         _embedding_func = func
         return func
 
 
 def embedding_identity() -> tuple[str, str, int]:
     """(后端, 模型, 维度)，用于状态展示与索引一致性检查。"""
-    func = get_embedding_function()
-    if cfg.EMBEDDING_BACKEND == "local":
-        return ("local", cfg.LOCAL_EMBED_MODEL, cfg.LOCAL_EMBED_DIM)
-    return ("api", getattr(func, "name", type(func).__name__), func.ndims())
+    return ("local", cfg.LOCAL_EMBED_MODEL, cfg.LOCAL_EMBED_DIM)
 
 
 def reset_embedding_function() -> None:

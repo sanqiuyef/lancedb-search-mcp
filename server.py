@@ -109,7 +109,7 @@ def search_knowledge(
 @mcp.tool(
     annotations=ToolAnnotations(readOnlyHint=True),
     name="ask_knowledge",
-    description="基于知识库检索结果回答提问，答案附来源引用（[1] 文件 chunk#N）。检索不到相关内容时明确说明，不编造。",
+    description="基于知识库检索回答问题所需的编号证据块（[1] 来源 + 全文 chunk）。请只依据证据作答并标注 [n] 引用；证据不足时明确说明，不编造。",
 )
 def ask_knowledge(
     query: Annotated[str, "要回答的问题"],
@@ -118,17 +118,16 @@ def ask_knowledge(
     source_filter: Annotated[str, "来源过滤（如 'paper.pdf'）"] = "",
     category_filter: Annotated[str, "类别过滤（如 'paper'）"] = "",
     search_mode: Annotated[str, "搜索模式 - vector / text / hybrid"] = "hybrid",
-    chat_model: Annotated[str, "作答模型名，空则用默认 CHAT_MODEL"] = "",
 ) -> str:
-    return kb_ask.ask_knowledge(
+    result = kb_ask.ask_knowledge(
         query=query,
         limit=limit,
         use_reranker=use_reranker,
         source_filter=source_filter,
         category_filter=category_filter,
         search_mode=search_mode,
-        chat_model=chat_model,
     )
+    return result["evidence_block"]
 
 
 # =============================================================

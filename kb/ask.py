@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
-"""RAG 问答：检索结构化结果 → SiliconFlow chat 带编号引用作答。"""
+"""RAG 证据检索：本地混合检索 + 精排 → 编号证据块（答问由调用方模型完成）。
+
+2026-10-02 全本地化：本包不做任何模型生成调用。bge-m3 检索、bge-reranker
+精排（均在 D:\\huggingface 本地缓存），检索到的证据以 [1]、[2] 编号块返回，
+由调用方（MCP 宿主模型）基于证据作答并标注引用。
+"""
 
 from __future__ import annotations
 
-import requests
-
-from . import config as cfg
 from . import search as kb_search
-
-
-SYSTEM_PROMPT = (
-    "你是知识库问答助手。只能依据提供的检索上下文回答，回答中必须用引用编号"
-    "（如 [1]、[2]）标注依据。上下文不足以回答时明确说不知道，不要编造。"
-)
 
 
 def ask_knowledge(
@@ -22,63 +18,36 @@ def ask_knowledge(
     source_filter: str = "",
     category_filter: str = "",
     search_mode: str = "hybrid",
-    chat_model: str = "",
-) -> str:
-    """基于知识库回答提问，答案附来源引用。"""
-    if not cfg.SILICONFLOW_API_KEY:
-        return "❌ 未配置 SILICONFLOW_API_KEY，无法调用问答模型。"
+) -> dict:
+    """检索回答「问题」所需的证据块，返回 {"evidence": [...], "evidence_block": str}。
 
-    try:
-        structured = kb_search.search_structured(
-            query=query,
-            limit=min(max(limit, 1), 10),
-            use_reranker=use_reranker,
-            source_filter=source_filter,
-            category_filter=category_filter,
-            search_mode=search_mode,
-        )
-    except Exception as e:
-        return f"❌ 检索失败: {e}"
-
+    evidence_block 是可直接嵌进提示词的编号证据文本（[1] 来源 + 全文 chunk），
+    调用方模型应只依据证据作答，并在回答中标注 [n] 引用；证据不足时明确说明。
+    """
+    structured = kb_search.search_structured(
+        query=query,
+        limit=min(max(limit, 1), 10),
+        use_reranker=use_reranker,
+        source_filter=source_filter,
+        category_filter=category_filter,
+        search_mode=search_mode,
+    )
     results = structured["results"]
-    if not results:
-        return f"知识库中未找到与「{query}」相关的内容，无法回答。"
-
-    context_parts = []
+    evidence = []
     for i, d in enumerate(results, 1):
-        context_parts.append(
-            f"[{i}] 来源: {d.get('source', '?')}（chunk #{d.get('chunk_index', 0)}）\n{d.get('text', '')}"
-        )
-    context = "\n\n".join(context_parts)
-    user_prompt = f"问题: {query}\n\n检索到的上下文:\n{context}"
+        evidence.append({
+            "cite": f"[{i}]",
+            "source": d.get("source", "?"),
+            "chunk_index": d.get("chunk_index", 0),
+            "category": d.get("category", ""),
+            "text": d.get("text", ""),
+        })
 
-    try:
-        resp = requests.post(
-            cfg.CHAT_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {cfg.SILICONFLOW_API_KEY}",
-            },
-            timeout=120,
-            json={
-                "model": chat_model or cfg.CHAT_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.2,
-                "max_tokens": 1024,
-            },
-        )
-        resp.raise_for_status()
-        answer = resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"❌ 问答模型调用失败: {e}"
-
-    ref_lines = []
-    for i, d in enumerate(results, 1):
-        source = d.get("source", "?")
-        fname = source.split("\\")[-1] if "\\" in source else source.split("/")[-1]
-        ref_lines.append(f"[{i}] {fname} #{d.get('chunk_index', 0)} — {source}")
-
-    return f"📖 **知识库问答** 「{query}」\n\n{answer}\n\n── 引用 ──\n" + "\n".join(ref_lines)
+    lines = [f"知识库证据（问题：「{query}」，共 {len(evidence)} 条）：", ""]
+    for ev in evidence:
+        lines.append(f"{ev['cite']} 来源: {ev['source']}（chunk #{ev['chunk_index']}）")
+        lines.append(ev["text"])
+        lines.append("")
+    if not evidence:
+        lines = [f"知识库中未找到与「{query}」相关的证据。"]
+    return {"evidence": evidence, "evidence_block": "\n".join(lines).strip()}

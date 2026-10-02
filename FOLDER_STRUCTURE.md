@@ -5,11 +5,11 @@ lancedb-search/
 ├── server.py                       MCP 薄入口（14 个工具定义）
 ├── kb/                             知识库核心包
 │   ├── config.py                   环境变量与单库路径解析（无分区）
-│   ├── embeddings.py               SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
+│   ├── embeddings.py               本地 embedding（bge-m3，官方注册表 + LRU 缓存）
 │   ├── model_lifecycle.py          本地模型生命周期：用时挂载、闲置自动卸载显存
 │   ├── schema.py                   LanceModel schema、建表、FTS/向量索引、库目录 README
 │   ├── ingest.py                   文档解析（OCR 链）、分块、增删改查
-│   ├── search.py                   官方 hybrid 检索 + SiliconFlow/本地 CrossEncoder 精排（回退 RRF）
+│   ├── search.py                   官方 hybrid 检索 + 本地 CrossEncoder 精排（回退 RRF）
 │   ├── ask.py                      RAG 问答（chat + 编号引用）
 │   ├── web.py                      [自建模块 · 待优化] 网页抓取入库
 │   └── watcher.py                  [自建模块 · 待优化] watchdog 目录监听

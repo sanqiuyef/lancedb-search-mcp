@@ -11,24 +11,10 @@ from __future__ import annotations
 import os
 import sys
 
-# 项目根目录（kb 包的上级）；kb-config.json 等本机配置都在根目录
+# 项目根目录（kb 包的上级）；本机配置都在根目录
 SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# ── API 服务（SiliconFlow：embedding / rerank / chat） ──
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
-EMBEDDING_URL = "https://api.siliconflow.cn/v1/embeddings"
-RERANK_URL = "https://api.siliconflow.cn/v1/rerank"
-CHAT_URL = os.environ.get("CHAT_URL", "https://api.siliconflow.cn/v1/chat/completions")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "Qwen/Qwen3-8B")
-EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
-RERANK_MODEL = "Qwen/Qwen3-Reranker-8B"
-EMBED_DIM = 1024  # Qwen3-Embedding-8B 支持 32~4096，1024 是质量/成本最佳平衡点
-
-# ── 后端选择：api（默认）/ local ──
-EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND", "api").lower()
-RERANKER_BACKEND = os.environ.get("RERANKER_BACKEND", "api").lower()
-
-# ── 本地模型配置（官方 sentence-transformers 注册表条目） ──
+# ── 本地模型（2026-10-02 起全本地化：仅 D:\huggingface 的 bge-m3 + bge-reranker，零云端依赖） ──
 LOCAL_EMBED_MODEL = os.environ.get("LOCAL_EMBED_MODEL", "BAAI/bge-m3")
 LOCAL_EMBED_DIM = int(os.environ.get("LOCAL_EMBED_DIM", "1024"))
 LOCAL_RERANK_MODEL = os.environ.get("LOCAL_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")

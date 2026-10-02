@@ -35,7 +35,6 @@ class FakeEmbeddings(TextEmbeddingFunction):
 
 def activate_fake_embedding() -> None:
     """把测试 embedding 设为激活后端，并清空 schema 缓存。"""
-    cfg.EMBEDDING_BACKEND = "test"
     kb_embeddings.reset_embedding_function()
     kb_embeddings._embedding_func = FakeEmbeddings.create()
     kb_schema._chunk_model = None

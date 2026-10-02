@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "lancedb-search": {
-      "description": "LanceDB knowledge search and content graph tools",
+      "description": "LanceDB knowledge search (fully local: bge-m3 + bge-reranker)",
       "command": "python",
       "args": [
         "-X",
@@ -9,15 +9,13 @@
         "D:\\path\\to\\lancedb-search-mcp\\server.py"
       ],
       "env": {
-        "SILICONFLOW_API_KEY": "replace-with-an-environment-specific-secret",
-        "EMBEDDING_BACKEND": "siliconflow",
-        "RERANKER_BACKEND": "siliconflow",
         "LANCEDB_OCR": "1",
         "TESSERACT_CMD": "D:\\path\\to\\tesseract.exe",
         "LANCEDB_OCR_LANG": "chi_sim+eng",
         "HF_HOME": "D:\\huggingface",
         "HF_HUB_CACHE": "D:\\huggingface\\hub",
-        "KMP_DUPLICATE_LIB_OK": "TRUE"
+        "KMP_DUPLICATE_LIB_OK": "TRUE",
+        "LANCEDB_DB_PATH": "D:\\cherry-workplace\\knowledge-hub\\lancedb"
       }
     }
   }

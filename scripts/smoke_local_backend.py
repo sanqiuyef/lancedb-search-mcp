@@ -10,8 +10,7 @@ from kb import config as cfg  # noqa: E402
 from kb import search as ks  # noqa: E402
 from kb.embeddings import embed_query, embedding_identity  # noqa: E402
 
-print(f"EMBEDDING_BACKEND = {cfg.EMBEDDING_BACKEND}")
-print(f"RERANKER_BACKEND  = {cfg.RERANKER_BACKEND}")
+print("后端：全本地（embedding=bge-m3 / reranker=bge-reranker-v2-m3）")
 backend, model, dims = embedding_identity()
 print(f"embedding_identity: {backend} / {model} / {dims} 维")
 print(f"reranker_identity : {ks.reranker_identity()}")

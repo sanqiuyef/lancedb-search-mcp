@@ -69,38 +69,12 @@ class KBEndToEnd(unittest.TestCase):
                                         source_filter="flood")
         self.assertTrue(all("flood" in x["source"] for x in r["results"]))
 
-    def test_siliconflow_reranker_falls_back_on_api_error(self):
-        class Boom:
-            def post(self, *a, **k):
-                raise ConnectionError("api down")
-
+    def test_build_reranker_always_local(self):
         from kb import search as ks
 
-        original = ks.requests
-        try:
-            class FakeRequests:
-                post = staticmethod(lambda *a, **k: (_ for _ in ()).throw(ConnectionError("x")))
-
-            ks.requests = FakeRequests
-            reranker = ks.SiliconFlowReranker()
-            vector_results = self.table.search("BIMbase").with_row_id(True).limit(2).to_arrow()
-            fts_results = self.table.search("BIMbase", query_type="fts").with_row_id(True).limit(2).to_arrow()
-            merged = reranker.rerank_hybrid("BIMbase", vector_results, fts_results)
-            self.assertGreater(merged.num_rows, 0)
-        finally:
-            ks.requests = original
-
-    def test_build_reranker_routing(self):
-        from kb import search as ks
-
-        original = ks.cfg.RERANKER_BACKEND
-        try:
-            ks.cfg.RERANKER_BACKEND = "local"
-            self.assertIsInstance(ks.build_reranker(), ks.LocalCrossEncoderReranker)
-            ks.cfg.RERANKER_BACKEND = "none"
-            self.assertIsInstance(ks.build_reranker(), ks.RRFReranker)
-        finally:
-            ks.cfg.RERANKER_BACKEND = original
+        self.assertIsInstance(ks.build_reranker(), ks.LocalCrossEncoderReranker)
+        self.assertEqual(ks.reranker_identity(),
+                         f"local / {ks.cfg.LOCAL_RERANK_MODEL}（首次检索时加载）")
 
     def test_local_reranker_merges_and_sorts(self):
         from kb import search as ks
