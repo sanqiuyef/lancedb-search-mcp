@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""检索内核：官方 hybrid 检索 + 自定义 SiliconFlow reranker。
+"""检索内核：官方 hybrid 检索 + SiliconFlow / 本地 CrossEncoder reranker。
 
 官方模式：table.search(query, query_type="hybrid") 同时走向量召回与原生
-BM25 FTS 召回，由 Reranker 融合排序。默认 RRF；配置 API 精排时使用本模块的
-SiliconFlowReranker（官方 Reranker 子类），API 失败自动回退 RRF。
+BM25 FTS 召回，由 Reranker 融合排序。默认 RRF；RERANKER_BACKEND=api 时用
+SiliconFlowReranker（官方 Reranker 子类），=local 时用 LocalCrossEncoderReranker
+（BAAI/bge-reranker-v2-m3），两者失败均自动回退 RRF。
 """
 
 from __future__ import annotations
@@ -94,11 +95,99 @@ class SiliconFlowReranker(Reranker):
         return combined
 
 
+# =============================================================
+# 本地 reranker（CrossEncoder，默认 BAAI/bge-reranker-v2-m3）
+# =============================================================
+
+_local_cross_encoder = None
+
+
+def _get_cross_encoder():
+    """进程级单例：CrossEncoder 权重较大，首次精排时才加载，之后复用。"""
+    global _local_cross_encoder
+    if _local_cross_encoder is None:
+        from sentence_transformers import CrossEncoder
+
+        from .embeddings import _resolve_device
+        _local_cross_encoder = CrossEncoder(
+            cfg.LOCAL_RERANK_MODEL, device=_resolve_device()
+        )
+    return _local_cross_encoder
+
+
+def reset_local_reranker() -> None:
+    """测试用：清空 CrossEncoder 单例。"""
+    global _local_cross_encoder
+    _local_cross_encoder = None
+
+
+class LocalCrossEncoderReranker(Reranker):
+    """本地 CrossEncoder 对融合候选精排；模型加载或推理失败回退 RRF。
+
+    构造轻量（不触发模型加载），权重在首次 rerank_hybrid 时才载入显存。
+    """
+
+    def __init__(self, model: str = "", top_n: int = 32, truncate_chars: int = 1024):
+        super().__init__()
+        self.model = model or cfg.LOCAL_RERANK_MODEL
+        self.top_n = top_n
+        self.truncate_chars = truncate_chars
+        self.fallback = RRFReranker()
+
+    def rerank_hybrid(
+        self,
+        query: str,
+        vector_results: pa.Table,
+        fts_results: pa.Table,
+    ) -> pa.Table:
+        try:
+            return self._rerank(query, vector_results, fts_results)
+        except Exception as e:
+            print(f"[reranker] 本地精排失败，回退 RRF: {e}", file=sys.stderr)
+            return self.fallback.rerank_hybrid(query, vector_results, fts_results)
+
+    def _rerank(
+        self,
+        query: str,
+        vector_results: pa.Table,
+        fts_results: pa.Table,
+    ) -> pa.Table:
+        combined = self.merge_results(vector_results, fts_results)  # 去重合并
+        if combined.num_rows == 0:
+            return combined
+
+        docs = combined.slice(0, min(self.top_n, combined.num_rows))
+        texts = [t[: self.truncate_chars] for t in docs.column("text").to_pylist()]
+        scores = _get_cross_encoder().predict(
+            [(query, t) for t in texts], show_progress_bar=False
+        )
+
+        # 未参与精排的尾部候选统一给 0 分，保持出现在结果尾部
+        all_scores = [0.0] * combined.num_rows
+        for i, s in enumerate(scores):
+            all_scores[i] = float(s)
+        combined = combined.append_column(
+            "_relevance_score", pa.array(all_scores, type=pa.float32())
+        ).sort_by([("_relevance_score", "descending")])
+        return combined
+
+
 def build_reranker():
-    """按配置返回 reranker：api → SiliconFlow 精排；否则官方 RRF。"""
+    """按配置返回 reranker：api → SiliconFlow 精排；local → 本地 CrossEncoder；否则官方 RRF。"""
     if cfg.RERANKER_BACKEND == "api" and cfg.SILICONFLOW_API_KEY:
         return SiliconFlowReranker()
+    if cfg.RERANKER_BACKEND == "local":
+        return LocalCrossEncoderReranker()
     return RRFReranker()
+
+
+def reranker_identity() -> str:
+    """当前 reranker 描述（不触发模型加载），用于状态展示。"""
+    if cfg.RERANKER_BACKEND == "api" and cfg.SILICONFLOW_API_KEY:
+        return f"api / {cfg.RERANK_MODEL}"
+    if cfg.RERANKER_BACKEND == "local":
+        return f"local / {cfg.LOCAL_RERANK_MODEL}（首次检索时加载）"
+    return "RRF（无神经精排）"
 
 
 # =============================================================

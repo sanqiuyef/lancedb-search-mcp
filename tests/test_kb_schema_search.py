@@ -96,6 +96,55 @@ class KBEndToEnd(unittest.TestCase):
         finally:
             ks.requests = original
 
+    def test_build_reranker_routing(self):
+        from kb import search as ks
+
+        original = ks.cfg.RERANKER_BACKEND
+        try:
+            ks.cfg.RERANKER_BACKEND = "local"
+            self.assertIsInstance(ks.build_reranker(), ks.LocalCrossEncoderReranker)
+            ks.cfg.RERANKER_BACKEND = "none"
+            self.assertIsInstance(ks.build_reranker(), ks.RRFReranker)
+        finally:
+            ks.cfg.RERANKER_BACKEND = original
+
+    def test_local_reranker_merges_and_sorts(self):
+        from kb import search as ks
+
+        class FakeCE:
+            def predict(self, pairs, show_progress_bar=False):
+                return [1.0 - 0.1 * i for i in range(len(pairs))]
+
+        original = ks._local_cross_encoder
+        try:
+            ks._local_cross_encoder = FakeCE()
+            reranker = ks.LocalCrossEncoderReranker()
+            vector_results = self.table.search("BIMbase").with_row_id(True).limit(2).to_arrow()
+            fts_results = self.table.search("BIMbase", query_type="fts").with_row_id(True).limit(2).to_arrow()
+            merged = reranker.rerank_hybrid("BIMbase", vector_results, fts_results)
+            self.assertGreater(merged.num_rows, 0)
+            scores = merged.column("_relevance_score").to_pylist()
+            self.assertEqual(scores, sorted(scores, reverse=True))
+        finally:
+            ks._local_cross_encoder = original
+
+    def test_local_reranker_falls_back_on_model_error(self):
+        from kb import search as ks
+
+        def boom():
+            raise RuntimeError("model load failed")
+
+        original = ks._get_cross_encoder
+        try:
+            ks._get_cross_encoder = boom
+            reranker = ks.LocalCrossEncoderReranker()
+            vector_results = self.table.search("BIMbase").with_row_id(True).limit(2).to_arrow()
+            fts_results = self.table.search("BIMbase", query_type="fts").with_row_id(True).limit(2).to_arrow()
+            merged = reranker.rerank_hybrid("BIMbase", vector_results, fts_results)
+            self.assertGreater(merged.num_rows, 0)  # RRF 回退仍有结果
+        finally:
+            ks._get_cross_encoder = original
+
     def test_empty_db_raises(self):
         import tempfile
 

@@ -33,6 +33,7 @@ RERANKER_BACKEND = os.environ.get("RERANKER_BACKEND", "api").lower()
 # ── 本地模型配置（官方 sentence-transformers 注册表条目） ──
 LOCAL_EMBED_MODEL = os.environ.get("LOCAL_EMBED_MODEL", "BAAI/bge-m3")
 LOCAL_EMBED_DIM = int(os.environ.get("LOCAL_EMBED_DIM", "1024"))
+LOCAL_RERANK_MODEL = os.environ.get("LOCAL_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 LOCAL_MODEL_DEVICE = os.environ.get("LOCAL_MODEL_DEVICE", "auto").lower()
 
 # ── 单库与表 ──

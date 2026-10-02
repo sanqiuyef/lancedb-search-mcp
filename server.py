@@ -141,13 +141,14 @@ def ask_knowledge(
     description="查看知识库状态：文档数量、分区分布、索引状态、embedding 配置等信息。",
 )
 def get_knowledge_status() -> str:
-    from kb_embeddings import embedding_identity
+    from kb.embeddings import embedding_identity
 
     if not kb_schema.table_exists():
         backend, model, dims = embedding_identity()
         return (
             f"❌ 知识库为空（库路径: {cfg.resolve_db_path()}）\n"
-            f"Embedding: {backend} / {model} / {dims} 维"
+            f"Embedding: {backend} / {model} / {dims} 维\n"
+            f"Reranker: {kb_search.reranker_identity()}"
         )
     table = kb_schema.get_or_create_table()
     arrow = table.to_lance().to_table(columns=["source", "project", "category"])
@@ -170,6 +171,7 @@ def get_knowledge_status() -> str:
         f"库路径: {cfg.resolve_db_path()}",
         f"总 chunk 数: {len(table)} | 文档数: {len(set(sources))}",
         f"Embedding: {backend} / {model} / {dims} 维",
+        f"Reranker: {kb_search.reranker_identity()}",
         f"索引: {', '.join(sorted(index_names)) or '（无）'}",
         "",
         "分区分布:",
