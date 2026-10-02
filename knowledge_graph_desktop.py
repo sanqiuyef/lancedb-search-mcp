@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Native LanceDB knowledge browser with lazy semantic graph loading."""
+"""[自建模块 · 待后期单独优化] PySide6 桌面知识浏览器：文档浏览、检索 trace、力导向图谱。
+现状：本次仅做列兼容适配（新 schema 多出 doc_id/ingested_at 列不影响读取）；
+优化方向：接入 kb_search 官方 hybrid 内核、拆分 UI 与数据层。
+
+Native LanceDB knowledge browser with lazy semantic graph loading."""
 
 from __future__ import annotations
 

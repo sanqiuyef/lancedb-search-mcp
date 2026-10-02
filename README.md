@@ -1,49 +1,87 @@
 # LanceDB Search MCP
 
-面向 AI 工作流的本地 LanceDB 文档检索、搜索解释与知识可视化工具。项目同时提供 MCP 服务和原生 PySide6“LanceDB 知识浏览器”。
+面向 AI 工作流的本地文档知识库检索服务。内核完全基于 **lancedb 0.39 官方 SDK**：
+LanceModel schema、官方 embedding 注册表、原生 BM25 全文检索（jieba 中文分词）、
+官方 hybrid 混合检索与 Reranker 接口。另提供 PySide6 桌面「知识浏览器」（自建模块）。
+
+> 2026-10 全面整改：旧版手写 RRF/混合检索/embedding 调度全部替换为官方 API，
+> 工具面从 26 个精简为 17 个。知识库数据按用户决定**全部清空**
+> （旧库与新库均已删除，从零开始按需入库）。
 
 ## 主要能力
 
-- Vector、Text、Hybrid 检索，以及可追踪的 RRF、类别提升和 Reranker 流水线；
-- 按来源精确读取文件全文与 Chunk，不依赖模糊文件名匹配；
-- 原生桌面端浏览知识库、原件状态、搜索解释和索引健康；
-- 文档级语义关系图，以及带 Chunk 证据的实体、方法、观点和主题图谱；
-- 独立 SQLite 侧车库存储人工关系与内容图谱，不修改 LanceDB 向量和源文件；
-- MinerU 超过 200 页 PDF 的本地拆分与页码偏移清单。
-- Chunk 文本资产与可切换 Embedding generation：换 Embedding 不再需要源 PDF/Word，Reranker 可独立替换。
+- **官方 hybrid 检索**：`query_type="hybrid"` 向量 + BM25 融合，RRF 或 SiliconFlow 精排；
+- **官方 embedding 注册表**：自定义 `siliconflow` EmbeddingFunction（Qwen3-Embedding-8B / 1024 维），
+  `table.add()` 自动向量化，LRU 缓存；
+- **原生 FTS**：Lance 原生 BM25 倒排索引，jieba 分词（词典在 `LANCE_LANGUAGE_MODEL_HOME`）；
+- **RAG 问答**：ask_knowledge 带编号引用作答；
+- **内容图谱（GraphRAG）**：实体/观点/方法图谱 + 子图检索（自建，独立 SQLite 侧车）；
+- **OCR 链路**：PDF 文本层 → MinerU API → 本地 Tesseract 回退；
+- **网页抓取 + 目录监听**自动重索引（自建）。
 
-详细使用说明见 [KNOWLEDGE_BROWSER.md](KNOWLEDGE_BROWSER.md)。
+## MCP 工具（17 个）
+
+| 类别 | 工具 |
+|---|---|
+| 检索问答 | search_knowledge、ask_knowledge、search_similar、get_document |
+| 知识库管理 | get_knowledge_status、list_documents、list_knowledge_bases、add_documents、add_single_document、update_document、delete_documents |
+| 自建能力 | ingest_url、start_watcher、stop_watcher、build_content_graph、get_content_graph、search_content_graph |
+
+已移除：switch_knowledge_base（legacy shim）、资产/generation 机制 7 工具
+（export/restore/verify/rebuild/switch/list_generations）、generate_index、extract_to_note。
+
+## 自建模块清单（待后期单独优化）
+
+以下模块为自建实现，文件头部有 `[自建模块 · 待后期单独优化]` 标记：
+
+| 模块 | 说明 | 优化方向 |
+|---|---|---|
+| `kb_web.py` | 网页抓取入库 | 反爬重试、正文智能抽取、与 web-search-server 抓取链复用 |
+| `kb_watcher.py` | watchdog 目录监听 | 多目录注册、删除事件同步、事件队列 |
+| `content_graph.py` | GraphRAG 内容图谱侧车 | 抽取器提示词、节点合并、子图检索排序 |
+| `knowledge_browser_core.py` | 桌面浏览器支撑层（含旧版手写检索路径） | 检索路径迁移到 kb_search 官方内核 |
+| `knowledge_graph.py` / `knowledge_graph_desktop.py` | 桌面浏览器与文档图谱 | 接入官方 hybrid 内核、拆分 UI 与数据层 |
+
+## 架构（整改后）
+
+```
+server.py            MCP 薄入口（17 工具）
+kb_config.py         环境变量 + kb-config.json 分区注册表（热重载）
+kb_embeddings.py     SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
+kb_schema.py         LanceModel schema、建表、FTS/向量索引维护、库目录 README
+kb_ingest.py         解析（含 OCR）、分块（800/100）、增删改查
+kb_search.py         官方 hybrid + SiliconFlowReranker（官方 Reranker 子类，失败回退 RRF）
+kb_ask.py            RAG 问答
+kb_web.py / kb_watcher.py / content_graph.py    [自建模块]
+knowledge_browser_core.py / knowledge_graph*.py [自建模块 · 桌面端]
+scripts/rebuild_from_sources.py   新库重建迁移脚本（checkpoint 断点续传）
+```
+
+单库分区模式：所有项目分区共存于同一个 LanceDB 库，`project` 列过滤，
+`kb-config.json` 维护 分区名 → 源文件目录 映射。库路径优先级：
+`LANCEDB_DB_PATH 环境变量 > kb-config.json 的 db_path > 默认 knowledge_v2`。
+
+## 数据状态
+
+- **知识库当前完全为空**（2026-10-02 用户决定清空全部向量数据：旧库与 knowledge_v2 均已删除）；
+- 按需入库：MCP 工具 `add_documents`（扫目录）/ `add_single_document`（单文件）；
+- 批量重建：`D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py`
+  （按 kb-config 分区源目录重建，支持 `--dry-run`、`--project`、`--limit-files`，checkpoint 断点续传）；
+- 唯一历史备份：`D:\cherry-workplace\旧库文本备份-20261002.zip`（旧库 36,857 chunks 的纯文本，非向量；不需要可删）。
 
 ## 安全约定
 
-仓库不会提交以下本机数据：
-
-- API Key、Token、`.mcp.json` 和 `.env`；
-- `kb-config.json` 中的本机路径；
-- LanceDB 数据、SQLite 侧车库、日志、虚拟环境和打包产物。
-
-首次使用时复制示例配置：
-
-```powershell
-Copy-Item .mcp.example.json .mcp.json
-Copy-Item kb-config.example.json kb-config.json
-```
-
-然后按本机环境修改路径，并通过环境变量或本地 MCP 配置提供密钥。
+仓库不提交：API Key、`.mcp.json`、`kb-config.json`（本机路径）、LanceDB 数据、
+SQLite 侧车库、日志、虚拟环境、打包产物。首次使用复制
+`.mcp.example.json` → `.mcp.json`、`kb-config.example.json` → `kb-config.json` 并按本机修改。
 
 ## 源码运行
 
-建议在独立 Python 环境中安装依赖：
-
 ```powershell
-python -m pip install -r requirements-browser-build.txt
-python -X utf8 knowledge_graph_desktop.py
-```
-
-启动 MCP 服务：
-
-```powershell
-python -X utf8 server.py
+python -m pip install -r requirements-runtime.txt      # MCP 运行时
+python -m pip install -r requirements-browser-build.txt # 桌面端打包
+python -X utf8 server.py                                # MCP 服务
+python -X utf8 knowledge_graph_desktop.py               # 桌面浏览器
 ```
 
 ## 测试
@@ -52,28 +90,5 @@ python -X utf8 server.py
 python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-## 可恢复知识资产与 Embedding 迁移
-
-`my_docs` 仍是兼容旧 MCP 与浏览器的活动检索表；入库时会同步保存独立的
-Chunk 文本资产。向量只是从这些资产派生出来的 generation。
-
-1. 先用 `verify_knowledge_assets` 检查 Chunk 资产完整性。
-2. 修改 Embedding 配置后调用 `rebuild_knowledge`。它从持久化 Chunk 重建新
-   generation，成功校验前不会删除活动索引。
-3. 用 `list_embedding_generations` 查看新旧模型，必要时调用
-   `switch_embedding_generation` 回滚。若库在旧 generation 之后新增了文本，
-   系统会拒绝切换，以免遗漏新文档；应先对该模型重新构建。
-4. 定期用 `export_knowledge_assets` 导出 ZIP；源文件遗失或数据库重建时，先用
-   `restore_knowledge_assets` 导入，再调用 `rebuild_knowledge`。
-
-资产包包含完整 Chunk 原文、来源、类别、顺序与哈希，不包含向量或原始二进制
-文件。因此它可以跨 Embedding/Reranker 和向量模型维度迁移，但不能还原 PDF 的
-版式、图片或附件。
-
-## 打包
-
-```powershell
-.\build_knowledge_browser.ps1 -VenvPath ".\.build-venv-clean" -SkipInstall
-```
-
-构建脚本会生成 `dist\KnowledgeBrowser\KnowledgeBrowser.exe`，并自动运行不调用 Embedding、Reranker 或外部 API 的 smoke test。
+44 个离线测试（假 embedding、mock HTTP），覆盖配置、分块、schema/检索端到端、
+reranker 回退、问答、网页解析、内容图谱。

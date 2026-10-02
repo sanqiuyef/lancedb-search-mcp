@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Build document-level semantic graphs from one or more LanceDB knowledge bases."""
+"""[自建模块 · 待后期单独优化] 文档级语义图谱构建（桌面端依赖）。
+现状：基于向量聚类的轻量实现；优化方向：与 content_graph 实体层融合。
+
+Build document-level semantic graphs from one or more LanceDB knowledge bases."""
 
 import argparse
 import html

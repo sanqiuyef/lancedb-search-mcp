@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Structured, read-mostly services for the LanceDB knowledge browser."""
+"""[自建模块 · 待后期单独优化] 桌面浏览器支撑层：KB 注册表规范化、检索 trace、手动关系库。
+现状：内含旧版手写 RRF 检索路径（桌面端专用）；优化方向：迁移到 kb_search 官方内核。
+
+Structured, read-mostly services for the LanceDB knowledge browser."""
 
 from __future__ import annotations
 

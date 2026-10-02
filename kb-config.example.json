@@ -12,5 +12,6 @@
       ]
     }
   },
-  "default": "global"
+  "default": "global",
+  "db_path": "D:\\cherry-workplace\\knowledge_v2"
 }

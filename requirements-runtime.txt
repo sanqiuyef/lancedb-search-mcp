@@ -1,9 +1,8 @@
-# Minimal isolated runtime for the LanceDB Search MCP service.
-# Optional local embedding, MinerU and desktop-packaging dependencies stay out
-# of this environment so unrelated global packages cannot break the server.
+# LanceDB Search MCP runtime — 基于 lancedb 0.39 官方 SDK 内核（整改后）。
+# 本地 OCR / MinerU / 桌面打包依赖不在此列表，按需安装。
 mcp>=1.27.0,<2
-lancedb==0.34.0
-pylance
+lancedb==0.39.0
+pylance>=12.0.0
 numpy
 pyarrow
 requests
@@ -11,4 +10,3 @@ PyMuPDF
 python-docx
 beautifulsoup4
 watchdog
-pandas

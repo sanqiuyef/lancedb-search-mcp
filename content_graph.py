@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Incremental, evidence-backed content graph stored beside LanceDB.
+"""[自建模块 · 待后期单独优化] 内容图谱（GraphRAG）SQLite 侧车：实体/观点/方法/主题抽取与证据链。
+现状：启发式抽取器噪声偏高；优化方向：抽取器提示词、节点合并、子图检索排序。
+
+Incremental, evidence-backed content graph stored beside LanceDB.
 
 LanceDB remains the source of truth for full chunk text and vectors.  This
 module stores only stable identities, short previews, extracted concepts and

@@ -1,10 +1,12 @@
+# 桌面知识浏览器（PyInstaller 打包）依赖 — [自建模块 · 待后期单独优化]
 pyinstaller==6.21.0
 PySide6==6.11.1
-lancedb==0.34.0
+lancedb==0.39.0
+pylance>=12.0.0
 numpy
 pyarrow
 requests
-mcp
+mcp>=1.27.0,<2
 pywin32
 python-docx
 beautifulsoup4
