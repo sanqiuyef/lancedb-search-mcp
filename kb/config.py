@@ -2,7 +2,8 @@
 r"""集中配置：环境变量与单库路径。
 
 单库不分区的扁平结构：所有文档共居一个 LanceDB 库（2026-10-02 用户决定
-移除分区机制，kb-config.json 注册表废止）。默认库为 D:\cherry-workplace\knowledge_v2。
+移除分区机制，kb-config.json 注册表废止）。默认库为全局知识库内的
+D:\cherry-workplace\knowledge-hub\lancedb（根目录将作为 Obsidian vault 协作搭建）。
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ LOCAL_MODEL_DEVICE = os.environ.get("LOCAL_MODEL_DEVICE", "auto").lower()
 LOCAL_MODEL_IDLE_UNLOAD = int(os.environ.get("LOCAL_MODEL_IDLE_UNLOAD", "300"))
 
 # ── 单库与表 ──
-DEFAULT_DB_PATH = r"D:\cherry-workplace\knowledge_v2"  # 整改后的活动库（旧库已删除）
+DEFAULT_DB_PATH = r"D:\cherry-workplace\knowledge-hub\lancedb"  # 全局知识库内的向量库子目录
 TABLE_NAME = "my_docs"
 
 # ── 文档扫描 ──
@@ -101,7 +102,7 @@ CATEGORY_MAPPINGS = {
 
 
 def resolve_db_path() -> str:
-    """库路径解析优先级：LANCEDB_DB_PATH 环境变量 > 默认 knowledge_v2。"""
+    """库路径解析优先级：LANCEDB_DB_PATH 环境变量 > 默认 knowledge-hub/lancedb。"""
     env = os.environ.get("LANCEDB_DB_PATH", "")
     if env:
         return env

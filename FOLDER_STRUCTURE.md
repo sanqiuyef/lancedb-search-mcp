@@ -36,7 +36,8 @@ lancedb-search/
 
 ## 数据目录（不在仓库内）
 
-- 知识库当前**完全为空**（2026-10-02 用户决定清空全部向量数据）；首次入库时自动重建 `knowledge_v2`
+- 知识库当前**完全为空**（2026-10-02 用户决定清空全部向量数据）；首次入库时在
+  `D:\cherry-workplace\knowledge-hub\lancedb`（全局知识库根目录内的向量库子文件夹）自动重建
 - `D:\huggingface\hub` — bge-m3 / bge-reranker-v2-m3 模型缓存（HF_HOME）
 - `D:\lance\language_models\jieba` — jieba 分词词典（LANCE_LANGUAGE_MODEL_HOME）
 

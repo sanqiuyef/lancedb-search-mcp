@@ -172,7 +172,7 @@ def update_db_readme() -> None:
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         lines = [
-            "# LanceDB 知识库（knowledge_v2）",
+            "# LanceDB 知识库",
             "",
             f"> 本文件由 lancedb-search MCP 自动维护，更新时间：{now}",
             "",

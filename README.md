@@ -59,11 +59,11 @@ scripts/                 rebuild_from_sources.py（批量重建）+ 冒烟脚本
 
 单库扁平模式（2026-10-02 起移除分区机制）：一个 LanceDB 库一个池子，无 project 列；
 类别（category）按源目录自动标注，可作过滤条件。库路径优先级：
-`LANCEDB_DB_PATH 环境变量 > 默认 knowledge_v2`。
+`LANCEDB_DB_PATH 环境变量 > 默认 knowledge-hub/lancedb`（全局知识库根目录内的向量库子文件夹，根目录规划与 Obsidian 协作）。
 
 ## 数据状态
 
-- **知识库当前完全为空**（2026-10-02 用户决定清空全部向量数据：旧库与 knowledge_v2 均已删除）；
+- **知识库当前完全为空**（2026-10-02 用户决定清空全部向量数据并迁移至 `D:\cherry-workplace\knowledge-hub\lancedb`）；
 - 按需入库：MCP 工具 `add_documents`（扫目录）/ `add_single_document`（单文件）；
 - 批量重建：`D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py`
   （直接给源目录，支持 `--dry-run`、`--limit-files`，checkpoint 断点续传）。
