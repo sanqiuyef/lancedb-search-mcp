@@ -13,7 +13,8 @@ LanceModel schema、官方 embedding 注册表、原生 BM25 全文检索（jieb
 
 - **官方 hybrid 检索**：`query_type="hybrid"` 向量 + BM25 融合，RRF 或 SiliconFlow 精排；
 - **本地模型**（当前后端）：BAAI/bge-m3 嵌入 + bge-reranker-v2-m3 精排，RTX 4060 实测通过，
-  零 API 费用；可经 `EMBEDDING_BACKEND=api` 切回 SiliconFlow Qwen3 组合；
+  零 API 费用；**用时挂载、闲置自动卸载显存**（`LOCAL_MODEL_IDLE_UNLOAD`，默认 300s，
+  0=常驻，对齐 Ollama keep-alive）；可经 `EMBEDDING_BACKEND=api` 切回 SiliconFlow Qwen3 组合；
 - **原生 FTS**：Lance 原生 BM25 倒排索引，jieba 分词（词典在 `LANCE_LANGUAGE_MODEL_HOME`）；
 - **RAG 问答**：ask_knowledge 带编号引用作答；
 - **OCR 链路**：PDF 文本层 → MinerU API → 本地 Tesseract 回退；
@@ -47,12 +48,13 @@ server.py                MCP 薄入口（14 工具）
 kb/                      知识库核心包
   config.py              环境变量 + kb-config.json 分区注册表（热重载）
   embeddings.py          SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
+  model_lifecycle.py     本地模型生命周期：用时挂载、闲置自动卸载（gc + empty_cache）
   schema.py              LanceModel schema、建表、FTS/向量索引维护、库目录 README
   ingest.py              解析（含 OCR）、分块（800/100）、增删改查
-  search.py              官方 hybrid + SiliconFlowReranker（官方 Reranker 子类，失败回退 RRF）
+  search.py              官方 hybrid + SiliconFlow/本地 CrossEncoder 精排（失败回退 RRF）
   ask.py                 RAG 问答
   web.py / watcher.py    [自建模块] 网页入库 / 目录监听
-scripts/                 rebuild_from_sources.py（批量重建）+ mineru_pdf_splitter.py（OCR 工具）
+scripts/                 rebuild_from_sources.py（批量重建）+ 冒烟脚本 + mineru_pdf_splitter.py（OCR 工具）
 ```
 
 单库分区模式：所有项目分区共存于同一个 LanceDB 库，`project` 列过滤，

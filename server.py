@@ -31,6 +31,13 @@ def _resolve_project(project: str) -> str:
     return cfg.normalize_project(project)
 
 
+def _residency_policy() -> str:
+    timeout = cfg.LOCAL_MODEL_IDLE_UNLOAD
+    if timeout <= 0:
+        return "常驻（不自动卸载）"
+    return f"用时挂载，闲置 {timeout}s 后自动卸载显存"
+
+
 def _fmt_trace(trace: dict) -> str:
     parts = [f"模式: {trace.get('mode', '?')}"]
     if trace.get("reranker") and trace["reranker"] != "none":
@@ -148,7 +155,8 @@ def get_knowledge_status() -> str:
         return (
             f"❌ 知识库为空（库路径: {cfg.resolve_db_path()}）\n"
             f"Embedding: {backend} / {model} / {dims} 维\n"
-            f"Reranker: {kb_search.reranker_identity()}"
+            f"Reranker: {kb_search.reranker_identity()}\n"
+            f"模型驻留: {_residency_policy()}"
         )
     table = kb_schema.get_or_create_table()
     arrow = table.to_lance().to_table(columns=["source", "project", "category"])
@@ -172,6 +180,7 @@ def get_knowledge_status() -> str:
         f"总 chunk 数: {len(table)} | 文档数: {len(set(sources))}",
         f"Embedding: {backend} / {model} / {dims} 维",
         f"Reranker: {kb_search.reranker_identity()}",
+        f"模型驻留: {_residency_policy()}",
         f"索引: {', '.join(sorted(index_names)) or '（无）'}",
         "",
         "分区分布:",

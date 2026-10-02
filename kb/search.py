@@ -16,6 +16,7 @@ import pyarrow as pa
 import requests
 
 from . import config as cfg
+from . import model_lifecycle as lifecycle
 from . import schema as kb_schema
 from .embeddings import embed_query
 from lancedb.rerankers import Reranker, RRFReranker
@@ -102,8 +103,20 @@ class SiliconFlowReranker(Reranker):
 _local_cross_encoder = None
 
 
+def _unload_cross_encoder() -> bool:
+    """卸载持有器中的重排模型；返回是否确实卸载了已加载的模型。"""
+    global _local_cross_encoder
+    if _local_cross_encoder is None:
+        return False
+    _local_cross_encoder = None
+    return True
+
+
+lifecycle.register_unloader("reranker:" + cfg.LOCAL_RERANK_MODEL, _unload_cross_encoder)
+
+
 def _get_cross_encoder():
-    """进程级单例：CrossEncoder 权重较大，首次精排时才加载，之后复用。"""
+    """进程级单例：CrossEncoder 权重较大，首次精排时才加载，闲置后自动卸载。"""
     global _local_cross_encoder
     if _local_cross_encoder is None:
         from sentence_transformers import CrossEncoder
@@ -112,6 +125,7 @@ def _get_cross_encoder():
         _local_cross_encoder = CrossEncoder(
             cfg.LOCAL_RERANK_MODEL, device=_resolve_device()
         )
+    lifecycle.touch()
     return _local_cross_encoder
 
 

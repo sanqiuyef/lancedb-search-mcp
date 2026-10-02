@@ -6,21 +6,25 @@ lancedb-search/
 ├── kb/                             知识库核心包
 │   ├── config.py                   环境变量、单库路径解析、kb-config.json 分区注册表
 │   ├── embeddings.py               SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
+│   ├── model_lifecycle.py          本地模型生命周期：用时挂载、闲置自动卸载显存
 │   ├── schema.py                   LanceModel schema、建表、FTS/向量索引、库目录 README
 │   ├── ingest.py                   文档解析（OCR 链）、分块、增删改查
-│   ├── search.py                   官方 hybrid 检索 + SiliconFlowReranker（回退 RRF）
+│   ├── search.py                   官方 hybrid 检索 + SiliconFlow/本地 CrossEncoder 精排（回退 RRF）
 │   ├── ask.py                      RAG 问答（chat + 编号引用）
 │   ├── web.py                      [自建模块 · 待优化] 网页抓取入库
 │   └── watcher.py                  [自建模块 · 待优化] watchdog 目录监听
 │
 ├── scripts/
 │   ├── rebuild_from_sources.py     批量重建脚本（攒批 + checkpoint 断点续传）
+│   ├── smoke_local_backend.py      本地双模型真实加载冒烟（GPU 推理验证）
+│   ├── smoke_idle_unload.py        闲置自动卸载冒烟（显存释放 + 重载验证）
 │   └── mineru_pdf_splitter.py      [自建 OCR 链路] MinerU 大 PDF 预切分工具
 ├── tests/                          unittest 离线测试套件
 │   ├── kb_test_support.py          公共设施：假 embedding、临时库、注册表
 │   ├── test_kb_config.py           分区规范化、库路径优先级
 │   ├── test_kb_ingest.py           分块、类别推断、文本抽取
 │   ├── test_kb_schema_search.py    schema/检索端到端（FTS/hybrid/过滤/回退）
+│   ├── test_kb_model_lifecycle.py  闲置卸载逻辑 + 本地嵌入懒加载（假模型）
 │   ├── test_kb_ask.py              问答（mock HTTP）
 │   └── test_kb_web.py              网页解析（mock HTTP）
 │

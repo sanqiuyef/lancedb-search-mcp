@@ -20,6 +20,7 @@ import requests
 from lancedb.embeddings import TextEmbeddingFunction, get_registry, register
 
 from . import config as cfg
+from . import model_lifecycle as lifecycle
 
 
 # =============================================================
@@ -130,6 +131,65 @@ class SiliconFlowEmbeddings(TextEmbeddingFunction):
 
 
 # =============================================================
+# 本地 sentence-transformers（懒加载 + 闲置自动卸载）
+# =============================================================
+
+# 权重持有器独立于函数实例：schema（LanceModel）会长期持有函数对象，
+# 若权重挂在实例上，闲置卸载时显存放不掉。
+_st_holder: dict = {"model": None}
+
+
+def _load_st_model(name: str, device: str, trust_remote_code: bool = True):
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(name, device=device, trust_remote_code=trust_remote_code)
+    lifecycle.touch()
+    return model
+
+
+def _unload_st_model() -> bool:
+    """卸载持有器中的嵌入模型；返回是否确实卸载了已加载的模型。"""
+    if _st_holder["model"] is None:
+        return False
+    _st_holder["model"] = None
+    return True
+
+
+lifecycle.register_unloader("embedding:" + cfg.LOCAL_EMBED_MODEL, _unload_st_model)
+
+
+@register("local-sentence-transformers")
+class LocalSentenceTransformerEmbeddings(TextEmbeddingFunction):
+    """本地 sentence-transformers 嵌入（默认 BAAI/bge-m3）。
+
+    与官方同名条目的区别：① ndims() 直接返回配置维度，不再加载模型探测；
+    ② 权重放模块持有器，支持闲置自动卸载与测试注入假模型。
+    """
+
+    name: str = cfg.LOCAL_EMBED_MODEL
+    dimensions: int = cfg.LOCAL_EMBED_DIM
+    device: str = "cpu"
+    normalize: bool = True
+    trust_remote_code: bool = True
+
+    def ndims(self) -> int:
+        return self.dimensions
+
+    def generate_embeddings(
+        self, texts: Union[List[str], np.ndarray]
+    ) -> List[np.array]:
+        if _st_holder["model"] is None:
+            _st_holder["model"] = _load_st_model(self.name, self.device, self.trust_remote_code)
+        lifecycle.touch()
+        vectors = _st_holder["model"].encode(
+            [str(t) for t in list(texts)],
+            convert_to_numpy=True,
+            normalize_embeddings=self.normalize,
+        )
+        return [np.asarray(v, dtype=np.float32) for v in vectors]
+
+
+# =============================================================
 # 激活后端选择
 # =============================================================
 
@@ -158,8 +218,9 @@ def get_embedding_function():
         if cfg.EMBEDDING_BACKEND == "local":
             func = (
                 get_registry()
-                .get("sentence-transformers")
-                .create(name=cfg.LOCAL_EMBED_MODEL, device=_resolve_device())
+                .get("local-sentence-transformers")
+                .create(name=cfg.LOCAL_EMBED_MODEL, dimensions=cfg.LOCAL_EMBED_DIM,
+                        device=_resolve_device())
             )
         else:
             func = get_registry().get("siliconflow").create()
