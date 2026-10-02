@@ -13,7 +13,8 @@ import os
 import sys
 from pathlib import Path
 
-SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+# 项目根目录（kb 包的上级）；kb-config.json 等本机配置都在根目录
+SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── API 服务（SiliconFlow：embedding / rerank / chat） ──
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")

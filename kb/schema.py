@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 import lancedb
 from lancedb.pydantic import LanceModel, Vector
 
-import kb_config as cfg
-import kb_embeddings
+from . import config as cfg
+from . import embeddings as kb_embeddings
 
 
 _db = None

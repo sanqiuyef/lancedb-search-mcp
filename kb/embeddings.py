@@ -19,7 +19,7 @@ import requests
 
 from lancedb.embeddings import TextEmbeddingFunction, get_registry, register
 
-import kb_config as cfg
+from . import config as cfg
 
 
 # =============================================================

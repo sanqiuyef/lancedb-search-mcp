@@ -8,8 +8,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import kb_ask
-import kb_config as cfg
+from kb import ask as kb_ask
+from kb import config as cfg
 
 
 class TestAskKnowledge(unittest.TestCase):

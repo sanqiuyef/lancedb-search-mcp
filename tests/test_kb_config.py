@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import kb_config as cfg
+from kb import config as cfg
 
 
 class TestNormalizeProject(unittest.TestCase):

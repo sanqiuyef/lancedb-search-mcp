@@ -22,9 +22,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import kb_config as cfg  # noqa: E402
-import kb_ingest  # noqa: E402
-import kb_schema  # noqa: E402
+from kb import config as cfg  # noqa: E402
+from kb import ingest as kb_ingest  # noqa: E402
+from kb import schema as kb_schema  # noqa: E402
 
 STATE_FILENAME = "rebuild_state.json"
 

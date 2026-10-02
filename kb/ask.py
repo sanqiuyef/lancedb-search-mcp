@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import requests
 
-import kb_config as cfg
-import kb_search
+from . import config as cfg
+from . import search as kb_search
 
 
 SYSTEM_PROMPT = (

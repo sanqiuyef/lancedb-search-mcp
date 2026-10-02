@@ -43,15 +43,16 @@ generate_index、extract_to_note、内容图谱 3 工具（build/get/search_cont
 ## 架构（整改后）
 
 ```
-server.py            MCP 薄入口（14 工具）
-kb_config.py         环境变量 + kb-config.json 分区注册表（热重载）
-kb_embeddings.py     SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
-kb_schema.py         LanceModel schema、建表、FTS/向量索引维护、库目录 README
-kb_ingest.py         解析（含 OCR）、分块（800/100）、增删改查
-kb_search.py         官方 hybrid + SiliconFlowReranker（官方 Reranker 子类，失败回退 RRF）
-kb_ask.py            RAG 问答
-kb_web.py / kb_watcher.py / mineru_pdf_splitter.py    [自建模块]
-scripts/rebuild_from_sources.py   批量重建脚本（攒批 + checkpoint 断点续传）
+server.py                MCP 薄入口（14 工具）
+kb/                      知识库核心包
+  config.py              环境变量 + kb-config.json 分区注册表（热重载）
+  embeddings.py          SiliconFlow/本地 embedding（官方注册表 + LRU 缓存）
+  schema.py              LanceModel schema、建表、FTS/向量索引维护、库目录 README
+  ingest.py              解析（含 OCR）、分块（800/100）、增删改查
+  search.py              官方 hybrid + SiliconFlowReranker（官方 Reranker 子类，失败回退 RRF）
+  ask.py                 RAG 问答
+  web.py / watcher.py    [自建模块] 网页入库 / 目录监听
+scripts/                 rebuild_from_sources.py（批量重建）+ mineru_pdf_splitter.py（OCR 工具）
 ```
 
 单库分区模式：所有项目分区共存于同一个 LanceDB 库，`project` 列过滤，

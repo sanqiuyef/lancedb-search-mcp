@@ -11,9 +11,9 @@ from __future__ import annotations
 import re
 import requests
 
-import kb_config as cfg
-import kb_ingest
-import kb_schema
+from . import config as cfg
+from . import ingest as kb_ingest
+from . import schema as kb_schema
 
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"

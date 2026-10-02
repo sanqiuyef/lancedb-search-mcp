@@ -12,8 +12,8 @@ import os
 import sys
 import time
 
-import kb_config as cfg
-import kb_ingest
+from . import config as cfg
+from . import ingest as kb_ingest
 
 _FILE_OBSERVER = None
 _FILE_OBSERVER_DIR = None

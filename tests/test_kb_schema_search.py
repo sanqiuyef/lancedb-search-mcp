@@ -11,10 +11,10 @@ from tests.kb_test_support import activate_fake_embedding, temp_db_env  # noqa: 
 
 activate_fake_embedding()
 
-import kb_ingest  # noqa: E402
-import kb_schema  # noqa: E402
-import kb_search  # noqa: E402
-import kb_config as cfg  # noqa: E402
+from kb import ingest as kb_ingest  # noqa: E402
+from kb import schema as kb_schema  # noqa: E402
+from kb import search as kb_search  # noqa: E402
+from kb import config as cfg  # noqa: E402
 
 
 SAMPLE_DOCS = [
@@ -80,7 +80,7 @@ class KBEndToEnd(unittest.TestCase):
             def post(self, *a, **k):
                 raise ConnectionError("api down")
 
-        import kb_search as ks
+        from kb import search as ks
 
         original = ks.requests
         try:

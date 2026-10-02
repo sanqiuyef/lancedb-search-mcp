@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import kb_ingest
+from kb import ingest as kb_ingest
 
 
 class TestPreSplit(unittest.TestCase):

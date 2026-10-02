@@ -14,9 +14,9 @@ from typing import Dict, List
 import pyarrow as pa
 import requests
 
-import kb_config as cfg
-import kb_schema
-from kb_embeddings import embed_query
+from . import config as cfg
+from . import schema as kb_schema
+from .embeddings import embed_query
 from lancedb.rerankers import Reranker, RRFReranker
 
 
@@ -192,7 +192,7 @@ def search_similar(filepath: str, project: str = "", max_results: int = 5) -> Li
     """以文搜文：参考文档前 512 字符向量化后做纯向量检索。"""
     import os
 
-    import kb_ingest
+    from . import ingest as kb_ingest
 
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"文件不存在: {filepath}")

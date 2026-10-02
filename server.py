@@ -15,13 +15,13 @@ from typing import Annotated
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import ToolAnnotations
 
-import kb_ask
-import kb_config as cfg
-import kb_ingest
-import kb_schema
-import kb_search
-import kb_watcher
-import kb_web
+from kb import ask as kb_ask
+from kb import config as cfg
+from kb import ingest as kb_ingest
+from kb import schema as kb_schema
+from kb import search as kb_search
+from kb import watcher as kb_watcher
+from kb import web as kb_web
 
 mcp = FastMCP("LanceDB 知识搜索", port=8002)
 

@@ -8,7 +8,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import kb_web
+from kb import web as kb_web
 
 HTML = """
 <html><head><title>测试页面</title></head>

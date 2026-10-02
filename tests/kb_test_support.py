@@ -6,9 +6,9 @@ import tempfile
 
 import numpy as np
 
-import kb_config as cfg
-import kb_embeddings
-import kb_schema
+from kb import config as cfg
+from kb import embeddings as kb_embeddings
+from kb import schema as kb_schema
 from lancedb.embeddings import TextEmbeddingFunction, register
 
 

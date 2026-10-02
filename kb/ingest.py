@@ -15,9 +15,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List
 
-import kb_config as cfg
-import kb_schema
-from kb_embeddings import embed_texts  # noqa: F401  （供脚本/桌面端复用批量向量化）
+from . import config as cfg
+from . import schema as kb_schema
+from .embeddings import embed_texts  # noqa: F401  （供脚本/桌面端复用批量向量化）
 
 
 def datetime_now_iso() -> str:
