@@ -137,8 +137,20 @@ _embedding_func = None
 _embedding_lock = threading.Lock()
 
 
+def _resolve_device() -> str:
+    """LOCAL_MODEL_DEVICE=auto 时探测 CUDA；torch 不接受 "auto" 设备串。"""
+    if cfg.LOCAL_MODEL_DEVICE != "auto":
+        return cfg.LOCAL_MODEL_DEVICE
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
 def get_embedding_function():
-    """返回当前激活的官方 EmbeddingFunction（api → siliconflow，local → bge-m3）。"""
+    """返回当前激活的官方 EmbeddingFunction（api → siliconflow，local → sentence-transformers）。"""
     global _embedding_func
     with _embedding_lock:
         if _embedding_func is not None:
@@ -147,7 +159,7 @@ def get_embedding_function():
             func = (
                 get_registry()
                 .get("sentence-transformers")
-                .create(name=cfg.LOCAL_EMBED_MODEL, device=cfg.LOCAL_MODEL_DEVICE)
+                .create(name=cfg.LOCAL_EMBED_MODEL, device=_resolve_device())
             )
         else:
             func = get_registry().get("siliconflow").create()
