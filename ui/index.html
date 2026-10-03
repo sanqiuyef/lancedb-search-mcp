@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LanceDB 文献检索</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #667085; --card: #f6f7f9;
+    --border: #e4e7ec; --accent: #6d28d9; --accent-soft: #ede9fe; --code: #f1f5f9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c; --fg: #e6e8eb; --muted: #98a2b3; --card: #1f2127;
+      --border: #2c2f36; --accent: #a78bfa; --accent-soft: #2a2340; --code: #23262d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 10px 12px 20px; background: var(--bg); color: var(--fg);
+    font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  h1 { font-size: 14px; margin: 2px 0 8px; display: flex; align-items: center; gap: 8px; }
+  h1 .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex: none; }
+  h1 .dot.err { background: #ef4444; }
+  h1 .rows { font-weight: 400; color: var(--muted); font-size: 12px; }
+  #q {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--fg); font-size: 13px; outline: none;
+  }
+  #q:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .row { display: flex; gap: 6px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+  select, input.f {
+    padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--fg); font-size: 12px;
+  }
+  input.f { width: 100%; }
+  button {
+    padding: 5px 12px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card); color: var(--fg); font-size: 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #filters { display: none; margin-top: 6px; }
+  #filters.open { display: block; }
+  #hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  #meta { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
+    margin-top: 10px; background: var(--card);
+  }
+  .card .hd { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+  .score {
+    background: var(--accent-soft); color: var(--accent); border-radius: 6px;
+    padding: 1px 6px; font-weight: 600; font-variant-numeric: tabular-nums;
+  }
+  .src { font-weight: 600; word-break: break-all; }
+  .tag { color: var(--muted); }
+  .txt { white-space: pre-wrap; word-break: break-word; margin-top: 6px; font-size: 12.5px; }
+  .txt.clamp { max-height: 8.4em; overflow: hidden; position: relative; }
+  .txt.clamp::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2.4em;
+    background: linear-gradient(transparent, var(--card));
+  }
+  .ops { display: flex; gap: 6px; margin-top: 6px; }
+  .ops button { padding: 2px 9px; font-size: 11.5px; }
+  .err { color: #ef4444; margin-top: 10px; white-space: pre-wrap; }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid var(--accent-soft); border-top-color: var(--accent);
+    animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<h1><span class="dot" id="dot"></span>LanceDB 文献检索 <span class="rows" id="rows"></span></h1>
+
+<input id="q" placeholder="搜索 116 篇文献切片…（回车检索）" autocomplete="off">
+
+<div class="row">
+  <select id="mode">
+    <option value="hybrid" selected>混合检索（推荐）</option>
+    <option value="vector">向量语义</option>
+    <option value="text">关键词（BM25）</option>
+  </select>
+  <select id="limit">
+    <option>5</option><option selected>10</option><option>20</option><option>30</option>
+  </select>
+  <button class="primary" id="go">检索</button>
+  <button id="toggleFilters">筛选</button>
+</div>
+
+<div id="filters">
+  <div class="row"><input class="f" id="sourceF" placeholder="来源过滤（文件名包含，如 洪涝）"></div>
+  <div class="row"><input class="f" id="catF" placeholder="类别过滤（如 paper）"></div>
+</div>
+
+<div id="meta"></div>
+<div id="hint">提示：首次检索需加载本地向量模型（约 3–8 秒），之后空闲会自动卸载。</div>
+<div id="list"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const q = $('q'), list = $('list'), meta = $('meta'), hint = $('hint'), dot = $('dot'), rowsEl = $('rows');
+  const goBtn = $('go');
+
+  async function status() {
+    try {
+      const r = await fetch('/api/status');
+      const d = await r.json();
+      if (d.ok) { dot.className = 'dot'; rowsEl.textContent = '· ' + d.rows.toLocaleString() + ' 切片'; }
+      else { dot.className = 'dot err'; rowsEl.textContent = '· ' + (d.error || '库不可用'); }
+    } catch (e) { dot.className = 'dot err'; rowsEl.textContent = '· 服务未启动'; }
+  }
+
+  function esc(s) { return s.replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+  function copyText(t, btn) {
+    navigator.clipboard.writeText(t).then(() => {
+      const old = btn.textContent; btn.textContent = '已复制 ✓';
+      setTimeout(() => btn.textContent = old, 1200);
+    }).catch(() => {
+      const ta = document.createElement('textarea');
+      ta.value = t; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    });
+  }
+
+  function render(d) {
+    list.innerHTML = '';
+    const t = d.trace || {};
+    meta.textContent = d.results.length + ' 条结果 · 模式 ' + (t.mode || '-') +
+      (t.reranker && t.reranker !== 'none' ? ' · 精排 ' + t.reranker : '') +
+      (t.warning ? ' · 警告: ' + t.warning : '');
+    d.results.forEach((r, i) => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const score = (r.relevance_score !== undefined) ? r.relevance_score : '';
+      card.innerHTML =
+        '<div class="hd">' +
+          '<span class="score">#' + (i + 1) + (score !== '' ? ' · ' + score : '') + '</span>' +
+          '<span class="src">' + esc(r.source || '(未知)') + '</span>' +
+          '<span class="tag">chunk #' + r.chunk_index + (r.category ? ' · ' + esc(r.category) : '') + '</span>' +
+        '</div>' +
+        '<div class="txt clamp">' + esc(r.text || '') + '</div>' +
+        '<div class="ops"><button data-a="cite">复制引用</button><button data-a="raw">复制正文</button><button data-a="expand">展开/收起</button></div>';
+      const txt = card.querySelector('.txt');
+      const cite = '来源：' + (r.source || '') + '（chunk #' + r.chunk_index + '）\n' + (r.text || '');
+      const ops = card.querySelectorAll('button');
+      ops.forEach((b) => b.addEventListener('click', () => {
+        const a = b.dataset.a;
+        if (a === 'expand') { txt.classList.toggle('clamp'); return; }
+        copyText(a === 'cite' ? cite : (r.text || ''), b);
+      }));
+      list.appendChild(card);
+    });
+    if (!d.results.length) meta.textContent = '没有命中结果（可换关键词或切到混合检索）。';
+  }
+
+  async function search() {
+    const query = q.value.trim();
+    if (!query) { q.focus(); return; }
+    goBtn.disabled = true;
+    meta.innerHTML = '<span class="spinner"></span>检索中…（首次需加载模型）';
+    list.innerHTML = '';
+    try {
+      const r = await fetch('/api/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query,
+          limit: parseInt($('limit').value, 10),
+          mode: $('mode').value,
+          source_filter: $('sourceF').value.trim(),
+          category_filter: $('catF').value.trim(),
+          use_reranker: true,
+        }),
+      });
+      const d = await r.json();
+      if (!d.ok) { meta.textContent = ''; list.innerHTML = '<div class="err">' + esc(d.error || '检索失败') + '</div>'; }
+      else { hint.style.display = 'none'; render(d); }
+    } catch (e) {
+      meta.textContent = '';
+      list.innerHTML = '<div class="err">请求失败：' + esc(String(e)) + '（确认服务在运行）</div>';
+    } finally { goBtn.disabled = false; }
+  }
+
+  q.addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+  goBtn.addEventListener('click', search);
+  $('toggleFilters').addEventListener('click', () => $('filters').classList.toggle('open'));
+  status();
+  setInterval(status, 60000);
+})();
+</script>
+</body>
+</html>
