@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """文档入库内核：解析（含 OCR 链）、分块、增删改查。
 
-解析链：文本层抽取（pdfminer → PyPDF2 回退）→ MinerU API → 本地 Tesseract。
-分块沿用既有参数（800 字符 / 100 overlap），Markdown 按标题感知分块。
+解析链（2026-10-04 起）：PDF 优先本地 MinerU 转 Markdown（公式 → LaTeX，带缓存，
+见 kb.pdf_convert）→ 失败回退文本层（PyMuPDF → pdfminer → PyPDF2）→ 扫描件走
+OCR 链（云 MinerU → 本地 Tesseract）。
+分块沿用既有参数（800 字符 / 100 overlap）。MinerU 产物含标题结构，走 Markdown 感知
+分块；其余按段落。
 向量在 table.add() 时由 LanceModel 的 VectorField 自动计算（官方模式）。
 """
 
@@ -110,18 +113,98 @@ def _ocr_pdf(filepath: str) -> str:
 # 文本抽取
 # =============================================================
 
-def extract_text(filepath: str) -> str:
-    """从文件中提取纯文本（.md/.txt/.docx/.pdf/代码与配置文件）。"""
+def _pdf_text_pymupdf(filepath: str) -> str:
+    """PyMuPDF 文本层抽取（质量高于 pdfminer：λ/∈ 等符号可保，无字母打散）。"""
+    import fitz
+
+    with fitz.open(filepath) as doc:
+        return "\n".join(doc.load_page(i).get_text() for i in range(doc.page_count))
+
+
+def _pdf_text_layer(filepath: str) -> str:
+    """PDF 文本层：PyMuPDF → pdfminer → PyPDF2 三级回退。"""
+    try:
+        text = _pdf_text_pymupdf(filepath)
+        if text.strip():
+            return text
+    except Exception:
+        pass
+    try:
+        from pdfminer.high_level import extract_text as pdf_extract
+
+        text = pdf_extract(filepath) or ""
+        if text.strip():
+            return text
+    except Exception:
+        pass
+    try:
+        import PyPDF2
+
+        with open(filepath, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+    except Exception:
+        return ""
+
+
+def _pdf_via_ocr_chain(filepath: str) -> str:
+    """扫描件/重复水印件的 OCR 回退链：云 MinerU（如已配置）→ 本地 Tesseract。"""
+    if cfg.MINERU_API_KEY:
+        try:
+            ocr_text = _ocr_pdf_mineru(filepath)
+            if len(ocr_text.strip()) >= 20:
+                return ocr_text
+            print(f"[MinerU] 未提取到有效文字，回退到 Tesseract: {filepath}", file=sys.stderr)
+        except Exception as e:
+            print(f"[MinerU] 识别失败，回退到 Tesseract {filepath}: {e}", file=sys.stderr)
+    try:
+        ocr_text = _ocr_pdf(filepath)
+        if len(ocr_text.strip()) >= 20:
+            return ocr_text
+        print(f"[OCR] 未提取到有效文字，保留原文本层: {filepath}", file=sys.stderr)
+    except Exception as e:
+        print(f"[OCR] 识别失败，保留原文本层 {filepath}: {e}", file=sys.stderr)
+    return ""
+
+
+def extract_content(filepath: str) -> "tuple[str, bool]":
+    """从文件提取 (文本, 是否 Markdown)。
+
+    PDF 优先走本地 MinerU 转 Markdown（公式 → LaTeX，带磁盘缓存，见 kb.pdf_convert）；
+    MinerU 不可用或失败时回退文本层抽取，再回退 OCR 链（云 MinerU → Tesseract）。
+    """
     ext = Path(filepath).suffix.lower()
     try:
+        if ext == ".pdf":
+            if cfg.MINERU_ENABLED:
+                try:
+                    from . import pdf_convert
+
+                    if pdf_convert.mineru_available():
+                        info = pdf_convert.convert_pdf(filepath)
+                        md = Path(info["md_path"]).read_text(encoding="utf-8")
+                        if len(md.strip()) >= 20:
+                            return md, True
+                except Exception as e:
+                    print(f"[MinerU] 本地转换失败，回退文本层 {filepath}: {e}",
+                          file=sys.stderr)
+            from . import pdf_convert
+
+            text = _pdf_text_layer(filepath)
+            if cfg.OCR_ENABLED and _pdf_text_needs_ocr(text):
+                print(f"[OCR] 检测到扫描件或重复水印，开始识别: {filepath}", file=sys.stderr)
+                ocr_text = _pdf_via_ocr_chain(filepath)
+                if ocr_text:
+                    return pdf_convert.normalize_text(ocr_text), False
+            return pdf_convert.normalize_text(text), False
         if ext in (".md", ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml"):
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+                return f.read(), ext == ".md"
         if ext == ".docx":
             from docx import Document
 
             doc = Document(filepath)
-            return "\n".join(p.text for p in doc.paragraphs)
+            return "\n".join(p.text for p in doc.paragraphs), False
         if ext in (".html", ".htm"):
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
@@ -131,46 +214,17 @@ def extract_text(filepath: str) -> str:
                 soup = BeautifulSoup(raw, "html.parser")
                 for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                     tag.decompose()
-                return soup.get_text(separator="\n", strip=True)
+                return soup.get_text(separator="\n", strip=True), False
             except ImportError:
-                return raw
-        if ext == ".pdf":
-            text = ""
-            try:
-                from pdfminer.high_level import extract_text as pdf_extract
-
-                text = pdf_extract(filepath) or ""
-            except Exception:
-                try:
-                    import PyPDF2
-
-                    with open(filepath, "rb") as f:
-                        reader = PyPDF2.PdfReader(f)
-                        text = "\n".join(p.extract_text() or "" for p in reader.pages)
-                except Exception:
-                    text = ""
-
-            if cfg.OCR_ENABLED and _pdf_text_needs_ocr(text):
-                print(f"[OCR] 检测到扫描件或重复水印，开始识别: {filepath}", file=sys.stderr)
-                if cfg.MINERU_API_KEY:
-                    try:
-                        ocr_text = _ocr_pdf_mineru(filepath)
-                        if len(ocr_text.strip()) >= 20:
-                            return ocr_text
-                        print(f"[MinerU] 未提取到有效文字，回退到 Tesseract: {filepath}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"[MinerU] 识别失败，回退到 Tesseract {filepath}: {e}", file=sys.stderr)
-                try:
-                    ocr_text = _ocr_pdf(filepath)
-                    if len(ocr_text.strip()) >= 20:
-                        return ocr_text
-                    print(f"[OCR] 未提取到有效文字，保留原文本层: {filepath}", file=sys.stderr)
-                except Exception as e:
-                    print(f"[OCR] 识别失败，保留原文本层 {filepath}: {e}", file=sys.stderr)
-            return text
-        return ""
+                return raw, False
+        return "", False
     except Exception:
-        return ""
+        return "", False
+
+
+def extract_text(filepath: str) -> str:
+    """兼容接口：仅返回文本（新代码请用 extract_content 以获知是否 Markdown）。"""
+    return extract_content(filepath)[0]
 
 
 # =============================================================
@@ -178,10 +232,15 @@ def extract_text(filepath: str) -> str:
 # =============================================================
 
 def guess_category(source_path: str) -> str:
-    """按路径中的目录名推断类别标签。"""
-    parts = {p.lower() for p in Path(source_path).parts}
+    """按路径中的目录名推断类别标签（仅看目录，不看文件名；支持名称包含匹配）。
+
+    只看目录可避免文件名里的子串误命中（如 "rapid" 含 "api"）：
+    如 08-literature-文献 → paper、docs/ → documentation。
+    """
+    parts = [p.lower() for p in Path(source_path).parts[:-1]]  # 排除文件名
     for key, category in cfg.CATEGORY_MAPPINGS.items():
-        if key.lower() in parts:
+        k = key.lower()
+        if any(k == p or k in p for p in parts):
             return category
     return ""
 
@@ -292,9 +351,14 @@ def _chunk_markdown(text: str, source: str) -> List[Dict]:
     return chunks
 
 
-def chunk_text(text: str, source: str) -> List[Dict]:
-    """分块入口：.md 走 Markdown 感知分块，其余按段落。"""
-    if source.lower().endswith(".md"):
+def chunk_text(text: str, source: str, is_markdown: "bool | None" = None) -> List[Dict]:
+    """分块入口：Markdown（含 MinerU 转换的 PDF）走标题感知分块，其余按段落。
+
+    is_markdown=None 时按 source 扩展名推断（向后兼容）。
+    """
+    if is_markdown is None:
+        is_markdown = source.lower().endswith(".md")
+    if is_markdown:
         return _chunk_markdown(text, source)
     return _chunk_by_paragraph(text, source, guess_category(source))
 
@@ -319,13 +383,45 @@ def _rows_from_chunks(chunks: List[Dict]) -> List[Dict]:
     return rows
 
 
-def add_chunks(table, chunks: List[Dict], batch_size: int = 32) -> int:
-    """分块批量入库并返回写入行数；每批触发一次自动向量化。"""
+def _rows_with_vectors(rows: List[Dict]) -> List[Dict]:
+    """主线程预计算向量后随行写入（显式向量列，lancedb 不再回调自动向量化）。"""
+    from . import embeddings as kb_embeddings
+
+    vectors = kb_embeddings.embed_texts([r["text"] for r in rows])
+    return [{**r, "vector": v} for r, v in zip(rows, vectors)]
+
+
+def add_chunks(table, chunks: List[Dict], batch_size: int = 32,
+               precompute_vectors: bool = True, write_batch: int = 256) -> int:
+    """分块批量入库并返回写入行数。
+
+    默认主线程预计算向量并显式写入：绕开 LanceModel 自动向量化回调
+    （该回调在 Python 3.13 + torch 下有原生崩溃记录：_PyThreadState_Attach），
+    失败时自动回退官方自动向量化模式。
+
+    嵌入按 batch_size 小批走（控制显存），写入按 write_batch 攒大批提交
+    （减少 Lance 碎片，实测大表写入速度显著提升）。
+    """
     added = 0
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        table.add(_rows_from_chunks(batch))
-        added += len(batch)
+    step = max(batch_size, write_batch if precompute_vectors else batch_size)
+    for i in range(0, len(chunks), step):
+        batch = chunks[i:i + step]
+        rows = _rows_from_chunks(batch)
+        if precompute_vectors:
+            try:
+                rows_with_vectors = []
+                for j in range(0, len(rows), batch_size):
+                    rows_with_vectors.extend(_rows_with_vectors(rows[j:j + batch_size]))
+                table.add(rows_with_vectors)
+                added += len(batch)
+                continue
+            except Exception as e:
+                print(f"[ingest] 显式向量写入失败，回退自动向量化: {e}", file=sys.stderr)
+                precompute_vectors = False
+                step = batch_size
+        for j in range(0, len(rows), batch_size):
+            table.add(rows[j:j + batch_size])
+            added += len(rows[j:j + batch_size])
     return added
 
 
@@ -379,12 +475,12 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     all_chunks: List[Dict] = []
     skipped: List[str] = []
     for done, fp in enumerate(new_files, 1):
-        text = extract_text(fp)
+        text, is_md = extract_content(fp)
         if not text or len(text) < 20:
             skipped.append(os.path.basename(fp))
             continue
         rel_path = os.path.relpath(fp, scan_dir)
-        chunks = chunk_text(text, rel_path)
+        chunks = chunk_text(text, rel_path, is_md)
         for ch in chunks:
             ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
             ch["ingested_at"] = datetime_now_iso()
@@ -428,7 +524,7 @@ def add_single_document(filepath: str, scan_dir: str = "") -> str:
     if os.path.getsize(filepath) > cfg.MAX_FILE_SIZE:
         return f"[ERROR] 文件过大: {os.path.getsize(filepath) / 1024 / 1024:.1f}MB"
 
-    text = extract_text(filepath)
+    text, is_md = extract_content(filepath)
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(filepath)}"
 
@@ -438,7 +534,7 @@ def add_single_document(filepath: str, scan_dir: str = "") -> str:
         if not rel.startswith(".." + os.sep) and rel != "..":
             source = rel
 
-    chunks = chunk_text(text, source)
+    chunks = chunk_text(text, source, is_md)
     if not chunks:
         return f"[ERROR] 分块后无有效内容: {source}"
     for ch in chunks:
@@ -479,11 +575,11 @@ def update_document(filepath: str) -> str:
             table.delete(f"source = '{safe_src}'")
         deleted_count = len(matched)
 
-    text = extract_text(filepath)
+    text, is_md = extract_content(filepath)
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {fname}"
 
-    chunks = chunk_text(text, fname)
+    chunks = chunk_text(text, fname, is_md)
     if not chunks:
         return f"[ERROR] 分块后无有效内容: {fname}"
     for ch in chunks:

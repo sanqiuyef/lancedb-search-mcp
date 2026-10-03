@@ -19,6 +19,12 @@ import sys
 import time
 from pathlib import Path
 
+# 必须在导入 kb（读取 cfg）之前设置：批处理进程消除闲置卸载看门狗线程与 tqdm
+# 监视线程，规避 Python 3.13 + torch 的线程状态原生崩溃
+# （_PyThreadState_Attach: non-NULL old thread state，实测嵌入数批后必崩）。
+os.environ.setdefault("LOCAL_MODEL_IDLE_UNLOAD", "0")
+os.environ.setdefault("TQDM_DISABLE", "1")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -116,11 +122,13 @@ def main() -> int:
         last_err = None
         for attempt in range(3):
             try:
+                print(f"      flush {len(buffer)} chunks …", flush=True)
                 added = kb_ingest.add_chunks(table, buffer)
                 done_chunks += added
                 for key, cnt in buffer_counts.items():
                     state["files"][key] = {"status": "done", "chunks": cnt}
                 save_state(state_path, state)
+                print(f"      flush 完成，累计 {done_chunks} chunks", flush=True)
                 buffer.clear()
                 buffer_counts.clear()
                 return
@@ -147,7 +155,11 @@ def main() -> int:
                 continue
             rel_path = os.path.relpath(fp, root)
             chunks = kb_ingest.chunk_text(text, rel_path)
+            # 类别按完整路径推断（source 存的是相对路径，缺目录信息）
+            category = kb_ingest.guess_category(os.path.join(root, rel_path))
             for ch in chunks:
+                if category:
+                    ch["category"] = category
                 ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
                 ch["ingested_at"] = kb_ingest.datetime_now_iso()
             buffer.extend(chunks)
@@ -167,6 +179,9 @@ def main() -> int:
                    "skipped": skipped, "failed": failed})
 
     print("\n===== 索引构建 =====")
+    removed = kb_schema.dedupe_by_doc_id(table)
+    if removed:
+        print(f"  去重删除 {removed} 行（中断重跑的重复行）")
     print(kb_schema.ensure_vector_index(table))
     print(kb_schema.ensure_fts_index(table))
     kb_schema.fold_new_rows(table)

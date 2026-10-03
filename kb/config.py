@@ -68,6 +68,19 @@ except ImportError:
     _MinerU = None
     _MINERU_SDK_AVAILABLE = False
 
+# ── PDF → Markdown 本地 MinerU（2026-10-04 集成；替代 pdfminer 主通路以保住公式） ──
+# 独立 venv：.mineru-venv（mineru 3.4.4 + transformers 4.57；Anaconda 的 transformers v5 不兼容）
+MINERU_ENABLED = os.environ.get("LANCEDB_MINERU", "1") == "1"
+MINERU_BIN = os.environ.get(
+    "LANCEDB_MINERU_BIN",
+    os.path.join(SERVER_DIR, ".mineru-venv", "Scripts", "mineru.exe"),
+)
+# 转换产物缓存目录；空 = <库目录>/_pdf_md_cache（按 PDF 路径+大小+mtime 失效）
+MINERU_CACHE_DIR = os.environ.get("LANCEDB_MINERU_CACHE", "")
+# 短路径暂存（规避 Windows 260 字符路径上限），需与库同级盘符且路径尽量短
+MINERU_STAGING_DIR = os.environ.get("LANCEDB_MINERU_STAGING", r"D:\mstaging")
+MINERU_TIMEOUT = int(os.environ.get("LANCEDB_MINERU_TIMEOUT", "1800"))
+
 # ── 目录路径 → 类别 ──
 CATEGORY_MAPPINGS = {
     "论文": "paper",

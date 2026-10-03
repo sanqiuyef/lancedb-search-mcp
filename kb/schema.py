@@ -146,6 +146,33 @@ def fold_new_rows(table) -> None:
         print(f"[schema] optimize 跳过: {e}", file=sys.stderr)
 
 
+def dedupe_by_doc_id(table) -> int:
+    """按 doc_id（内容指纹：source+chunk_index+text）去重，保留首次出现。
+
+    用于清理中断/重跑批量入库留下的重复行；返回删除行数。
+    """
+    arrow = table.to_lance().to_table(columns=["doc_id"])
+    ids = arrow.column("doc_id").to_pylist()
+    seen: set = set()
+    dups: list = []
+    for v in ids:
+        key = v or ""
+        if key in seen:
+            dups.append(key)
+        else:
+            seen.add(key)
+    dups = [d for d in dict.fromkeys(dups) if d]
+    removed = 0
+    for i in range(0, len(dups), 500):
+        chunk_keys = dups[i:i + 500]
+        before = len(table)
+        table.delete("doc_id IN (" + ",".join(f"'{k}'" for k in chunk_keys) + ")")
+        removed += before - len(table)
+    if removed:
+        print(f"[schema] 按 doc_id 去重删除 {removed} 行", file=sys.stderr)
+    return removed
+
+
 # =============================================================
 # 库目录说明（自动维护的 README.md）
 # =============================================================
