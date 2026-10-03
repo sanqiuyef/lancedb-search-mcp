@@ -12,11 +12,14 @@ knowledge/
 lancedb_data/
 *.log
 *.pid
+rebuild_state.json
+_pdf_md_cache/
 
 # Python environments and caches
 .venv/
 venv/
 .build-venv*/
+.mineru-venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/

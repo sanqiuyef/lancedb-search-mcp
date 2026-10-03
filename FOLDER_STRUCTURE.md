@@ -8,7 +8,8 @@ lancedb-search/
 │   ├── embeddings.py               本地 embedding（bge-m3，官方注册表 + LRU 缓存）
 │   ├── model_lifecycle.py          本地模型生命周期：用时挂载、闲置自动卸载显存
 │   ├── schema.py                   LanceModel schema、建表、FTS/向量索引、库目录 README
-│   ├── ingest.py                   文档解析（OCR 链）、分块、增删改查
+│   ├── ingest.py                   文档解析（MinerU→文本层→OCR 回退链）、分块、增删改查
+│   ├── pdf_convert.py              ★PDF→Markdown 核心（本地 MinerU pipeline，缓存+档位判定；与 scripts 批量脚本共用）
 │   ├── search.py                   官方 hybrid 检索 + 本地 CrossEncoder 精排（回退 RRF）
 │   ├── ask.py                      RAG 问答（chat + 编号引用）
 │   ├── web.py                      [自建模块 · 待优化] 网页抓取入库
@@ -18,7 +19,10 @@ lancedb-search/
 │   ├── rebuild_from_sources.py     批量重建脚本（攒批 + checkpoint 断点续传）
 │   ├── smoke_local_backend.py      本地双模型真实加载冒烟（GPU 推理验证）
 │   ├── smoke_idle_unload.py        闲置自动卸载冒烟（显存释放 + 重载验证）
-│   └── mineru_pdf_splitter.py      [自建 OCR 链路] MinerU 大 PDF 预切分工具
+│   ├── mineru_pdf_splitter.py      [自建 OCR 链路] MinerU 大 PDF 预切分工具
+│   ├── mineru_to_markdown.py       ★ PDF→Markdown 主转换器（MinerU pipeline；中文 ocr / 英文 auto）
+│   └── pdf_to_markdown.py          PDF→Markdown 备选转换器（docling 公式增强 + CUDA）
+├── .mineru-venv/                   独立 venv：mineru 3.4.4 + transformers 4.57（Anaconda 已是 v5，不能共用）
 ├── tests/                          unittest 离线测试套件
 │   ├── kb_test_support.py          公共设施：假 embedding、临时库、注册表
 │   ├── test_kb_config.py           库路径优先级
