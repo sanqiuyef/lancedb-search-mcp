@@ -167,11 +167,13 @@ def _pdf_via_ocr_chain(filepath: str) -> str:
     return ""
 
 
-def extract_content(filepath: str) -> "tuple[str, bool]":
+def extract_content(filepath: str, export_markdown_dir: str = "") -> "tuple[str, bool]":
     """从文件提取 (文本, 是否 Markdown)。
 
     PDF 优先走本地 MinerU 转 Markdown（公式 → LaTeX，带磁盘缓存，见 kb.pdf_convert）；
     MinerU 不可用或失败时回退文本层抽取，再回退 OCR 链（云 MinerU → Tesseract）。
+    export_markdown_dir 非空时，MinerU 产物额外导出为标准布局
+    （`<目录>/<文件名>.md` + `<文件名>_images/`），供阅读/归档/二次入库。
     """
     ext = Path(filepath).suffix.lower()
     try:
@@ -181,7 +183,8 @@ def extract_content(filepath: str) -> "tuple[str, bool]":
                     from . import pdf_convert
 
                     if pdf_convert.mineru_available():
-                        info = pdf_convert.convert_pdf(filepath)
+                        info = pdf_convert.convert_pdf(
+                            filepath, export_dir=export_markdown_dir or None)
                         md = Path(info["md_path"]).read_text(encoding="utf-8")
                         if len(md.strip()) >= 20:
                             return md, True
@@ -448,8 +451,11 @@ def scan_files(scan_dir: str) -> List[str]:
 
 
 def add_documents(scan_dir: str, reindex_all: bool = False,
-                  progress=None) -> str:
-    """扫描目录并增量入库。progress: optional callable(done_files, total_files)。"""
+                  progress=None, export_markdown_dir: str = "") -> str:
+    """扫描目录并增量入库。progress: optional callable(done_files, total_files)。
+
+    export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
+    """
     if not os.path.isdir(scan_dir):
         return f"❌ 目录不存在: {scan_dir}"
 
@@ -475,7 +481,7 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     all_chunks: List[Dict] = []
     skipped: List[str] = []
     for done, fp in enumerate(new_files, 1):
-        text, is_md = extract_content(fp)
+        text, is_md = extract_content(fp, export_markdown_dir=export_markdown_dir)
         if not text or len(text) < 20:
             skipped.append(os.path.basename(fp))
             continue
@@ -498,6 +504,8 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     kb_schema.update_db_readme()
 
     extra = f"（跳过 {len(existing)} 个已有文件）" if existing and not reindex_all else ""
+    if export_markdown_dir:
+        extra += "\nMarkdown 导出目录: " + export_markdown_dir
     lines = [
         f"✅ **文档添加完成！**",
         f"{'─' * 40}",
@@ -514,8 +522,12 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     return "\n".join(lines)
 
 
-def add_single_document(filepath: str, scan_dir: str = "") -> str:
-    """向量化单个文档（避免大批量超时）。"""
+def add_single_document(filepath: str, scan_dir: str = "",
+                        export_markdown_dir: str = "") -> str:
+    """向量化单个文档（避免大批量超时）。
+
+    export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
+    """
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
     ext = Path(filepath).suffix.lower()
@@ -524,7 +536,7 @@ def add_single_document(filepath: str, scan_dir: str = "") -> str:
     if os.path.getsize(filepath) > cfg.MAX_FILE_SIZE:
         return f"[ERROR] 文件过大: {os.path.getsize(filepath) / 1024 / 1024:.1f}MB"
 
-    text, is_md = extract_content(filepath)
+    text, is_md = extract_content(filepath, export_markdown_dir=export_markdown_dir)
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(filepath)}"
 
@@ -547,11 +559,12 @@ def add_single_document(filepath: str, scan_dir: str = "") -> str:
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
     kb_schema.update_db_readme()
+    extra = f"\nMarkdown 导出: {export_markdown_dir}" if export_markdown_dir else ""
     return (
         f"✅ 文档已入库!\n"
         f"文件: {source}\n"
         f"新增记录: {added}\n"
-        f"知识库总块数: {len(table)}"
+        f"知识库总块数: {len(table)}{extra}"
     )
 
 

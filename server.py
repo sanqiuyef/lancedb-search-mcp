@@ -181,24 +181,34 @@ def get_knowledge_status() -> str:
 
 @mcp.tool(
     name="add_documents",
-    description="扫描指定目录，将文档（.md/.pdf/.docx/.txt 等）向量化后存入知识库。",
+    description="扫描指定目录，将文档（.md/.pdf/.docx/.txt 等）向量化后存入知识库。"
+                "PDF 自动走本地 MinerU 转换（公式 → LaTeX），可用 export_markdown_dir "
+                "把转换出的 Markdown（含图片）同步导出留档。",
 )
 def add_documents(
     scan_dir: Annotated[str, "要扫描的目录路径"],
     reindex_all: Annotated[bool, "是否清空知识库后重新添加（默认只增量）"] = False,
+    export_markdown_dir: Annotated[
+        str, "可选：PDF 转换出的 Markdown 导出目录（留空不导出）"] = "",
 ) -> str:
-    return kb_ingest.add_documents(scan_dir, reindex_all=reindex_all)
+    return kb_ingest.add_documents(scan_dir, reindex_all=reindex_all,
+                                   export_markdown_dir=export_markdown_dir)
 
 
 @mcp.tool(
     name="add_single_document",
-    description="向量化单个文档到知识库（一次只处理一个文件，避免大批量超时）。支持 .md/.pdf/.docx/.txt 等格式。",
+    description="向量化单个文档到知识库（一次只处理一个文件，避免大批量超时）。"
+                "支持 .md/.pdf/.docx/.txt 等格式；PDF 自动走本地 MinerU 转 Markdown"
+                "（公式 → LaTeX），可用 export_markdown_dir 导出留档。",
 )
 def add_single_document(
     filepath: Annotated[str, "文件路径"],
     scan_dir: Annotated[str, "可选，来源基准目录（source 记录为相对路径）"] = "",
+    export_markdown_dir: Annotated[
+        str, "可选：PDF 转换出的 Markdown 导出目录（留空不导出）"] = "",
 ) -> str:
-    return kb_ingest.add_single_document(filepath, scan_dir=scan_dir)
+    return kb_ingest.add_single_document(filepath, scan_dir=scan_dir,
+                                         export_markdown_dir=export_markdown_dir)
 
 
 @mcp.tool(

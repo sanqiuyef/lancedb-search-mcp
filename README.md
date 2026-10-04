@@ -88,6 +88,9 @@ mineru-models-download -s modelscope -m pipeline      # 首次下载模型（约
 | 知识库管理 | get_knowledge_status、list_documents、add_documents、add_single_document、update_document、delete_documents |
 | 自建能力 | ingest_url、start_watcher、stop_watcher |
 
+`add_documents` / `add_single_document` 均支持 `export_markdown_dir` 参数：入库的同时把
+PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<名>.md` + `<名>_images/`）。
+
 ## 自建模块清单（待后期单独优化）
 
 以下模块为自建实现，文件头部有 `[自建模块 · 待后期单独优化]` 标记：
@@ -137,13 +140,19 @@ OCR 链（云 MinerU → Tesseract）。转换产物按 `路径+大小+mtime` �
 
 ## 入库与批量重建
 
+- **一条命令走完（推荐）**：`python -X utf8 scripts/pdf_pipeline.py <PDF目录>
+  [--md-dir <md输出>] [--workers 3] [--resume] [--no-ingest] [--dry-run]`
+  —— 阶段 1 PDF → Markdown（MinerU 并行转换、带缓存、可断点），阶段 2 Markdown → 向量库
+  （标题分块 + 预计算向量 + 按 doc_id 去重 + 索引维护）。MinerU 不可用时直接报错退出，
+  不做静默降级（避免把压平公式入进库）；
 - **按需入库**：MCP 工具 `add_documents`（扫目录）/ `add_single_document`（单文件，
-  PDF 自动走 MinerU → LaTeX）；
-- **批量重建**：`python -X utf8 scripts/rebuild_from_sources.py <源目录>`
-  （支持 `--dry-run`、`--limit-files`，checkpoint 断点续传，自动按 `doc_id` 去重）；
-- **批量 PDF → Markdown**：`python -X utf8 scripts/mineru_to_markdown.py <PDF目录> <输出目录>
+  PDF 自动走 MinerU → LaTeX）；两者都支持 `export_markdown_dir` 参数，把转换出的
+  Markdown + 图片同步导出留档（可再用于 Obsidian 等阅读端）；
+- **只转换不入库**：`python -X utf8 scripts/mineru_to_markdown.py <PDF目录> <md目录>
   --workers 3`（每篇产出 `<名>.md` + `<名>_images/`，可断点续跑）；
   备选引擎 docling 见 `scripts/pdf_to_markdown.py`；
+- **重建/更新**：`python -X utf8 scripts/rebuild_from_sources.py <源目录>`
+  （`--dry-run`、`--limit-files`，checkpoint 断点续传，自动按 `doc_id` 去重）；
 - **实测规模参考**（作者使用场景）：116 篇论文（2205 页）→ 18k 切片，
   3 并行转换约 1.5 小时（RTX 4060），重建入库约 12 分钟。
 

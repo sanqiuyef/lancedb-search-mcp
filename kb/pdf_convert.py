@@ -162,10 +162,36 @@ def cache_dir() -> Path:
         else Path(cfg.resolve_db_path()) / "_pdf_md_cache"
 
 
-def convert_pdf(pdf_path: "str | Path", use_cache: bool = True) -> dict:
+def export_copy(md_path: Path, export_dir: Path, stem: str) -> Path:
+    """把转换产物导出为标准布局（供人阅读/入库/归档）：
+
+    <export_dir>/<stem>.md + <export_dir>/<stem>_images/img-NNN.ext
+    正文中的图片链接同步改写为新目录名。
+    """
+    src_stem = md_path.stem
+    text = md_path.read_text(encoding="utf-8")
+    src_img_dir = md_path.parent / f"{src_stem}_images"
+    dst_img_dir = export_dir / f"{stem}_images"
+    if src_img_dir.is_dir():
+        dst_img_dir.mkdir(parents=True, exist_ok=True)
+        for f in src_img_dir.iterdir():
+            if f.is_file():
+                shutil.copy2(f, dst_img_dir / f.name)
+        text = text.replace(f"{src_stem}_images/", f"{stem}_images/")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    dest_md = export_dir / f"{stem}.md"
+    dest_md.write_text(text, encoding="utf-8")
+    return dest_md
+
+
+def convert_pdf(pdf_path: "str | Path", use_cache: bool = True,
+                export_dir: "str | Path | None" = None) -> dict:
     """PDF → Markdown（公式 LaTeX + 图片另存）。带磁盘缓存。
 
-    返回 {md_path, chars, images, formulas, cached, method, lang}；
+    export_dir 不为空时，额外把产物导出为标准布局
+    `<export_dir>/<stem>.md` + `<export_dir>/<stem>_images/`（含缓存命中的情况）。
+
+    返回 {md_path, chars, images, formulas, cached, method, lang[, exported_md]}
     失败抛异常（由调用方决定回退策略）。
     """
     pdf = Path(pdf_path)
@@ -174,18 +200,20 @@ def convert_pdf(pdf_path: "str | Path", use_cache: bool = True) -> dict:
     if not mineru_available():
         raise RuntimeError(f"MinerU 不可用：{cfg.MINERU_BIN}")
 
+    entry = None
     if use_cache:
         entry = cache_dir() / cache_key(pdf)
         md_path = entry / "doc.md"
         if md_path.is_file():
             md = md_path.read_text(encoding="utf-8")
-            return {"md_path": str(md_path), "chars": len(md),
+            info = {"md_path": str(md_path), "chars": len(md),
                     "images": len(list((entry / "doc_images").glob("*")))
                     if (entry / "doc_images").is_dir() else 0,
                     "formulas": len(re.findall(r"\$\$[^$]+\$\$|\$[^$\n]+\$", md)),
                     "cached": True, "method": "cache", "lang": ""}
-    else:
-        entry = None
+            if export_dir:
+                info["exported_md"] = str(export_copy(md_path, Path(export_dir), pdf.stem))
+            return info
 
     staging = Path(cfg.MINERU_STAGING_DIR) / ("kb_" + cache_key(pdf) if use_cache else "kb_run")
     lang, method = pick_profile(pdf)
@@ -196,4 +224,6 @@ def convert_pdf(pdf_path: "str | Path", use_cache: bool = True) -> dict:
     info.update({"cached": False, "method": method, "lang": lang,
                  "seconds": round(time.time() - t0, 1)})
     shutil.rmtree(staging, ignore_errors=True)
+    if export_dir:
+        info["exported_md"] = str(export_copy(Path(info["md_path"]), Path(export_dir), pdf.stem))
     return info

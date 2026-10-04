@@ -20,7 +20,8 @@ lancedb-search/
 │   ├── smoke_local_backend.py      本地双模型真实加载冒烟（GPU 推理验证）
 │   ├── smoke_idle_unload.py        闲置自动卸载冒烟（显存释放 + 重载验证）
 │   ├── mineru_pdf_splitter.py      [自建 OCR 链路] MinerU 大 PDF 预切分工具
-│   ├── mineru_to_markdown.py       ★ PDF→Markdown 主转换器（MinerU pipeline；中文 ocr / 英文 auto）
+│   ├── pdf_pipeline.py             ★ 标准管道：PDF → Markdown → 向量库（一条命令，可断点）
+│   ├── mineru_to_markdown.py       PDF→Markdown 批量转换（只转换不入库）
 │   └── pdf_to_markdown.py          PDF→Markdown 备选转换器（docling 公式增强 + CUDA）
 ├── .mineru-venv/                   独立 venv：mineru 3.4.4 + transformers 4.57（Anaconda 已是 v5，不能共用）
 ├── tests/                          unittest 离线测试套件
