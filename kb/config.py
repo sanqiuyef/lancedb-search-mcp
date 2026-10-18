@@ -22,6 +22,23 @@ LOCAL_MODEL_DEVICE = os.environ.get("LOCAL_MODEL_DEVICE", "auto").lower()
 # 闲置 N 秒后自动卸载本地模型释放显存（对齐 Ollama keep-alive；0 = 常驻不卸载）
 LOCAL_MODEL_IDLE_UNLOAD = int(os.environ.get("LOCAL_MODEL_IDLE_UNLOAD", "300"))
 
+# ── 图像嵌入（2026-10-06 新增：jina-clip-v2 图文对齐，与文本链路相互独立） ──
+# 图文同空间 → 以文搜图；CC-BY-NC-4.0 仅限个人学术用途。维度 1024（Matryoshka 可截断）。
+LOCAL_IMAGE_EMBED_MODEL = os.environ.get("LOCAL_IMAGE_EMBED_MODEL", "jinaai/jina-clip-v2")
+LOCAL_IMAGE_EMBED_DIM = int(os.environ.get("LOCAL_IMAGE_EMBED_DIM", "1024"))
+# 自包含本地目录（权重+内联实现代码，auto_map 已改写为本地引用，彻底离线可载）；
+# 空或不存在时回退 HF 缓存快照解析。
+IMAGE_EMBED_LOCAL_DIR = os.environ.get(
+    "LANCEDB_IMAGE_EMBED_LOCAL_DIR", r"D:\huggingface\local-models\jina-clip-v2"
+)
+IMAGE_TABLE_NAME = os.environ.get("LANCEDB_IMAGE_TABLE", "image_chunks")
+IMAGE_BATCH_SIZE = int(os.environ.get("LANCEDB_IMAGE_BATCH", "16"))
+# 默认扫描目录：vault 文献图片（按 citekey 分目录）
+IMAGE_SCAN_DIR_DEFAULT = os.environ.get(
+    "LANCEDB_IMAGE_SCAN_DIR",
+    r"D:\cherry-workplace\knowledge-hub\vault\attachments-附件\literature-文献图片",
+)
+
 # ── 单库与表 ──
 DEFAULT_DB_PATH = r"D:\cherry-workplace\knowledge-hub\lancedb"  # 全局知识库内的向量库子目录
 TABLE_NAME = "my_docs"

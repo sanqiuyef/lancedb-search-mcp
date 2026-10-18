@@ -2,10 +2,11 @@
 
 ```
 lancedb-search/
-├── server.py                       MCP 薄入口（14 个工具定义）
+├── server.py                       MCP 薄入口（15 个工具定义）
 ├── kb/                             知识库核心包
 │   ├── config.py                   环境变量与单库路径解析（无分区）
 │   ├── embeddings.py               本地 embedding（bge-m3，官方注册表 + LRU 缓存）
+│   ├── image_search.py             ★图像向量检索（jina-clip-v2 自包含加载 + image_chunks 表，2026-10-06）
 │   ├── model_lifecycle.py          本地模型生命周期：用时挂载、闲置自动卸载显存
 │   ├── schema.py                   LanceModel schema、建表、FTS/向量索引、库目录 README
 │   ├── ingest.py                   文档解析（MinerU→文本层→OCR 回退链）、分块、增删改查
@@ -19,6 +20,7 @@ lancedb-search/
 │   ├── rebuild_from_sources.py     批量重建脚本（攒批 + checkpoint 断点续传）
 │   ├── smoke_local_backend.py      本地双模型真实加载冒烟（GPU 推理验证）
 │   ├── smoke_idle_unload.py        闲置自动卸载冒烟（显存释放 + 重载验证）
+│   ├── test_jina_clip_smoke.py     图像嵌入冒烟（kb.image_search 生产路径 + 中文查询×样图矩阵）
 │   ├── mineru_pdf_splitter.py      [自建 OCR 链路] MinerU 大 PDF 预切分工具
 │   ├── pdf_pipeline.py             ★ 标准管道：PDF → Markdown → 向量库（一条命令，可断点）
 │   ├── mineru_to_markdown.py       PDF→Markdown 批量转换（只转换不入库）
@@ -43,7 +45,10 @@ lancedb-search/
 
 - 知识库当前**完全为空**（2026-10-02 用户决定清空全部向量数据）；首次入库时在
   `D:\cherry-workplace\knowledge-hub\lancedb`（全局知识库根目录内的向量库子文件夹）自动重建
-- `D:\huggingface\hub` — bge-m3 / bge-reranker-v2-m3 模型缓存（HF_HOME）
+- `image_chunks` 表（2026-10-06）：3091 张 vault 文献图片向量（jina-clip-v2，1024 维）
+- `D:\huggingface\hub` — bge-m3 / bge-reranker-v2-m3 / jina 模型缓存（HF_HOME）
+- `D:\huggingface\local-models\` — jina-clip-v2 与 jina-embeddings-v3 **自包含目录**
+  （权重+内联实现代码+auto_map 本地化，transformers v5 离线兼容，重建步骤见 README 图像检索节）
 - `D:\lance\language_models\jieba` — jieba 分词词典（LANCE_LANGUAGE_MODEL_HOME）
 
 ## 已删除的历史功能（2026-10 整改期间）

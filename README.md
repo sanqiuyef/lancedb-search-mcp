@@ -80,16 +80,38 @@ mineru-models-download -s modelscope -m pipeline      # 首次下载模型（约
 | `TESSERACT_CMD` / `LANCEDB_OCR_LANG` | 见 `kb/config.py` | Tesseract 路径与语言包 |
 | `MINERU_API_KEY` | 空 | 云 MinerU API（可选，仅扫描件回退链用） |
 
-## MCP 工具（13 个）
+## MCP 工具（15 个）
 
 | 类别 | 工具 |
 |---|---|
 | 检索问答 | search_knowledge、ask_knowledge、search_similar、get_document |
 | 知识库管理 | get_knowledge_status、list_documents、add_documents、add_single_document、update_document、delete_documents |
 | 自建能力 | ingest_url、start_watcher、stop_watcher |
+| 图像检索（2026-10-06） | search_images（以文搜图）、ingest_images（图片向量入库） |
 
 `add_documents` / `add_single_document` 均支持 `export_markdown_dir` 参数：入库的同时把
 PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<名>.md` + `<名>_images/`）。
+
+## 图像向量检索（2026-10-06 新增）
+
+以 `jinaai/jina-clip-v2`（图文对齐双塔，1024 维，CC-BY-NC-4.0 仅限个人学术用途）
+为图像嵌入模型，与文本链路（bge-m3）**完全独立**：独立表 `image_chunks`、独立
+嵌入函数、共享闲置卸载机制。中文查询直接可用（以文搜图）；caption 字段预留。
+
+- **模型本地化（重要）**：`D:\huggingface\local-models\jina-clip-v2\` 与
+  `local-models\jina-embeddings-v3\` 为**自包含目录**（权重 + 内联实现代码 +
+  auto_map 改写为本地引用）。原因：transformers v5 的动态模块离线解析对
+  trust_remote_code 多文件模型不稳定，且 jina 两级模型各自引用远程实现仓库。
+  重建方法：从 HF 缓存快照 copytree → 拷入实现仓库 *.py → 剥掉 auto_map 的
+  `仓库前缀--` → v2 的 `text_config.hf_model_name_or_path` 指向 v3 本地目录 →
+  `text_config.hf_model_config_kwargs.use_flash_attn=false`（本机未装 flash-attn）。
+  另给本地 modeling_clip.py 打了两处 isinstance→类名校验补丁（v5 动态模块按文件
+  内容分目录缓存，config 与 model 类来自不同模块实例，isinstance 必然失败）。
+- **依赖兼容**：Anaconda 需 `timm`（EVA02 视觉塔）；`kb/image_search.py` 运行时
+  给 `transformers.models.clip.modeling_clip` 垫回 v5 移除的 `clip_loss`（推理不调用，
+  仅为通过顶层 import）。
+- 入库：`ingest_images(scan_dir)`，默认扫描 vault 文献图片目录，按 mtime 增量；
+  检索：`search_images(query, limit, source_filter)`，cosine 距离转相似度输出。
 
 ## 自建模块清单（待后期单独优化）
 
@@ -104,10 +126,11 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 ## 架构
 
 ```
-server.py                MCP 薄入口（13 工具）
+server.py                MCP 薄入口（15 工具）
 kb/                      知识库核心包
   config.py              环境变量 + 单库路径解析（无分区）
   embeddings.py          本地 embedding（bge-m3，官方注册表 + LRU 缓存）
+  image_search.py        ★图像向量检索（jina-clip-v2 自包含加载 + image_chunks 表）
   model_lifecycle.py     本地模型生命周期：用时挂载、闲置自动卸载（gc + empty_cache）
   schema.py              LanceModel schema、建表、FTS/向量索引维护、库目录 README
   pdf_convert.py         ★PDF→Markdown（本地 MinerU pipeline；公式→LaTeX，缓存+档位判定）

@@ -329,5 +329,69 @@ def stop_watcher() -> str:
     return kb_watcher.stop_watcher()
 
 
+# =============================================================
+# 图像检索（2026-10-06 新增：jina-clip-v2 图文对齐）
+# =============================================================
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True),
+    name="search_images",
+    description="以文搜图：在文献图片向量库中按内容检索图像（jina-clip-v2 图文对齐空间，中文查询可用）。返回图片路径、来源文献与相似度。",
+)
+def search_images(
+    query: Annotated[str, "图片内容的自然语言描述（中英文均可）"],
+    limit: Annotated[int, "返回图片数（1-20）"] = 8,
+    source_filter: Annotated[str, "来源过滤（citekey 或目录名片段，如 'asif2026'）"] = "",
+) -> str:
+    from kb import image_search as kb_img
+
+    limit = min(max(limit, 1), 20)
+    try:
+        if not kb_img.image_table_exists():
+            return (
+                "❌ 图像库为空。请先用 ingest_images 工具入库图片（默认扫描 vault 文献图片目录）。\n"
+                f"   嵌入模型: {kb_img.image_identity()}"
+            )
+        structured = kb_img.search_images_structured(query=query, limit=limit, source_filter=source_filter)
+    except Exception as error:
+        import sys
+        import traceback
+
+        print(f"[search_images] {traceback.format_exc()}", file=sys.stderr)
+        return f"❌ 图像搜索失败: {error}"
+    docs = structured["results"]
+    if not docs:
+        return f"未搜索到与「{query}」相关的图片。"
+    trace = structured["trace"]
+    lines = [
+        f"🖼️ **图像搜索结果** 「{query}」",
+        f"   模式: {trace['mode']} | {trace['model']} | 表内 {trace['table_rows']} 张",
+        "─" * 60,
+    ]
+    for i, d in enumerate(docs, 1):
+        lines.append(
+            f"{i}. **{d['source_doc']}/{d['file_name']}** 相似度: {d['similarity']:.4f}\n"
+            f"   路径: {d['image_path']}"
+        )
+    lines.append("提示: 用 Read 工具打开路径即可查看图片。")
+    return "\n\n".join(lines)
+
+
+@mcp.tool(
+    name="ingest_images",
+    description="把目录下的图片向量化入库（jpg/jpeg/png；默认扫描 vault 文献图片目录，按 mtime 增量跳过未变更）。",
+)
+def ingest_images(
+    scan_dir: Annotated[str, "图片根目录（默认 vault 文献图片目录）"] = "",
+    rebuild: Annotated[bool, "清空重建（默认 false，增量入库）"] = False,
+) -> str:
+    from kb import image_search as kb_img
+
+    try:
+        return kb_img.ingest_images(scan_dir=scan_dir, rebuild=rebuild)
+    except Exception as error:
+        return f"❌ 图像入库失败: {error}"
+
+
 if __name__ == "__main__":
     mcp.run()
