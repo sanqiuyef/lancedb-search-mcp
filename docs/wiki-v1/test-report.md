@@ -1,29 +1,46 @@
-# Wiki V1 Phase 7 测试报告
+# Wiki V1 测试报告
 
 ## 结论
 
 | 项目 | 结果 |
 |---|---|
-| Phase 0 基线 | 40 项 |
-| Phase 7 开发前全量 | 359 项，全部通过 |
-| Phase 7 新增 | 24 项（recovery 8 + ops 16） |
-| 当前全量 discover | **383 项，全部通过** |
+| 基线（Phase 0 之前） | 40 项 |
+| 当前全量 discover | **495 项，全部通过** |
 | 失败/错误/跳过 | 0 / 0 / 0 |
 | 运行环境 | Windows 10.0.19045，Python 3.13.9（`D:\anaconda3\python.exe`） |
-| 全量耗时 | 约 18 秒 |
+| 全量耗时 | 约 36 秒 |
 
 ## 测试演进
 
 | 阶段 | 累计测试数 | 主要范围 |
 |---|---:|---|
-| Phase 0 | 40 | 原有检索/入库/网页/监听/图像等基础能力 |
-| Phase 1 | — | 配置、稳定 ID、frontmatter、SQLite 迁移 |
-| Phase 2 | — | 文档登记、切片引用、证据链、旧库迁移 |
-| Phase 3 | 359 | 页面存储、实体/关系、页面双链、提案、validator |
-| Phase 7 | 383 | 崩溃恢复、备份、校验 CLI、质量报告、元数据重建 |
+| 基线 | 40 | 原有检索/入库/网页/监听/图像等基础能力 |
+| Phase 0 | 218 | watcher、ingest 身份/幂等、URL 规范化、图片去重 |
+| Phase 1 | 134（分支） | 配置、稳定 ID、frontmatter、SQLite 迁移 |
+| Phase 2 | 278（分支） | 文档登记、切片引用、证据链、旧库迁移 |
+| Phase 3 | 299（分支） | 页面存储、实体/关系、页面双链、提案、validator |
+| schema + Phase 4 + 7 | 434 | 状态对齐、页面索引/检索、恢复/备份/质量指标 |
+| 导航层 | 453 | index/log/purpose/overview、统一提交 |
+| Phase 5 | 485 | service 门面 + 14 个 MCP 工具 + 抽取契约 |
+| Phase 6 | 494 | Wiki 阅读与提案审核 UI |
+| 发布修复 | 495 | 正文型提案审核通过后自动发布并入索引 |
 
-Phase 7 未修改既有测试；新增测试全部使用 `tempfile.TemporaryDirectory()`，
-不访问真实 vault、真实 `.wiki/wiki.sqlite3` 或 LanceDB。
+新增测试全部使用 `tempfile.TemporaryDirectory()`，不访问真实 vault、真实 Wiki SQLite 或 LanceDB。
+
+## Phase 8 端到端（隔离环境）
+
+临时 vault + 真实 `my_docs` 的 300 条切片：
+
+| 步骤 | 结果 |
+|---|---|
+| 迁移 | 3 个文档、300 条 chunk_refs |
+| 抽取 | 1 个实体、1 条 factual claim，引文校验通过，0 拒绝 |
+| 提案 → 审核 | pending → applied |
+| 发布 | 页面 status=published，Git 提交 `wiki: update ... (r2)` |
+| 导航 | index/log/purpose/overview 均生成，Git 提交 `wiki: refresh navigation` |
+| 页面索引 | 真实 bge-m3 索引成功，`index_error=""` |
+| 检索 | `wiki_search(mode=page)` 命中 1 条 |
+| 校验 | 0 error / 0 warning |
 
 ## 运行命令
 
@@ -95,8 +112,8 @@ D:/anaconda3/python.exe -X utf8 -m unittest \
   “收敛判定”被覆盖，但操作系统级 fsync/断电行为不在单测范围。
 - 按任务要求不访问真实 vault/LanceDB；Quote Validity 未做内容级回查，
   只验证 `quote_sha256(quote)` 与位置字段的结构口径。
-- Phase 4 页面索引尚未合并：未索引指标只测试“表缺失”和人工构造的
-  `wiki_pages(page_id)` 两种情形；真实索引 schema/重建脚本未联调。
+- 页面索引已合并并有临时 LanceDB 测试；Phase 8 用真实 bge-m3 跑通一次，
+  但未对大规模页面库做性能与索引重建压测。
 - 备份未覆盖大库、在线高并发写入、磁盘满、权限拒绝、跨盘/网络盘与远程复制；
   不自动 push 是设计约束，不属于未实现功能。
 - 元数据重建未覆盖符号链接/junction、超长路径、非 UTF-8 文件名等平台边界；

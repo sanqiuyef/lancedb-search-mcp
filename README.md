@@ -325,8 +325,9 @@ OCR 链（云 MinerU → Tesseract）。转换产物按 `路径+大小+mtime` �
 
 `ui_server.py` + `ui/index.html`：只绑 `127.0.0.1:8002` 的本地检索面板，检索内核复用
 `kb.search.search_structured`（混合检索 + 本地精排），供 Obsidian（核心 Web Viewer）或
-任意浏览器内嵌使用，不依赖 MCP 与任何 Obsidian 插件。Wiki 页面浏览与提案审核标签
-随 Wiki 层提供；当前面板尚未合并这些标签，仍只做原始切片检索。
+任意浏览器内嵌使用，不依赖 MCP 与任何 Obsidian 插件。面板包含「检索 / Wiki / 审核」
+三个标签：Wiki 标签浏览页面、反链与证据，审核标签查看提案 Diff 并批准/拒绝；
+`WIKI_ENABLED=0` 时 Wiki 与审核标签显示启用提示，检索标签不受影响。
 
 ```powershell
 run_ui.cmd                     # 启动器（内部设好 HF/env 后拉起 ui_server.py）

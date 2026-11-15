@@ -269,19 +269,17 @@ D:/anaconda3/python.exe -X utf8 scripts/rebuild_wiki_metadata.py \
 
 ## 9. 重建页面索引
 
-页面索引由 Phase 4 实现（`kb/wiki/page_index.py`、
-`scripts/rebuild_wiki_page_index.py`）；本分支不包含、不修改这些文件。
+页面索引由 `kb/wiki/page_index.py` 实现，重建入口是
+`scripts/rebuild_wiki_page_index.py`。
 
-预期流程：
+流程：
 
-1. 确认 `WIKI_PAGE_INDEX_TABLE` 与 Phase 4 索引表名一致（默认 `wiki_pages`）；
-2. 运行 Phase 4 提供的重建命令（具体参数以该脚本 `--help` 为准）；
-3. 运行质量报告确认 `unindexed_published_pages.status == "ok"` 且
-   `missing_count == 0`；
+1. 确认 `WIKI_PAGE_INDEX_TABLE` 与索引表名一致（默认 `wiki_pages`）；
+2. 运行 `python -X utf8 scripts/rebuild_wiki_page_index.py`（默认增量；`--dry-run` 预览，`--drop` 显式重建）；
+3. 运行质量报告确认 `unindexed_published_pages.status == "ok"` 且缺失数为 0；
 4. 对 `index_pending` journal 人工确认后标 `completed`。
 
-在索引脚本尚未合并时，质量报告会明确输出“索引未建立”，不应把该状态当成
-0 缺失。
+索引表尚未建立时，质量报告会明确输出“索引未建立”，不应把该状态当成 0 缺失。
 
 ## 10. 迁移与回滚
 

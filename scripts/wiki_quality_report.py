@@ -55,7 +55,7 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.82
 LIST_LIMIT = 50
 COVERAGE_CLAIM_TYPES = ("fact", "factual", "definition", "result")
 ACTIVE_CLAIM_STATUSES = ("proposed", "accepted", "disputed")
-ACTIVE_RELATION_STATUSES = ("proposed", "accepted")
+ACTIVE_RELATION_STATUSES = ("proposed", "verified")
 INACTIVE_ENTITY_STATUSES = ("merged", "deprecated")
 
 
@@ -657,7 +657,7 @@ def unresolved_aliases(conn: sqlite3.Connection) -> dict[str, Any]:
         "status": "ok",
         "note": (
             "Unresolved = redirect 目标实体不存在 / 别名所属实体 archived|rejected / "
-            "同一 normalized_alias 被多个 proposed|accepted 实体共享。"
+            "同一 normalized_alias 被多个 active 实体共享。"
         ),
     }
 
@@ -757,7 +757,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"| Unindexed Published Pages | {unindexed_value} | "
         "published 页面在页面索引中的缺失数 |",
         f"| Unsourced Relations | {unsourced['count']} | "
-        "无 evidence 且无 source_page_id 的 proposed/accepted 关系 |",
+        "无 evidence 且无 source_page_id 的 proposed/verified 关系 |",
         f"| Unresolved Aliases | {aliases['count']} | "
         "redirect 目标缺失 / inactive 实体别名 / active 实体别名冲突 |",
         "",
