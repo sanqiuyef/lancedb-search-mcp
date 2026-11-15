@@ -222,6 +222,7 @@ class PageDraft:
     status: str = "draft"
     created: Any = None
     change_reason: str = ""
+    sources: list[str] = field(default_factory=list)
 
 
 def _coerce_draft(draft: PageDraft | Mapping[str, Any]) -> PageDraft:
@@ -352,6 +353,7 @@ class PageStore:
             raise PageValidationError(f"未知 page_type: {page_type!r}")
         tags = _string_list("tags", draft.tags)
         aliases = _string_list("aliases", draft.aliases)
+        sources = _string_list("sources", draft.sources)
         created = _format_created(draft.created)
 
         base_slug = (
@@ -398,6 +400,8 @@ class PageStore:
                     "revision_id": revision_id,
                     "updated": now,
                 }
+                if sources:
+                    frontmatter["sources"] = sources
                 frontmatter = validate_page_frontmatter(frontmatter)
                 content = render_frontmatter(frontmatter, draft.body)
                 digest = content_sha256(content)
@@ -750,6 +754,12 @@ class PageStore:
             summary = provided_fm["summary"]
             aliases = _string_list("aliases", provided_fm.get("aliases"))
             status = provided_fm["status"]
+            sources = _string_list(
+                "sources",
+                provided_fm.get("sources")
+                if "sources" in provided_fm
+                else existing_fm.get("sources"),
+            )
         else:
             title = existing_fm["title"]
             tags = _string_list("tags", existing_fm.get("tags"))
@@ -757,6 +767,7 @@ class PageStore:
             aliases = _string_list("aliases", existing_fm.get("aliases"))
             body = new_content
             status = str(page.status)
+            sources = _string_list("sources", existing_fm.get("sources"))
 
         created = _format_created(
             existing_fm.get("created")
@@ -776,6 +787,7 @@ class PageStore:
                 "aliases": aliases,
                 "revision_id": revision_id,
                 "updated": updated,
+                **({"sources": sources} if sources else {}),
             }
         )
         return frontmatter, body, str(status)
@@ -870,6 +882,86 @@ class PageStore:
             return False
         return result.returncode == 0 and result.stdout.strip() == "true"
 
+    def _commit_relative_path(
+        self, path: str, *, require_exists: bool = True
+    ) -> str:
+        """把相对/绝对路径规范为 vault 相对路径，并校验边界（可选文件存在）。"""
+        if not isinstance(path, str) or not path.strip():
+            raise GitCommitError("待提交路径必须是非空字符串")
+        if os.path.isabs(path):
+            absolute = ensure_within(self.config.vault_path, path)
+        else:
+            normalized = path.replace("\\", "/")
+            absolute = ensure_within(
+                self.config.vault_path,
+                os.path.join(self.config.vault_path, *normalized.split("/")),
+            )
+        relative = os.path.relpath(absolute, self.config.vault_path).replace(
+            os.sep, "/"
+        )
+        if relative in ("", "."):
+            raise GitCommitError("不能提交 vault 根目录")
+        if require_exists and not os.path.isfile(absolute):
+            raise GitCommitError(f"待提交文件不存在: {absolute}")
+        return relative
+
+    def commit_paths(self, paths: list[str], message: str) -> str:
+        """一次提交指定路径；未初始化 git 时返回 ""，失败抛 GitCommitError。
+
+        所有路径必须位于 vault 内。git 仓库内还要求路径是已存在的文件；
+        只 ``git add`` 并 ``git commit --only`` 这些路径，不触碰其他
+        已暂存/未暂存的文件。
+        """
+        if not isinstance(message, str) or not message.strip():
+            raise GitCommitError("git commit message 不能为空")
+        if isinstance(paths, (str, bytes)) or not isinstance(paths, (list, tuple)):
+            raise GitCommitError("paths 必须是路径列表")
+        if not paths:
+            raise GitCommitError("paths 不能为空")
+
+        relatives: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            relative = self._commit_relative_path(path, require_exists=False)
+            if relative not in seen:
+                seen.add(relative)
+                relatives.append(relative)
+
+        if not self._is_git_repo():
+            return ""
+
+        for relative in relatives:
+            absolute = os.path.join(
+                self.config.vault_path, *relative.split("/")
+            )
+            if not os.path.isfile(absolute):
+                raise GitCommitError(f"待提交文件不存在: {absolute}")
+
+        added = self._run_git(["add", "--", *relatives])
+        if added.returncode != 0:
+            raise GitCommitError(f"git add 失败: {added.stderr.strip()}")
+        staged = self._run_git(
+            ["diff", "--cached", "--quiet", "--", *relatives]
+        )
+        if staged.returncode == 0:
+            return ""
+        if staged.returncode != 1:
+            raise GitCommitError(
+                f"git diff --cached 失败: {staged.stderr.strip()}"
+            )
+        committed = self._run_git(
+            ["commit", "--only", "-m", message, "--", *relatives]
+        )
+        if committed.returncode != 0:
+            stderr = committed.stderr.strip()
+            if "nothing to commit" in stderr.lower():
+                return ""
+            raise GitCommitError(f"git commit 失败: {stderr}")
+        head = self._run_git(["rev-parse", "HEAD"])
+        if head.returncode != 0:
+            raise GitCommitError(f"git rev-parse HEAD 失败: {head.stderr.strip()}")
+        return head.stdout.strip()
+
     def git_commit_page(self, relative_path: str, message: str) -> str:
         """只提交指定页面文件；未初始化 git 时返回 ""，失败抛 GitCommitError。"""
         if not isinstance(message, str) or not message.strip():
@@ -883,35 +975,7 @@ class PageStore:
         )
         if not os.path.isfile(absolute):
             raise GitCommitError(f"待提交文件不存在: {absolute}")
-        if not self._is_git_repo():
-            return ""
-
-        added = self._run_git(["add", "--", relative])
-        if added.returncode != 0:
-            raise GitCommitError(
-                f"git add 失败（{relative}）: {added.stderr.strip()}"
-            )
-        staged = self._run_git(
-            ["diff", "--cached", "--quiet", "--", relative]
-        )
-        if staged.returncode == 0:
-            return ""
-        if staged.returncode != 1:
-            raise GitCommitError(
-                f"git diff --cached 失败: {staged.stderr.strip()}"
-            )
-        committed = self._run_git(
-            ["commit", "--only", "-m", message, "--", relative]
-        )
-        if committed.returncode != 0:
-            stderr = committed.stderr.strip()
-            if "nothing to commit" in stderr.lower():
-                return ""
-            raise GitCommitError(f"git commit 失败: {stderr}")
-        head = self._run_git(["rev-parse", "HEAD"])
-        if head.returncode != 0:
-            raise GitCommitError(f"git rev-parse HEAD 失败: {head.stderr.strip()}")
-        return head.stdout.strip()
+        return self.commit_paths([relative], message)
 
 
 __all__ = [

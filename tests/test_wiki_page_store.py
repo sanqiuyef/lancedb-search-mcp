@@ -250,6 +250,30 @@ class TestCreatePage(WikiPageStoreTestBase):
         self.assertIn(first.page_id, {page.page_id for page in self.store.list_pages()})
         self.assertIn(second.page_id, {page.page_id for page in self.store.list_pages()})
 
+    def test_optional_sources_rendered_and_preserved_on_update(self):
+        sources = ["raw-素材/城市洪涝.md", "https://example.com/flood"]
+        page = self.store.create_page(self.make_draft(sources=sources))
+        frontmatter, _ = parse_frontmatter(self.read_page_text(page))
+        self.assertEqual(frontmatter["sources"], sources)
+
+        result = self.store.update_page(
+            page.page_id,
+            "# 更新后的正文\n",
+            expected_revision_id=page.current_revision_id,
+            commit=False,
+        )
+        self.assertEqual(result.status, "updated")
+        frontmatter, _ = parse_frontmatter(self.read_page_text(page))
+        self.assertEqual(frontmatter["sources"], sources)
+
+        plain = self.store.create_page(self.make_draft(slug="plain"))
+        frontmatter, _ = parse_frontmatter(self.read_page_text(plain))
+        self.assertNotIn("sources", frontmatter)
+
+        with self.assertRaises(PageValidationError):
+            self.store.create_page(self.make_draft(sources="not-a-list"))
+
+
 
 class TestUpdatePage(WikiPageStoreTestBase):
     def test_body_update_creates_revision_and_preserves_metadata(self):
@@ -502,6 +526,105 @@ class TestGitCommit(WikiPageStoreTestBase):
         ).fetchone()
         self.assertEqual(journal["state"], "failed")
         self.assertIn("commit boom", journal["error_message"])
+
+
+class TestCommitPaths(WikiPageStoreTestBase):
+    def write_vault_file(self, relative, text):
+        path = os.path.join(self.vault, *relative.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        return path
+
+    def status_lines(self):
+        return [
+            line
+            for line in self.git("status", "--porcelain").stdout.splitlines()
+            if line.strip()
+        ]
+
+    def test_commits_page_index_log_and_leaves_other_changes(self):
+        self.init_git()
+        self.write_vault_file("notes/tracked.md", "tracked\n")
+        seed = self.git("add", "--", "notes/tracked.md")
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        seed = self.git("commit", "-m", "test: seed tracked file")
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        self.write_vault_file("notes/tracked.md", "tracked modified\n")
+        self.write_vault_file("notes/scratch.md", "scratch\n")
+
+        page = self.store.create_page(self.make_draft(), commit=False)
+        index = self.write_vault_file("wiki-维基/index.md", "# 知识索引\n")
+        log = self.write_vault_file("wiki-维基/log.md", "# 操作日志\n\n- entry\n")
+
+        commit = self.store.commit_paths(
+            [page.relative_path, "wiki-维基/index.md", "wiki-维基/log.md"],
+            "wiki: refresh navigation",
+        )
+
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            self.git("log", "-1", "--pretty=%s").stdout.strip(),
+            "wiki: refresh navigation",
+        )
+        names = self.git("show", "--name-only", "--pretty=", "HEAD").stdout.replace(
+            "\\", "/"
+        )
+        for expected in (
+            page.relative_path,
+            "wiki-维基/index.md",
+            "wiki-维基/log.md",
+        ):
+            self.assertIn(expected, names)
+        self.assertNotIn("notes/tracked.md", names)
+        self.assertNotIn("notes/scratch.md", names)
+
+        status = self.status_lines()
+        self.assertIn(" M notes/tracked.md", status)
+        self.assertIn("?? notes/scratch.md", status)
+        self.assertFalse(any("wiki-维基" in line for line in status))
+        self.assertTrue(os.path.isfile(index))
+        self.assertTrue(os.path.isfile(log))
+
+    def test_returns_empty_without_git_repository(self):
+        page = self.store.create_page(self.make_draft(), commit=False)
+        index = self.write_vault_file("wiki-维基/index.md", "# 知识索引\n")
+        current = self.store.commit_paths(
+            [page.relative_path, "wiki-维基/index.md"], "wiki: refresh"
+        )
+        self.assertEqual(current, "")
+        self.assertTrue(os.path.isfile(index))
+        self.assertEqual(
+            self.store.commit_paths(["wiki-维基/missing.md"], "wiki: refresh"),
+            "",
+        )
+
+    def test_rejects_paths_outside_vault(self):
+        self.init_git()
+        outside = os.path.join(self.root, "outside.md")
+        with open(outside, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("outside\n")
+        for path in (outside, "../outside.md", "wiki-维基/../../outside.md"):
+            with self.subTest(path=path):
+                with self.assertRaises(WikiPathError):
+                    self.store.commit_paths([path], "should fail")
+        self.assertNotEqual(self.git("log", "--oneline").returncode, 0)
+
+    def test_missing_path_and_empty_paths_rejected(self):
+        self.init_git()
+        with self.assertRaises(GitCommitError):
+            self.store.commit_paths(["wiki-维基/missing.md"], "msg")
+        with self.assertRaises(GitCommitError):
+            self.store.commit_paths([], "msg")
+        with self.assertRaises(GitCommitError):
+            self.store.commit_paths("wiki-维基/index.md", "msg")
+
+    def test_no_changes_returns_empty(self):
+        self.init_git()
+        self.write_vault_file("a.md", "a\n")
+        first = self.store.commit_paths(["a.md"], "first")
+        self.assertRegex(first, r"^[0-9a-f]{40}$")
+        self.assertEqual(self.store.commit_paths(["a.md"], "second"), "")
 
 
 class TestAtomicWriteHelper(WikiPageStoreTestBase):

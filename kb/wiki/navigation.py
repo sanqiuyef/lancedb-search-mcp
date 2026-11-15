@@ -1,0 +1,489 @@
+# -*- coding: utf-8 -*-
+"""Wiki 导航层：purpose / index / log / overview 的生成与刷新。
+
+边界约定（见 ``docs/wiki-v1/llm-wiki-inspired-design.md``）：
+
+- ``index.md``、``overview.md`` 是生成物，每次重建都会覆盖；
+- ``purpose.md`` 只在不存在时从内置模板创建，之后由人维护，AI 不覆盖；
+- ``log.md`` 只追加，不改写历史。
+
+所有路径都限制在 ``config.page_root``（默认 ``<vault>/wiki-维基/``）内。
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any
+
+from . import constants as C
+from .config import WikiConfig, WikiPathError, ensure_within
+from .evidence import quote_sha256
+from .markdown import FrontmatterError, parse_frontmatter
+from .models import PageRecord
+from .page_store import atomic_write_text, utc_now
+from .repositories import pages as pages_repo
+
+NAV_FILENAMES = {
+    "index": "index.md",
+    "log": "log.md",
+    "purpose": "purpose.md",
+    "overview": "overview.md",
+}
+
+PAGE_TYPE_LABELS = {
+    "concept": "概念",
+    "entity": "实体",
+    "topic": "主题",
+}
+
+PAGE_STATUS_LABELS = {
+    "published": "已发布",
+    "draft": "草稿",
+    "review": "待审核",
+    "archived": "已归档",
+}
+
+EMPTY_INDEX_TEXT = "当前没有已发布的 Wiki 页面。"
+
+LOG_TITLE = "# 操作日志\n\n"
+
+PURPOSE_TEMPLATE = """# 知识库目标
+
+> 本文件由系统首次生成，之后由人维护；自动刷新不会覆盖这里的内容。
+
+## 目标
+
+说明这个 Wiki 要沉淀什么知识、为谁服务，以及希望回答哪类问题。
+
+## 范围
+
+- 收录：
+- 不收录：
+
+## 关键问题
+
+1.
+2.
+3.
+
+## 维护规则
+
+- 原始资料只读，Wiki 页面承载消化后的结论与来源。
+- 页面默认先进 draft/review，显式确认后再发布。
+- 发布后重建 index/overview；purpose 的人工修改不会被自动覆盖。
+- log 只追加，不改写历史记录。
+"""
+
+
+def nav_paths(config: WikiConfig) -> dict[str, str]:
+    """返回 index/log/purpose/overview 四个绝对路径。"""
+    if not isinstance(config, WikiConfig):
+        raise TypeError("config 必须是 WikiConfig")
+    paths: dict[str, str] = {}
+    for key, filename in NAV_FILENAMES.items():
+        path = ensure_within(config.page_root, filename)
+        paths[key] = ensure_within(config.vault_path, path)
+    return paths
+
+
+def ensure_purpose(config: WikiConfig) -> tuple[str, bool]:
+    """确保 purpose.md 存在；返回 ``(path, created)``。
+
+    已存在时直接返回，绝不读取后重写或覆盖用户内容。
+    """
+    path = nav_paths(config)["purpose"]
+    if os.path.isfile(path):
+        return path, False
+
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    try:
+        with open(path, "xb") as handle:
+            handle.write(PURPOSE_TEMPLATE.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        return path, False
+    return path, True
+
+
+def rebuild_index(conn: sqlite3.Connection, config: WikiConfig) -> str:
+    """从已发布页面重建 index.md，返回文件绝对路径。"""
+    paths = nav_paths(config)
+    published = pages_repo.list_pages(conn, status="published", limit=None)
+
+    groups: dict[str, list[PageRecord]] = {page_type: [] for page_type in C.PAGE_TYPES}
+    for page in published:
+        page_type = str(page.page_type)
+        if page_type in groups:
+            groups[page_type].append(page)
+    for items in groups.values():
+        items.sort(key=lambda page: (page.title.casefold(), page.slug.casefold()))
+
+    lines = ["# 知识索引", "", f"> 更新时间：{utc_now()}", ""]
+    if not published:
+        lines.extend([EMPTY_INDEX_TEXT, ""])
+    else:
+        lines.extend(["本页由系统按已发布页面生成，可随时重建。", ""])
+        for page_type in C.PAGE_TYPES:
+            items = groups[page_type]
+            if not items:
+                continue
+            label = PAGE_TYPE_LABELS.get(page_type, page_type)
+            lines.extend([f"## {label}（{page_type}）", ""])
+            for page in items:
+                link = _wikilink(page.slug, page.title)
+                summary = _page_summary(config, page)
+                lines.append(f"- {link} — {summary}" if summary else f"- {link}")
+            lines.append("")
+
+    text = "\n".join(lines).rstrip("\n") + "\n"
+    atomic_write_text(paths["index"], text)
+    return paths["index"]
+
+
+def append_log(
+    config: WikiConfig,
+    actor: str,
+    action: str,
+    object_id: str = "",
+    detail: str = "",
+) -> str:
+    """向 log.md 追加一行操作记录，返回文件绝对路径。
+
+    行格式：``- <UTC 秒级时间> | actor | action | object_id | detail``。
+    detail/actor 等字段中的换行替换为空格，管道符转义为 ``\\|``。
+    文件不存在（或为空）时先写标题；已有内容只追加，不重写。
+    """
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("actor 必须是非空字符串")
+    if not isinstance(action, str) or not action.strip():
+        raise ValueError("action 必须是非空字符串")
+    if not isinstance(object_id, str):
+        raise TypeError("object_id 必须是字符串")
+    if not isinstance(detail, str):
+        raise TypeError("detail 必须是字符串")
+
+    path = nav_paths(config)["log"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fields = [actor, action, object_id, detail]
+    line = "- " + " | ".join(
+        [_utc_timestamp(), *(_log_field(field) for field in fields)]
+    ) + "\n"
+
+    with open(path, "a", encoding="utf-8", newline="\n") as handle:
+        if handle.tell() == 0:
+            handle.write(LOG_TITLE)
+        handle.write(line)
+    return path
+
+
+def rebuild_overview(conn: sqlite3.Connection, config: WikiConfig) -> str:
+    """统计页面、证据与来源，重建 overview.md，返回文件绝对路径。"""
+    paths = nav_paths(config)
+
+    total_pages = _count_rows(conn, "pages")
+    status_counts, type_counts = _page_counts(conn)
+    documents = _count_rows(conn, "documents")
+    chunk_refs = _count_rows(conn, "chunk_refs")
+    claims = _count_rows(conn, "claims")
+    evidence_total = _count_rows(conn, "claim_evidence")
+    verified, unverified, evidence_note = _evidence_counts(conn, evidence_total)
+    recent = _recent_pages(conn)
+
+    lines = [
+        "# 知识库概览",
+        "",
+        f"> 更新时间：{utc_now()}",
+        "",
+        "## 概览",
+        "",
+        f"- 页面总数：{total_pages}",
+        f"- 已发布：{status_counts.get('published', 0)}",
+        f"- 草稿：{status_counts.get('draft', 0)}",
+        f"- 待审核：{status_counts.get('review', 0)}",
+        f"- 已归档：{status_counts.get('archived', 0)}",
+        f"- 文档：{documents}",
+        f"- 切片引用：{chunk_refs}",
+        f"- Claims：{claims}",
+        f"- 证据：{evidence_total}",
+        "",
+        "## 页面分布",
+        "",
+        "| 类型 | 页面数 |",
+        "| --- | --- |",
+    ]
+    for page_type in C.PAGE_TYPES:
+        label = PAGE_TYPE_LABELS.get(page_type, page_type)
+        lines.append(f"| {label}（{page_type}） | {type_counts.get(page_type, 0)} |")
+
+    lines.extend(["", "| 状态 | 页面数 |", "| --- | --- |"])
+    for status in ("published", "draft", "review", "archived"):
+        label = PAGE_STATUS_LABELS.get(status, status)
+        lines.append(f"| {label}（{status}） | {status_counts.get(status, 0)} |")
+
+    lines.extend(
+        [
+            "",
+            "## 证据概况",
+            "",
+            f"- Claims：{claims}",
+            f"- Claim 证据：{evidence_total}",
+            f"- 已验证：{verified}",
+            f"- 未验证：{unverified}",
+            f"- {evidence_note}",
+            "",
+            "## 最近更新页面",
+            "",
+        ]
+    )
+    if recent:
+        for slug, title, status, updated_at in recent:
+            link = _wikilink(slug, title)
+            lines.append(f"- {link}（{status}，{updated_at}）")
+    else:
+        lines.append("当前没有页面。")
+
+    lines.extend(
+        [
+            "",
+            "## 导航",
+            "",
+            "- [[index]]",
+            "- [[log]]",
+            "- [[purpose]]",
+            "",
+        ]
+    )
+
+    text = "\n".join(lines).rstrip("\n") + "\n"
+    atomic_write_text(paths["overview"], text)
+    return paths["overview"]
+
+
+def refresh_navigation(
+    conn: sqlite3.Connection,
+    config: WikiConfig,
+    actor: str = "agent",
+) -> dict[str, Any]:
+    """依次刷新 purpose/index/overview；单步失败不阻断其他步骤。
+
+    返回 ``{"paths": {index, log, purpose, overview}, "errors": [...],
+    "purpose_created": bool}``。``actor`` 预留给调用方记录操作日志。
+    """
+    errors: list[str] = []
+    purpose_created = False
+
+    try:
+        _, purpose_created = ensure_purpose(config)
+    except Exception as exc:  # noqa: BLE001 - 刷新需逐项收集错误
+        errors.append(f"purpose: {exc}")
+
+    try:
+        rebuild_index(conn, config)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"index: {exc}")
+
+    try:
+        rebuild_overview(conn, config)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"overview: {exc}")
+
+    return {
+        "paths": nav_paths(config),
+        "errors": errors,
+        "purpose_created": purpose_created,
+    }
+
+
+# ── 内部辅助 ──
+
+
+def _utc_timestamp() -> str:
+    """秒级 UTC 时间戳，用于 log.md 行首。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _single_line(value: str) -> str:
+    return value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _log_field(value: str) -> str:
+    """日志字段：换行变空格、管道符转义，保持一行五列。"""
+    return _single_line(value).replace("|", "\\|")
+
+
+def _wikilink(slug: str, title: str) -> str:
+    return f"[[{_single_line(slug).strip()}|{_single_line(title).strip()}]]"
+
+
+def _page_file_path(config: WikiConfig, page: PageRecord) -> str | None:
+    relative = str(page.relative_path or "").replace("\\", "/")
+    if not relative or os.path.isabs(relative):
+        return None
+    candidate = os.path.join(config.vault_path, *relative.split("/"))
+    try:
+        ensure_within(config.vault_path, candidate)
+        return ensure_within(config.page_root, candidate)
+    except (WikiPathError, ValueError):
+        return None
+
+
+def _page_summary(config: WikiConfig, page: PageRecord) -> str:
+    """从页面文件 frontmatter 读取 summary；文件缺失/非法时返回空串。"""
+    path = _page_file_path(config, page)
+    if path is None or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    try:
+        frontmatter, _ = parse_frontmatter(content)
+    except FrontmatterError:
+        return ""
+    summary = frontmatter.get("summary")
+    if not isinstance(summary, str):
+        return ""
+    return _single_line(summary).strip()
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    quoted = '"' + table.replace('"', '""') + '"'
+    return {
+        str(row[1]).lower()
+        for row in conn.execute(f"PRAGMA table_info({quoted})")
+    }
+
+
+def _count_rows(conn: sqlite3.Connection, table: str) -> int:
+    if not _table_exists(conn, table):
+        return 0
+    quoted = '"' + table.replace('"', '""') + '"'
+    return int(conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+
+
+def _page_counts(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, int], dict[str, int]]:
+    status_counts = {
+        status: 0 for status in ("published", "draft", "review", "archived")
+    }
+    type_counts = {page_type: 0 for page_type in C.PAGE_TYPES}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) AS count FROM pages GROUP BY status"
+    ):
+        status_counts[str(row["status"])] = int(row["count"])
+    for row in conn.execute(
+        "SELECT page_type, COUNT(*) AS count FROM pages GROUP BY page_type"
+    ):
+        type_counts[str(row["page_type"])] = int(row["count"])
+    return status_counts, type_counts
+
+
+def _evidence_counts(
+    conn: sqlite3.Connection, total: int
+) -> tuple[int, int, str]:
+    """返回 (已验证, 未验证, 口径说明)。
+
+    优先使用 ``verification`` / ``verified`` 列；当前 0003 schema 没有验证列，
+    此时按引文指纹与 ``text_sha256`` 一致且位置合法计为已验证，并在概览中注明
+    这是结构校验而不是原文复核。
+    """
+    if not _table_exists(conn, "claim_evidence"):
+        return 0, 0, "口径：claim_evidence 表不存在，证据统计为 0。"
+
+    columns = _table_columns(conn, "claim_evidence")
+    if "verification" in columns:
+        verified = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM claim_evidence "
+                "WHERE lower(trim(CAST(verification AS TEXT))) "
+                "IN ('verified', '1', 'true', 'yes')"
+            ).fetchone()[0]
+        )
+        note = "口径：按 claim_evidence.verification = 'verified' 统计。"
+    elif "verified" in columns:
+        verified = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM claim_evidence "
+                "WHERE lower(trim(CAST(verified AS TEXT))) "
+                "IN ('1', 'true', 'yes', 'verified')"
+            ).fetchone()[0]
+        )
+        note = "口径：按 claim_evidence.verified 布尔列统计。"
+    else:
+        verified = _structurally_verified_evidence(conn)
+        note = (
+            "口径：claim_evidence 无 verification 列，按引文指纹与 text_sha256 "
+            "一致且位置合法计为已验证（结构校验，非原文复核）。"
+        )
+    verified = max(0, min(total, verified))
+    return verified, total - verified, note
+
+
+def _structurally_verified_evidence(conn: sqlite3.Connection) -> int:
+    verified = 0
+    for row in conn.execute(
+        "SELECT quote, text_sha256, char_start, char_end FROM claim_evidence"
+    ):
+        quote = row["quote"]
+        text_sha = str(row["text_sha256"] or "").strip()
+        if not text_sha or not isinstance(quote, str):
+            continue
+        try:
+            char_start = int(row["char_start"])
+            char_end = int(row["char_end"])
+        except (TypeError, ValueError):
+            continue
+        if char_end >= char_start and text_sha == quote_sha256(quote):
+            verified += 1
+    return verified
+
+
+def _recent_pages(
+    conn: sqlite3.Connection, limit: int = 10
+) -> list[tuple[str, str, str, str]]:
+    if not _table_exists(conn, "pages"):
+        return []
+    rows = conn.execute(
+        "SELECT slug, title, status, updated_at FROM pages "
+        "ORDER BY updated_at DESC, page_id ASC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [
+        (
+            str(row["slug"]),
+            str(row["title"]),
+            str(row["status"]),
+            str(row["updated_at"]),
+        )
+        for row in rows
+    ]
+
+
+__all__ = [
+    "EMPTY_INDEX_TEXT",
+    "LOG_TITLE",
+    "NAV_FILENAMES",
+    "PAGE_STATUS_LABELS",
+    "PAGE_TYPE_LABELS",
+    "PURPOSE_TEMPLATE",
+    "append_log",
+    "ensure_purpose",
+    "nav_paths",
+    "rebuild_index",
+    "rebuild_overview",
+    "refresh_navigation",
+]
