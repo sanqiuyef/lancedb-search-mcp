@@ -1,0 +1,420 @@
+# -*- coding: utf-8 -*-
+"""Wiki 提案服务：draft/diff 落盘、审核队列与 apply/reject。
+
+提案文件写在 ``<wiki_db_dir>/proposals/<proposal_id>/draft.md`` 与 ``diff.md``，
+绝不写入 vault 页面目录；只有 ``apply_proposal(approve=True)`` 通过 PageStore
+更新页面。
+
+状态机：pending → rejected / stale / approved → applied；``cancelled`` 仅存在于
+服务层状态常量（Phase 1 schema 的 proposals.status CHECK 未包含该值，无法持久化）。
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import shutil
+import sqlite3
+from dataclasses import dataclass
+from typing import Any
+
+from .config import WikiConfig, ensure_within
+from .db import transaction
+from .ids import new_ulid
+from .models import PageRecord, PageRevisionRecord, ProposalRecord
+from .page_store import (
+    PageFileMissingError,
+    PageNotFoundError,
+    PageStore,
+    PageValidationError,
+    RevisionConflictError,
+    atomic_write_text,
+)
+from .repositories import proposals as proposals_repo
+
+PROPOSAL_STATES = (
+    "pending",
+    "rejected",
+    "stale",
+    "approved",
+    "applied",
+    "cancelled",
+)
+PERSISTED_PROPOSAL_STATES = ("pending", "rejected", "stale", "approved", "applied")
+
+
+class ProposalError(RuntimeError):
+    """提案服务基类错误。"""
+
+
+class ProposalNotFoundError(ProposalError, LookupError):
+    """提案不存在。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalDetail:
+    record: ProposalRecord
+    payload: dict[str, Any]
+    draft: str
+    diff: str
+
+    def __getattr__(self, name: str) -> Any:
+        """未定义属性代理到 ProposalRecord（如 proposal_id/status/page_id）。"""
+        return getattr(self.record, name)
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalDecision:
+    ok: bool
+    status: str
+    message: str
+    proposal: ProposalRecord
+    page: PageRecord | None = None
+    revision: PageRevisionRecord | None = None
+
+
+def _payload(record: ProposalRecord) -> dict[str, Any]:
+    try:
+        data = json.loads(record.payload_json) if record.payload_json else {}
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _dump_payload(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+class ProposalService:
+    """提案创建、查询与审核入口。"""
+
+    def __init__(
+        self,
+        config: WikiConfig,
+        conn: sqlite3.Connection,
+        page_store: PageStore | None = None,
+    ) -> None:
+        self.config = config
+        self.conn = conn
+        self.page_store = page_store or PageStore(config, conn)
+        self.proposals_root = os.path.join(
+            os.path.dirname(config.db_path), "proposals"
+        )
+
+    # ── 路径 ──
+    def _proposal_dir(self, proposal_id: str) -> str:
+        return ensure_within(
+            self.proposals_root, os.path.join(self.proposals_root, proposal_id)
+        )
+
+    def _artifact_paths(self, proposal_id: str) -> tuple[str, str]:
+        directory = self._proposal_dir(proposal_id)
+        return (
+            os.path.join(directory, "draft.md"),
+            os.path.join(directory, "diff.md"),
+        )
+
+    # ── 创建/读取 ──
+    def create_proposal(
+        self,
+        proposal_type: str,
+        target_page_id: str,
+        proposed_content: str,
+        rationale: str,
+        expected_revision_id: str,
+        evidence_refs: list[Any] | tuple[Any, ...] | None,
+        created_by: str,
+    ) -> ProposalRecord:
+        if not isinstance(proposal_type, str) or not proposal_type.strip():
+            raise ValueError("proposal_type 必须是非空字符串")
+        if not isinstance(target_page_id, str) or not target_page_id.strip():
+            raise ValueError("target_page_id 必须是非空字符串")
+        if not isinstance(proposed_content, str):
+            raise ValueError("proposed_content 必须是字符串")
+        if not isinstance(rationale, str):
+            raise ValueError("rationale 必须是字符串")
+        if not isinstance(expected_revision_id, str):
+            raise ValueError("expected_revision_id 必须是字符串")
+        if not isinstance(created_by, str) or not created_by.strip():
+            raise ValueError("created_by 必须是非空字符串")
+
+        page_view = self.page_store.read_page(target_page_id)
+        if page_view is None:
+            raise ProposalError(f"目标页面不存在: {target_page_id}")
+
+        evidence = list(evidence_refs or [])
+        try:
+            json.dumps(evidence, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("evidence_refs 必须可 JSON 序列化") from exc
+
+        payload = {
+            "proposed_content": proposed_content,
+            "evidence_refs": evidence,
+        }
+        fromfile = f"a/{page_view.page.relative_path}"
+        tofile = f"b/{page_view.page.relative_path}"
+        diff_text = "".join(
+            difflib.unified_diff(
+                page_view.content.splitlines(keepends=True),
+                proposed_content.splitlines(keepends=True),
+                fromfile=fromfile,
+                tofile=tofile,
+            )
+        )
+        if diff_text and not diff_text.endswith("\n"):
+            diff_text += "\n"
+
+        proposal_id = new_ulid()
+        draft_path, diff_path = self._artifact_paths(proposal_id)
+        directory = self._proposal_dir(proposal_id)
+        if os.path.exists(directory):
+            raise ProposalError(f"提案目录已存在: {directory}")
+
+        now = proposals_repo.utc_now()
+        record = ProposalRecord(
+            proposal_id=proposal_id,
+            proposal_type=proposal_type.strip(),
+            status="pending",
+            page_id=target_page_id,
+            expected_revision_id=expected_revision_id,
+            result_revision_id="",
+            payload_json=_dump_payload(payload),
+            rationale=rationale,
+            created_by=created_by,
+            created_at=now,
+            updated_at=now,
+            reviewed_by="",
+            reviewed_at=None,
+            applied_at=None,
+            error_message="",
+        )
+        try:
+            os.makedirs(directory, exist_ok=False)
+            atomic_write_text(draft_path, proposed_content)
+            atomic_write_text(diff_path, diff_text)
+            with transaction(self.conn):
+                proposals_repo.insert_proposal(self.conn, record)
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        return record
+
+    def get_proposal(self, proposal_id: str) -> ProposalDetail | None:
+        record = proposals_repo.get_proposal(self.conn, proposal_id)
+        if record is None:
+            return None
+        draft_path, diff_path = self._artifact_paths(proposal_id)
+        draft = ""
+        diff = ""
+        try:
+            with open(draft_path, "r", encoding="utf-8") as handle:
+                draft = handle.read()
+        except OSError:
+            draft = ""
+        try:
+            with open(diff_path, "r", encoding="utf-8") as handle:
+                diff = handle.read()
+        except OSError:
+            diff = ""
+        return ProposalDetail(
+            record=record,
+            payload=_payload(record),
+            draft=draft,
+            diff=diff,
+        )
+
+    def review_queue(self, status: str = "pending") -> list[ProposalRecord]:
+        if status not in PERSISTED_PROPOSAL_STATES:
+            raise ValueError(
+                f"未知 proposal status: {status!r}；"
+                f"可持久化状态: {', '.join(PERSISTED_PROPOSAL_STATES)}"
+            )
+        return proposals_repo.list_proposals(self.conn, status=status)
+
+    # ── 审核 ──
+    def apply_proposal(
+        self,
+        proposal_id: str,
+        approve: bool,
+        review_note: str = "",
+        actor: str = "agent",
+    ) -> ProposalDecision:
+        record = proposals_repo.get_proposal(self.conn, proposal_id)
+        if record is None:
+            raise ProposalNotFoundError(f"提案不存在: {proposal_id}")
+        if not isinstance(review_note, str):
+            raise ValueError("review_note 必须是字符串")
+
+        if record.status != "pending":
+            return ProposalDecision(
+                ok=False,
+                status=str(record.status),
+                message=f"提案状态为 {record.status}，只有 pending 可审核",
+                proposal=record,
+            )
+
+        payload = _payload(record)
+        if review_note:
+            payload["review_note"] = review_note
+        payload_json = _dump_payload(payload)
+        reviewed_at = proposals_repo.utc_now()
+
+        if not approve:
+            with transaction(self.conn):
+                proposals_repo.update_proposal(
+                    self.conn,
+                    proposal_id,
+                    status="rejected",
+                    reviewed_by=actor,
+                    reviewed_at=reviewed_at,
+                    payload_json=payload_json,
+                )
+            updated = proposals_repo.get_proposal(self.conn, proposal_id)
+            assert updated is not None
+            return ProposalDecision(
+                ok=True,
+                status="rejected",
+                message="提案已拒绝，页面未修改",
+                proposal=updated,
+            )
+
+        proposed_content = payload.get("proposed_content")
+        if not isinstance(proposed_content, str):
+            return self._mark_stale(
+                record,
+                "提案 payload 缺少 proposed_content",
+                actor,
+                reviewed_at,
+                payload_json,
+            )
+
+        try:
+            page_view = (
+                self.page_store.read_page(record.page_id)
+                if record.page_id
+                else None
+            )
+        except (PageNotFoundError, PageFileMissingError, PageValidationError) as exc:
+            return self._mark_stale(
+                record, f"目标页面不可用: {exc}", actor, reviewed_at, payload_json
+            )
+        if page_view is None:
+            return self._mark_stale(
+                record, "目标页面不存在", actor, reviewed_at, payload_json
+            )
+
+        current_revision_id = page_view.page.current_revision_id or ""
+        if current_revision_id != (record.expected_revision_id or ""):
+            return self._mark_stale(
+                record,
+                "expected_revision_id 已过期",
+                actor,
+                reviewed_at,
+                payload_json,
+            )
+
+        # 审核通过先落 approved，再执行写入；写入后置 applied。
+        with transaction(self.conn):
+            proposals_repo.update_proposal(
+                self.conn,
+                proposal_id,
+                status="approved",
+                reviewed_by=actor,
+                reviewed_at=reviewed_at,
+                payload_json=payload_json,
+            )
+
+        try:
+            result = self.page_store.update_page(
+                record.page_id,
+                proposed_content,
+                record.expected_revision_id,
+                actor=actor,
+                commit=True,
+                source_proposal_id=proposal_id,
+                change_reason=record.rationale,
+            )
+        except (RevisionConflictError, PageFileMissingError, PageNotFoundError) as exc:
+            return self._mark_stale(
+                record, f"应用失败: {exc}", actor, reviewed_at, payload_json
+            )
+        except BaseException as exc:
+            with transaction(self.conn):
+                proposals_repo.update_proposal(
+                    self.conn,
+                    proposal_id,
+                    error_message=str(exc),
+                )
+            raise
+
+        if result.status != "updated":
+            return self._mark_stale(
+                record,
+                result.message or "页面在审核期间发生外部修改",
+                actor,
+                reviewed_at,
+                payload_json,
+            )
+
+        applied_at = proposals_repo.utc_now()
+        with transaction(self.conn):
+            proposals_repo.update_proposal(
+                self.conn,
+                proposal_id,
+                status="applied",
+                result_revision_id=(
+                    result.revision.revision_id if result.revision else ""
+                ),
+                applied_at=applied_at,
+                error_message="",
+            )
+        updated = proposals_repo.get_proposal(self.conn, proposal_id)
+        assert updated is not None
+        return ProposalDecision(
+            ok=True,
+            status="applied",
+            message="提案已应用并提交",
+            proposal=updated,
+            page=result.page,
+            revision=result.revision,
+        )
+
+    def _mark_stale(
+        self,
+        record: ProposalRecord,
+        message: str,
+        actor: str,
+        reviewed_at: str,
+        payload_json: str,
+    ) -> ProposalDecision:
+        with transaction(self.conn):
+            proposals_repo.update_proposal(
+                self.conn,
+                record.proposal_id,
+                status="stale",
+                reviewed_by=actor,
+                reviewed_at=reviewed_at,
+                error_message=message,
+                payload_json=payload_json,
+            )
+        updated = proposals_repo.get_proposal(self.conn, record.proposal_id)
+        assert updated is not None
+        return ProposalDecision(
+            ok=False,
+            status="stale",
+            message=message,
+            proposal=updated,
+        )
+
+
+__all__ = [
+    "PERSISTED_PROPOSAL_STATES",
+    "PROPOSAL_STATES",
+    "ProposalDecision",
+    "ProposalDetail",
+    "ProposalError",
+    "ProposalNotFoundError",
+    "ProposalService",
+]
