@@ -72,8 +72,10 @@ lancedb-search/
 │       ├── llm-wiki-inspired-design.md 与 llm_wiki 的设计借鉴及许可边界
 │       ├── agent-extraction-contract.md 两步摄入契约与 payload/校验规则
 │       ├── repository-audit.md        只读环境与库表审计结果
+│       ├── migration-report.md        真实库迁移 dry-run/apply 结果与回滚说明
+│       ├── quality-report.md          真实 Wiki 库质量指标基线（当前 0 页面）
 │       ├── operations.md              备份/恢复/校验/质量/重建/迁移运维手册
-│       └── test-report.md             Wiki V1 测试报告（历史阶段基线）
+│       └── test-report.md             Wiki V1 测试报告（495 项基线）
 ├── .mineru-venv/                   独立 venv：mineru 3.4.4 + transformers 4.57（Anaconda 已是 v5，不能共用）
 ├── tests/                          unittest 离线测试套件
 │   ├── kb_test_support.py          公共设施：假 embedding、临时库、注册表
