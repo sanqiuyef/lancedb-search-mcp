@@ -26,6 +26,10 @@ from kb import search as kb_search
 from kb import watcher as kb_watcher
 from kb import web as kb_web
 
+# 启动即预导入 sentence_transformers（连带 torch/sklearn/scipy 全链）：
+# 事件循环启动后再懒加载会卡死在 scipy BLAS DLL 导入上，导致首轮搜索无限挂起（2026-11-05 实测）。
+import sentence_transformers  # noqa: E402
+
 mcp = FastMCP("LanceDB 知识搜索", port=8002)
 
 
