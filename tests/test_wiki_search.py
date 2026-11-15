@@ -435,7 +435,7 @@ class TestRelatedMode(WikiSearchTestBase):
             canonical_name="SWMM",
             normalized_name="swmm",
             entity_type="model",
-            status="accepted",
+            status="active",
             created_at=NOW,
             updated_at=NOW,
         )
@@ -443,7 +443,7 @@ class TestRelatedMode(WikiSearchTestBase):
             canonical_name="IFC",
             normalized_name="ifc",
             entity_type="format",
-            status="accepted",
+            status="active",
             created_at=NOW,
             updated_at=NOW,
         )
@@ -476,7 +476,7 @@ class TestRelatedMode(WikiSearchTestBase):
             second_entity.entity_id,
             confidence=0.9,
             source_page_id=seed.page_id,
-            status="accepted",
+            status="verified",
         )
         return seed, target
 

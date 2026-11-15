@@ -337,9 +337,9 @@ class TestQualityReport(WikiOpsTestBase):
         )
 
         for entity_id, name, status in (
-            ("entity-1", "Alpha Entity", "accepted"),
-            ("entity-2", "Beta Entity", "accepted"),
-            ("entity-3", "Legacy Entity", "archived"),
+            ("entity-1", "Alpha Entity", "active"),
+            ("entity-2", "Beta Entity", "active"),
+            ("entity-3", "Legacy Entity", "deprecated"),
         ):
             self.conn.execute(
                 "INSERT INTO entities (entity_id, canonical_name, normalized_name, "
@@ -365,13 +365,13 @@ class TestQualityReport(WikiOpsTestBase):
             "INSERT INTO relations (relation_id, subject_entity_id, predicate, "
             "object_entity_id, status, evidence, source_page_id) "
             "VALUES ('rel-sourced', 'entity-2', 'uses', 'entity-1', "
-            "'accepted', '有来源', ?)",
+            "'verified', '有来源', ?)",
             (self.p1.page_id,),
         )
         self.conn.execute(
             "INSERT INTO relations (relation_id, subject_entity_id, predicate, "
             "object_entity_id, status, evidence, source_page_id) "
-            "VALUES ('rel-rejected', 'entity-1', 'uses', 'entity-2', "
+            "VALUES ('rel-rejected', 'entity-1', 'based_on', 'entity-2', "
             "'rejected', '', NULL)"
         )
 

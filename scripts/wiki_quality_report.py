@@ -14,8 +14,8 @@
 - Duplicate Page Candidates：标题/别名归一后重复，以及摘要高相似；只报告候选。
 - Unindexed Published Pages：published 页面在 ``WIKI_PAGE_INDEX_TABLE`` 缺失；
   索引表不存在时明确输出“索引未建立”。
-- Unsourced Relations：proposed/accepted 关系既无 evidence 也无 source_page_id。
-- Unresolved Aliases：redirect 目标不存在、别名所属实体 archived/rejected、
+- Unsourced Relations：proposed/verified 关系既无 evidence 也无 source_page_id。
+- Unresolved Aliases：redirect 目标不存在、别名所属实体 merged/deprecated、
   或同一 normalized_alias 被多个 active 实体共享。
 
 关系正确率需要人工抽样，脚本不计算、不编造。
@@ -56,7 +56,7 @@ LIST_LIMIT = 50
 COVERAGE_CLAIM_TYPES = ("fact", "factual", "definition", "result")
 ACTIVE_CLAIM_STATUSES = ("proposed", "accepted", "disputed")
 ACTIVE_RELATION_STATUSES = ("proposed", "accepted")
-INACTIVE_ENTITY_STATUSES = ("archived", "rejected")
+INACTIVE_ENTITY_STATUSES = ("merged", "deprecated")
 
 
 class QualityReportError(RuntimeError):
@@ -575,7 +575,6 @@ def unresolved_aliases(conn: sqlite3.Connection) -> dict[str, Any]:
         str(row[0]): str(row[1])
         for row in conn.execute("SELECT entity_id, status FROM entities")
     }
-    placeholders = ", ".join("?" for _ in INACTIVE_ENTITY_STATUSES)
     rows = conn.execute(
         "SELECT entity_id, alias, normalized_alias, alias_type "
         "FROM entity_aliases ORDER BY entity_id ASC, normalized_alias ASC"
@@ -620,7 +619,7 @@ def unresolved_aliases(conn: sqlite3.Connection) -> dict[str, Any]:
                     "detail": f"别名所属实体状态为 {status}",
                 }
             )
-        if status in ("proposed", "accepted") and normalized:
+        if status == "active" and normalized:
             group = active_groups.setdefault(
                 normalized.casefold(), {"entity_ids": set(), "rows": []}
             )
