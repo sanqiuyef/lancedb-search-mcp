@@ -1,26 +1,32 @@
 # LanceDB Search MCP
 
-面向 AI 工作流的**全本地**文档知识库检索服务（MCP Server）。内核基于
+面向 AI 工作流的**本地优先**文档知识库检索服务（MCP Server）。内核基于
 [lancedb](https://github.com/lancedb/lancedb) 官方 SDK：LanceModel schema、官方 embedding
 注册表、原生 BM25 全文检索（jieba 中文分词）、官方 hybrid 混合检索与 Reranker 接口。
 
-- **零云端依赖**：嵌入（bge-m3）与精排（bge-reranker-v2-m3）都在本机 GPU 跑，用时挂载、
-  闲置自动卸载显存，不调用任何外部 API、数据不出本机；
+- **嵌入/精排全本地**：嵌入（bge-m3）与精排（bge-reranker-v2-m3）都在本机 GPU 跑，用时挂载、
+  闲置自动卸载显存，不调用云端推理 API；仅扫描件 OCR 可选启用云 MinerU 回退
+  （`MINERU_API_KEY`，默认关闭，显式配置后该回退会把文件发往云端）；
 - **公式级 PDF 解析**：PDF 入库优先走本地 [MinerU](https://github.com/opendatalab/MinerU)
   pipeline，把论文里的公式转成 **LaTeX** 后再入库 —— 而不是纯文本抽取器那种
   `(cid:2)`、字母打散、上下标丢失的坏结果（见「PDF 解析」一节）；
-- **混合检索 + 精排**：向量 + BM25 融合，CrossEncoder 精排，带编号引用的 RAG 问答；
-- **13 个 MCP 工具**：检索 / 问答 / 增删改查 / 网页抓取入库 / 目录监听自动重索引；
+- **混合检索 + 精排**：向量 + BM25 融合，CrossEncoder 精排；`ask_knowledge` 检索并打包
+  编号证据块，作答由调用方模型完成；
+- **15 个 MCP 工具**：检索 / 证据打包 / 增删改查 / 网页抓取入库 / 目录监听自动重索引 /
+  图像检索；
 - **零插件检索面板**：可选的本地面板（`ui_server.py`，127.0.0.1:8002），供人直接查询。
 
 ## 主要能力
 
-- **官方 hybrid 检索**：`query_type="hybrid"` 向量 + BM25 融合，本地 CrossEncoder 精排（失败回退 RRF）；
+- **检索模式**：`search_knowledge` 默认 `search_mode="vector"`；显式选 `hybrid` 时走向量 +
+  BM25 融合，且只有 `use_reranker=True` 才加载本地 CrossEncoder 精排（失败回退 RRF）；
+  `vector` 与 `text` 分支不做精排；
 - **全本地模型**：BAAI/bge-m3 嵌入 + bge-reranker-v2-m3 精排，模型缓存目录由 `HF_HOME`
   指定；**用时挂载、闲置自动卸载显存**（`LOCAL_MODEL_IDLE_UNLOAD`，默认 300s，0=常驻，
   对齐 Ollama keep-alive）；
 - **原生 FTS**：Lance 原生 BM25 倒排索引，jieba 分词（词典在 `LANCE_LANGUAGE_MODEL_HOME`）；
-- **RAG 问答**：ask_knowledge 带编号引用作答；
+- **证据打包（非生成式问答）**：`ask_knowledge` 检索并打包 `[n]` 编号证据块（来源 + 全文
+  chunk），不调用任何生成模型；作答与引用标注由 MCP 宿主模型基于证据完成；
 - **PDF → Markdown（含 LaTeX 公式）**：本地 MinerU pipeline 优先，失败回退
   PyMuPDF/pdfminer 文本层，扫描件再回退 OCR 链（云 MinerU API → 本地 Tesseract）；
 - **网页抓取 + 目录监听**自动重索引（自建）。
@@ -84,19 +90,51 @@ mineru-models-download -s modelscope -m pipeline      # 首次下载模型（约
 
 | 类别 | 工具 |
 |---|---|
-| 检索问答 | search_knowledge、ask_knowledge、search_similar、get_document |
-| 知识库管理 | get_knowledge_status、list_documents、add_documents、add_single_document、update_document、delete_documents |
+| 检索与证据打包 | search_knowledge、ask_knowledge、search_similar |
+| 知识库管理 | get_knowledge_status、list_documents、get_document、add_documents、add_single_document、update_document、delete_documents |
 | 自建能力 | ingest_url、start_watcher、stop_watcher |
 | 图像检索（2026-10-06） | search_images（以文搜图）、ingest_images（图片向量入库） |
 
+`search_knowledge` 默认 `search_mode="vector"`，可选 `text` / `hybrid`；Reranker 只在
+`hybrid` 分支且 `use_reranker=True` 时生效。`ask_knowledge` 只做检索与证据打包，返回
+`[n] 来源 + 全文 chunk` 的编号文本，不调用生成模型。
+
 `add_documents` / `add_single_document` 均支持 `export_markdown_dir` 参数：入库的同时把
 PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<名>.md` + `<名>_images/`）。
+
+### 删除与更新语义（Phase 0 修复后）
+
+- `delete_documents`：先按完整 source 精确匹配（`normcase`，Windows 下不区分大小写）；
+  仅当未命中且模式含 `* ? [` 时按 `fnmatch` 通配（如 `*.pdf`、`docs/*`），不再做子串匹配；
+  匹配集合覆盖全部来源时会被拒绝。`source_pattern` 留空或 `delete_documents("*")`
+  都必须显式 `confirm_all=True` 才会清空。
+- `update_document`：按完整文件路径唯一确定已有 source；同名 basename 匹配到多个 source
+  且路径后缀无法唯一判定时返回错误并列出候选，不执行任何写入或删除。
+- `add_single_document`：不传 `scan_dir` 时 source 退化为文件名；若库中已有同名 source
+  会报错拒绝覆盖，请传 `scan_dir`（按相对路径入库）或改用 `update_document`。
+
+### 网页入库
+
+- source 形如 `网页-<host>-<sha1(canonical)[:12]>`；canonical 只做 scheme/host 小写、
+  去默认端口、去 fragment、清 `utm_*` / `fbclid` / `gclid`，**不折叠尾斜杠**，query
+  参数不排序。
+- 同一 canonical URL 重复抓取时先补写新块，成功后再删除不在新 `doc_id` 集合中的旧块；
+  内容未变的块不重复写入。
+
+### 目录监听
+
+- 已适配 watchdog 6.0 事件 API（`is_directory`），支持同时监听多个目录；父子目录
+  重叠会被拒绝，需先停止已有监听。
+- 新增/修改走尾沿防抖：同一路径静默 5 秒后只重索引一次；删除事件批量延迟 1.5 秒
+  清理；移动事件同时处理旧来源删除与新位置重索引（目标移出监听根时只清理旧来源）。
+- 不传 `watch_dir` 时监听当前工作目录，返回文本会明确提示这一点。
 
 ## 图像向量检索（2026-10-06 新增）
 
 以 `jinaai/jina-clip-v2`（图文对齐双塔，1024 维，CC-BY-NC-4.0 仅限个人学术用途）
 为图像嵌入模型，与文本链路（bge-m3）**完全独立**：独立表 `image_chunks`、独立
-嵌入函数、共享闲置卸载机制。中文查询直接可用（以文搜图）；caption 字段预留。
+嵌入函数、共享闲置卸载机制。中文查询直接可用（以文搜图）；`caption` 当前恒为空
+字符串（字段预留，尚未接入描述生成）。
 
 - **模型本地化（重要）**：`D:\huggingface\local-models\jina-clip-v2\` 与
   `local-models\jina-embeddings-v3\` 为**自包含目录**（权重 + 内联实现代码 +
@@ -111,7 +149,9 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
   给 `transformers.models.clip.modeling_clip` 垫回 v5 移除的 `clip_loss`（推理不调用，
   仅为通过顶层 import）。
 - 入库：`ingest_images(scan_dir)`，默认扫描 vault 文献图片目录，按 mtime 增量；
-  检索：`search_images(query, limit, source_filter)`，cosine 距离转相似度输出。
+  mtime 变化的图片或同一路径存在多行时会替换旧行（先写新行，再按旧 `_rowid` 删除）；
+  历史遗留的重复行可通过 `ingest_images(rebuild=True)` 清空重建，或再次入库收敛。
+- 检索：`search_images(query, limit, source_filter)`，cosine 距离转相似度输出。
 
 ## 自建模块清单（待后期单独优化）
 
@@ -119,8 +159,8 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 
 | 模块 | 说明 | 优化方向 |
 |---|---|---|
-| `kb_web.py` | 网页抓取入库 | 反爬重试、正文智能抽取、与 web-search-server 抓取链复用 |
-| `kb_watcher.py` | watchdog 目录监听 | 多目录注册、删除事件同步、事件队列 |
+| `kb/web.py` | 网页抓取入库（canonical source + 幂等替换） | 反爬重试、正文智能抽取、与 web-search-server 抓取链复用 |
+| `kb/watcher.py` | watchdog 6.0 目录监听（多目录、删除/移动同步、5 秒尾沿防抖） | 整目录移入/移出的递归迁移兜底、事件队列 |
 | `mineru_pdf_splitter.py` | MinerU 大 PDF 预切分 | 按需使用，独立工具 |
 
 ## 架构
@@ -136,10 +176,13 @@ kb/                      知识库核心包
   pdf_convert.py         ★PDF→Markdown（本地 MinerU pipeline；公式→LaTeX，缓存+档位判定）
   ingest.py              解析（MinerU→文本层→OCR 回退链）、分块（800/100）、增删改查
   search.py              官方 hybrid + 本地 CrossEncoder 精排（失败回退 RRF）
-  ask.py                 RAG 问答
-  web.py / watcher.py    [自建模块] 网页入库 / 目录监听
+  ask.py                 检索证据打包（[n] 编号证据块，不调用生成模型）
+  web.py / watcher.py    [自建模块] 网页入库 / 目录监听（watchdog 6.0）
+  wiki/                  Wiki V1 元数据底座（Phase 1：配置、SQLite 迁移、稳定 ID、
+                         frontmatter；repositories 为 Phase 2 规划中）
 scripts/                 rebuild_from_sources.py（批量重建）+ mineru_to_markdown.py（批量 PDF→md）
                          + pdf_to_markdown.py（docling 备选）+ 冒烟脚本 + mineru_pdf_splitter.py
+                         + audit_wiki_environment.py（只读环境/库表审计）
 ui_server.py / ui/       检索面板（零插件版，HTTP 8002，复用 kb.search）+ run_ui.cmd 启动器
 ```
 
@@ -201,9 +244,17 @@ run_ui.cmd                     # 启动器（内部设好 HF/env 后拉起 ui_se
 python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-离线测试（假 embedding、mock HTTP），覆盖配置、分块、schema/检索端到端、
-reranker 回退、问答、网页解析。
+离线测试（假 embedding、mock HTTP），覆盖配置、分块、schema/检索端到端、reranker 回退、
+证据打包、网页 canonical/幂等、目录监听（防抖/删除/多目录）、图像入库计划与替换、
+Wiki 元数据（配置/ID/frontmatter/SQLite 迁移）。
 
 ## License
 
-[MIT](LICENSE) © 2026 sanqiuyef
+代码 [MIT](LICENSE) © 2026 sanqiuyef。
+
+模型权重遵循各自许可，与代码许可相互独立：
+
+- `jinaai/jina-clip-v2`：CC-BY-NC-4.0，仅限个人学术用途；
+- `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3`：仓库内未声明其许可，使用前请核对
+  各自模型卡。
+- MinerU 及其模型、Tesseract 语言包等第三方组件同样遵循各自许可。
