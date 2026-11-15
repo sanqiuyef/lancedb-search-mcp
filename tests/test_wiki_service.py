@@ -25,6 +25,9 @@ from kb.wiki.page_store import PageDraft, PageStore  # noqa: E402
 from kb.wiki.repositories import entities as entities_repo  # noqa: E402
 from kb.wiki.repositories import jobs as jobs_repo  # noqa: E402
 from kb.wiki.repositories import relations as relations_repo  # noqa: E402
+from kb import ingest as kb_ingest  # noqa: E402
+from kb import schema as kb_schema  # noqa: E402
+from tests.kb_test_support import activate_fake_embedding  # noqa: E402
 
 CHUNK_TEXT = "城市洪涝受降雨与排水能力共同影响，SWMM 模型常用于模拟。"
 
@@ -1156,6 +1159,313 @@ class TestEvidenceRelatedValidateSearch(WikiServiceTestBase):
 
         with self.assertRaises(service.WikiServiceError):
             service.search_evidence("", config=self.config)
+
+
+class WikiServiceLanceTestBase(WikiServiceTestBase):
+    """带真实临时 LanceDB 的 service 测试（fake embedding，不访问真实库）。"""
+
+    def setUp(self):
+        super().setUp()
+        activate_fake_embedding()
+        kb_schema.reset_db()
+        self.addCleanup(kb_schema.reset_db)
+
+    def seed_lance(self, text, source="paper.pdf", index=0, doc_id=""):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(
+            table,
+            [
+                {
+                    "text": text,
+                    "source": source,
+                    "chunk_index": index,
+                    "category": "paper",
+                    "doc_id": doc_id,
+                    "ingested_at": "2026-11-15T00:00:00Z",
+                }
+            ],
+        )
+
+
+class TestExtractionEvidenceBinding(WikiServiceLanceTestBase):
+    def test_library_text_wins_over_forged_chunk_texts(self):
+        self.seed_lance(CHUNK_TEXT)
+        self.seed_source(text=CHUNK_TEXT)
+        forged = "伪造原文：这句话只存在于调用方提供的 chunk_texts。"
+        forged_claim = {
+            "claim_text": "伪造引文不应落库。",
+            "claim_type": "factual",
+            "evidence": [{"chunk_id": "chunk-1", "quote": "伪造原文"}],
+            "confidence": 0.9,
+        }
+
+        rejected = service.submit_extraction(
+            self.base_extraction(
+                claims=[forged_claim], chunk_texts={"chunk-1": forged}
+            ),
+            config=self.config,
+            conn=self.conn,
+        )
+
+        self.assertEqual(rejected["created"]["claims"], [])
+        self.assertIn("not_found", [item["reason"] for item in rejected["rejected"]])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0], 0
+        )
+
+        accepted = service.submit_extraction(
+            self.base_extraction(
+                claims=[
+                    {
+                        "claim_text": "城市洪涝受降雨与排水能力共同影响。",
+                        "claim_type": "factual",
+                        "evidence": [
+                            {
+                                "chunk_id": "chunk-1",
+                                "quote": "城市洪涝受降雨与排水能力共同影响",
+                            }
+                        ],
+                        "confidence": 0.9,
+                    }
+                ],
+                chunk_texts={"chunk-1": forged},
+            ),
+            config=self.config,
+            conn=self.conn,
+        )
+        self.assertEqual(len(accepted["created"]["claims"]), 1)
+        self.assertEqual(
+            accepted["created"]["claims"][0]["verification"], "verified"
+        )
+
+    def test_missing_chunk_in_available_library_rejects_caller_text(self):
+        self.seed_lance(CHUNK_TEXT)
+        self.seed_source(text=CHUNK_TEXT, source_value="other.pdf")
+
+        result = service.submit_extraction(
+            self.base_extraction(
+                claims=[
+                    {
+                        "claim_text": "库内查不到的切片。",
+                        "claim_type": "factual",
+                        "evidence": [
+                            {"chunk_id": "chunk-1", "quote": "库内查不到"}
+                        ],
+                        "confidence": 0.9,
+                    }
+                ]
+            ),
+            config=self.config,
+            conn=self.conn,
+        )
+
+        self.assertEqual(result["created"]["claims"], [])
+        self.assertIn("not_found", [item["reason"] for item in result["rejected"]])
+
+    def test_offline_verification_is_marked_unverified_in_get_page(self):
+        self.seed_source()
+        page = self.make_page(
+            "离线证据页面", status="draft", slug="offline-evidence-page"
+        )
+        payload = self.base_extraction(
+            claims=[
+                {
+                    "claim_text": "城市洪涝受降雨与排水能力共同影响。",
+                    "claim_type": "factual",
+                    "evidence": [
+                        {
+                            "chunk_id": "chunk-1",
+                            "quote": "城市洪涝受降雨与排水能力共同影响",
+                        }
+                    ],
+                    "confidence": 0.9,
+                }
+            ],
+            page_suggestion={
+                "action": "update",
+                "page_id": page.page_id,
+                "content_md": "# 页面正文\n",
+                "rationale": "离线校验测试",
+            },
+        )
+
+        with mock.patch.object(
+            service.wiki_evidence,
+            "resolve_chunk_text",
+            side_effect=wiki_evidence.ChunkTextUnavailable("offline"),
+        ), mock.patch.object(
+            service, "_lancedb_available", return_value=False
+        ):
+            result = service.submit_extraction(
+                payload, config=self.config, conn=self.conn
+            )
+
+        self.assertEqual(len(result["created"]["claims"]), 1)
+        claim_info = result["created"]["claims"][0]
+        self.assertEqual(claim_info["verification"], "offline_unverified")
+        self.assertEqual(claim_info["page_id"], page.page_id)
+
+        chunk_ref = self.conn.execute(
+            "SELECT locator_json FROM chunk_refs WHERE chunk_id = 'chunk-1'"
+        ).fetchone()
+        self.assertIn("offline_unverified", chunk_ref["locator_json"])
+
+        view = service.get_page(
+            page.page_id, config=self.config, conn=self.conn
+        )
+        self.assertEqual(view["evidence"]["claim_count"], 1)
+        evidence_item = view["evidence"]["claims"][0]["evidence"][0]
+        self.assertFalse(evidence_item["verified"])
+        self.assertEqual(
+            evidence_item["verification"], "offline_unverified"
+        )
+
+        # 同一 chunk 后续在线校验的证据不应被旧离线标记连带标成未验证。
+        self.seed_lance(CHUNK_TEXT)
+        online = service.submit_extraction(
+            self.base_extraction(
+                claims=[
+                    {
+                        "claim_text": "在线校验的同一 chunk 证据。",
+                        "claim_type": "factual",
+                        "evidence": [
+                            {
+                                "chunk_id": "chunk-1",
+                                "quote": "城市洪涝受降雨与排水能力共同影响",
+                            }
+                        ],
+                        "confidence": 0.9,
+                    }
+                ],
+                page_suggestion={
+                    "action": "update",
+                    "page_id": page.page_id,
+                    "content_md": "# 页面正文\n",
+                    "rationale": "在线校验测试",
+                },
+            ),
+            config=self.config,
+            conn=self.conn,
+        )
+        self.assertEqual(
+            online["created"]["claims"][0]["verification"], "verified"
+        )
+        view = service.get_page(
+            page.page_id, config=self.config, conn=self.conn
+        )
+        by_text = {
+            claim["claim_text"]: claim for claim in view["evidence"]["claims"]
+        }
+        self.assertFalse(
+            by_text["城市洪涝受降雨与排水能力共同影响。"]["evidence"][0][
+                "verified"
+            ]
+        )
+        self.assertTrue(
+            by_text["在线校验的同一 chunk 证据。"]["evidence"][0]["verified"]
+        )
+
+    def test_page_suggestion_binds_claims_entities_and_relations(self):
+        self.seed_lance(CHUNK_TEXT)
+        self.seed_source(text=CHUNK_TEXT)
+        page = self.make_page(
+            "证据绑定页面", status="draft", slug="binding-page"
+        )
+        payload = self.base_extraction(
+            entities=[
+                {"name": "Alpha", "entity_type": "concept", "confidence": 0.9},
+                {"name": "Beta", "entity_type": "concept", "confidence": 0.9},
+            ],
+            claims=[
+                {
+                    "claim_text": "城市洪涝受降雨与排水能力共同影响。",
+                    "claim_type": "factual",
+                    "evidence": [
+                        {
+                            "chunk_id": "chunk-1",
+                            "quote": "城市洪涝受降雨与排水能力共同影响",
+                        }
+                    ],
+                    "confidence": 0.9,
+                }
+            ],
+            relations=[
+                {
+                    "subject": "Alpha",
+                    "predicate": "uses",
+                    "object": "Beta",
+                    "confidence": 0.9,
+                }
+            ],
+            page_suggestion={
+                "action": "update",
+                "page_id": page.page_id,
+                "content_md": "# 页面正文\n",
+                "rationale": "页面级证据绑定",
+            },
+        )
+
+        result = service.submit_extraction(
+            payload, config=self.config, conn=self.conn
+        )
+
+        self.assertEqual(len(result["created"]["claims"]), 1)
+        self.assertEqual(result["created"]["claims"][0]["page_id"], page.page_id)
+        self.assertEqual(
+            result["created"]["relations"][0]["source_page_id"], page.page_id
+        )
+        claim_row = self.conn.execute("SELECT page_id FROM claims").fetchone()
+        self.assertEqual(claim_row["page_id"], page.page_id)
+        relation_row = self.conn.execute(
+            "SELECT source_page_id FROM relations"
+        ).fetchone()
+        self.assertEqual(relation_row["source_page_id"], page.page_id)
+        page_entities = entities_repo.get_page_entities(self.conn, page.page_id)
+        self.assertEqual(len(page_entities), 2)
+
+        view = service.get_page(
+            page.page_id, config=self.config, conn=self.conn
+        )
+        self.assertEqual(view["evidence"]["claim_count"], 1)
+        self.assertEqual(
+            view["evidence"]["claims"][0]["page_id"], page.page_id
+        )
+        self.assertTrue(view["evidence"]["claims"][0]["evidence"][0]["verified"])
+
+    def test_chunk_resolution_happens_before_write_transaction(self):
+        self.seed_lance(CHUNK_TEXT)
+        self.seed_source(text=CHUNK_TEXT)
+        real_resolve = wiki_evidence.resolve_chunk_text
+        observed: list[bool] = []
+
+        def spy(conn, chunk_id, **kwargs):
+            observed.append(bool(conn.in_transaction))
+            return real_resolve(conn, chunk_id, **kwargs)
+
+        payload = self.base_extraction(
+            claims=[
+                {
+                    "claim_text": "城市洪涝受降雨与排水能力共同影响。",
+                    "claim_type": "factual",
+                    "evidence": [
+                        {
+                            "chunk_id": "chunk-1",
+                            "quote": "城市洪涝受降雨与排水能力共同影响",
+                        }
+                    ],
+                    "confidence": 0.9,
+                }
+            ]
+        )
+        with mock.patch.object(
+            wiki_evidence, "resolve_chunk_text", side_effect=spy
+        ):
+            result = service.submit_extraction(
+                payload, config=self.config, conn=self.conn
+            )
+
+        self.assertEqual(len(result["created"]["claims"]), 1)
+        self.assertEqual(observed, [False])
 
 
 if __name__ == "__main__":

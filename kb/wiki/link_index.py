@@ -14,7 +14,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Any, Iterator
 
 from .config import WikiConfig, WikiPathError, ensure_within
 from .db import transaction
@@ -120,17 +120,12 @@ def delete_page_links(conn: sqlite3.Connection, page_id: str) -> int:
     ).rowcount
 
 
-def rebuild_page_links(
-    conn: sqlite3.Connection,
+def _collect_link_records(
     page_id: str,
     body: str,
-    config: WikiConfig | None = None,
+    lookup: _PageLookup,
+    now: str,
 ) -> list[PageLinkRecord]:
-    """重建某页出链；未解析目标保留 target_slug 与 NULL target_page_id。"""
-    if pages_repo.get_page(conn, page_id) is None:
-        raise LinkPageNotFoundError(f"页面不存在: {page_id}")
-    lookup = _PageLookup(conn, config)
-    now = utc_now()
     records: list[PageLinkRecord] = []
     seen: set[str] = set()
     for target_slug, display_text in iter_wiki_links(body):
@@ -148,23 +143,121 @@ def rebuild_page_links(
                 created_at=now,
             )
         )
+    return records
+
+
+def _write_page_links(
+    conn: sqlite3.Connection, page_id: str, records: list[PageLinkRecord]
+) -> None:
+    delete_page_links(conn, page_id)
+    for record in records:
+        conn.execute(
+            "INSERT INTO page_links "
+            "(source_page_id, target_slug, target_page_id, display_text, "
+            " created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                record.source_page_id,
+                record.target_slug,
+                record.target_page_id,
+                record.display_text,
+                record.created_at,
+            ),
+        )
+
+
+def rebuild_page_links(
+    conn: sqlite3.Connection,
+    page_id: str,
+    body: str,
+    config: WikiConfig | None = None,
+) -> list[PageLinkRecord]:
+    """重建某页出链；未解析目标保留 target_slug 与 NULL target_page_id。"""
+    if pages_repo.get_page(conn, page_id) is None:
+        raise LinkPageNotFoundError(f"页面不存在: {page_id}")
+    lookup = _PageLookup(conn, config)
+    now = utc_now()
+    records = _collect_link_records(page_id, body, lookup, now)
 
     with _transactional(conn):
-        delete_page_links(conn, page_id)
-        for record in records:
-            conn.execute(
-                "INSERT INTO page_links "
-                "(source_page_id, target_slug, target_page_id, display_text, "
-                " created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    record.source_page_id,
-                    record.target_slug,
-                    record.target_page_id,
-                    record.display_text,
-                    record.created_at,
-                ),
-            )
+        _write_page_links(conn, page_id, records)
     return records
+
+
+def rebuild_all_page_links(
+    conn: sqlite3.Connection,
+    config: WikiConfig,
+) -> dict[str, Any]:
+    """全量重建所有页面的出链并回填 target_page_id。
+
+    解析规则与单页重建一致（slug → title → alias，大小写不敏感）；只有
+    ``published`` 页面写入链接，草稿/待审/归档页面的出链会被清空，与
+    PageStore 的发布语义保持一致。文件缺失或 frontmatter 非法的页面会记录
+    到 ``errors`` 并保留其原有链接（不静默删除）。返回值包含页面数、链接数
+    与断链明细。
+
+    所有文件读取与解析在写事务开始前完成，事务内只做 SQL 删除/插入。
+    """
+    if not isinstance(config, WikiConfig):
+        raise TypeError("config 必须是 WikiConfig")
+    pages = pages_repo.list_pages(conn, limit=None, order="created")
+    lookup = _PageLookup(conn, config)
+    now = utc_now()
+
+    stats: dict[str, Any] = {
+        "pages": len(pages),
+        "published": 0,
+        "unpublished": 0,
+        "links": 0,
+        "broken": 0,
+        "broken_links": [],
+        "errors": [],
+        "missing_files": [],
+    }
+    prepared: list[tuple[str, list[PageLinkRecord]]] = []
+    clear_page_ids: list[str] = []
+    for page in pages:
+        if str(page.status) != "published":
+            clear_page_ids.append(page.page_id)
+            stats["unpublished"] += 1
+            continue
+        path = _page_path(config, page)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            _frontmatter, body = parse_frontmatter(text)
+        except FileNotFoundError:
+            stats["missing_files"].append(
+                {"page_id": page.page_id, "relative_path": page.relative_path}
+            )
+            stats["errors"].append(
+                f"页面文件缺失，保留旧链接: {page.relative_path}"
+            )
+            continue
+        except (OSError, UnicodeDecodeError, FrontmatterError, WikiPathError) as exc:
+            stats["errors"].append(
+                f"页面不可解析，保留旧链接: {page.relative_path}: {exc}"
+            )
+            continue
+        records = _collect_link_records(page.page_id, body, lookup, now)
+        prepared.append((page.page_id, records))
+        stats["published"] += 1
+        stats["links"] += len(records)
+        for record in records:
+            if record.target_page_id is None:
+                stats["broken"] += 1
+                stats["broken_links"].append(
+                    {
+                        "source_page_id": record.source_page_id,
+                        "target_slug": record.target_slug,
+                    }
+                )
+
+    with _transactional(conn):
+        for page_id in clear_page_ids:
+            delete_page_links(conn, page_id)
+        for page_id, records in prepared:
+            _write_page_links(conn, page_id, records)
+    return stats
 
 
 def outgoing_links(
@@ -214,5 +307,6 @@ __all__ = [
     "delete_page_links",
     "iter_wiki_links",
     "outgoing_links",
+    "rebuild_all_page_links",
     "rebuild_page_links",
 ]

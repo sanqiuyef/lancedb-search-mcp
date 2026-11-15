@@ -35,6 +35,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from kb.wiki import constants as C  # noqa: E402
 from kb.wiki import db as wiki_db  # noqa: E402
+from kb.wiki import link_index  # noqa: E402
 from kb.wiki.config import WikiConfig, WikiConfigError, WikiPathError, ensure_within  # noqa: E402
 from kb.wiki.markdown import (  # noqa: E402
     FrontmatterError,
@@ -261,6 +262,7 @@ def rebuild(
         "path_conflict": [],
         "revision_conflict": [],
         "orphan_page_records": [],
+        "link_rebuild": None,
     }
 
     candidates: list[ScannedPage] = []
@@ -365,6 +367,9 @@ def rebuild(
         with context:
             for record in candidates:
                 report["registered"].append(_register_page(conn, config, record))
+    if apply:
+        # 登记完成后全量重建出链/断链，保证导入的页面立即参与双链索引。
+        report["link_rebuild"] = link_index.rebuild_all_page_links(conn, config)
     return report
 
 
@@ -387,6 +392,15 @@ def render_text(report: dict[str, Any]) -> str:
         f"  revision 冲突: {len(report['revision_conflict'])}",
         f"  DB 记录但文件缺失: {len(report['orphan_page_records'])}",
     ]
+    link_rebuild = report.get("link_rebuild")
+    if link_rebuild is not None:
+        lines.append(
+            f"  链接重建: pages={link_rebuild['pages']}, "
+            f"published={link_rebuild['published']}, "
+            f"links={link_rebuild['links']}, broken={link_rebuild['broken']}"
+        )
+        for error in link_rebuild.get("errors") or []:
+            lines.append(f"  - [link] {error}")
     for item in report["register_candidates"]:
         prefix = "已登记" if report["registered"] else "候选"
         lines.append(

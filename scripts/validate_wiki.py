@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """Wiki 一致性校验 CLI：validator.validate + recovery.scan_journal。
 
-只读打开 SQLite（``mode=ro``），不执行迁移、不修复问题、不写 vault。
+默认只读打开 SQLite（``mode=ro``），不执行迁移、不修复问题、不写 vault。
+``--rebuild-links`` 例外：以读写连接全量重建 ``page_links`` 后再校验。
 默认输出 Markdown；``--json`` 输出结构化结果；``--strict`` 时存在 error 级
 问题则退出码 1。运行失败（库缺失/未迁移等）退出码 2。
 
 用法：
     python -X utf8 scripts/validate_wiki.py
     python -X utf8 scripts/validate_wiki.py --db <wiki.sqlite3> --json --strict
+    python -X utf8 scripts/validate_wiki.py --db <wiki.sqlite3> --rebuild-links
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from kb.wiki import constants as C  # noqa: E402
 from kb.wiki import db as wiki_db  # noqa: E402
+from kb.wiki import link_index  # noqa: E402
 from kb.wiki import recovery  # noqa: E402
 from kb.wiki import validator  # noqa: E402
 from kb.wiki.config import WikiConfig, WikiConfigError  # noqa: E402
@@ -98,6 +101,18 @@ def _open_readonly(db_path: str) -> sqlite3.Connection:
         raise ValidateError(f"无法只读打开 Wiki 数据库: {exc}") from exc
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _open_readwrite(db_path: str, config: WikiConfig) -> sqlite3.Connection:
+    """``--rebuild-links`` 需要写 page_links；仍要求库已迁移。"""
+    if not os.path.exists(db_path):
+        raise ValidateError(f"Wiki 数据库不存在: {db_path}")
+    if not os.path.isfile(db_path):
+        raise ValidateError(f"Wiki 数据库路径不是文件: {db_path}")
+    try:
+        return wiki_db.connect(db_path, config)
+    except sqlite3.Error as exc:
+        raise ValidateError(f"无法打开 Wiki 数据库: {exc}") from exc
 
 
 def _load_detail(text: str) -> Any:
@@ -192,6 +207,20 @@ def render_markdown(result: dict[str, Any], strict: bool) -> str:
     else:
         lines.append("未发现问题。")
 
+    lines.extend(["", "## 链接重建", ""])
+    link_rebuild = result.get("link_rebuild")
+    if link_rebuild is None:
+        lines.append("未执行（使用 --rebuild-links 重建）。")
+    else:
+        lines.append(
+            f"- pages={link_rebuild['pages']}, "
+            f"published={link_rebuild['published']}, "
+            f"unpublished={link_rebuild['unpublished']}, "
+            f"links={link_rebuild['links']}, broken={link_rebuild['broken']}"
+        )
+        for error in link_rebuild.get("errors") or []:
+            lines.append(f"- 错误: {_cell(error)}")
+
     lines.extend(["", "## 未完成写入日志", ""])
     journal = result["journal"]
     if journal["total"] == 0:
@@ -248,6 +277,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="存在 error 级问题时退出码 1",
     )
+    parser.add_argument(
+        "--rebuild-links",
+        action="store_true",
+        help="校验前全量重建 page_links（写库；默认只读）",
+    )
     return parser
 
 
@@ -258,14 +292,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         env_config, vault_path, db_path = _resolve_paths(args)
         config = _build_config(env_config, args, vault_path, db_path)
-        conn = _open_readonly(db_path)
+        if args.rebuild_links:
+            conn = _open_readwrite(db_path, config)
+        else:
+            conn = _open_readonly(db_path)
         applied = wiki_db.db_status(conn)
         if not applied:
             raise ValidateError(
                 f"数据库未执行 Wiki 迁移: {db_path}；"
                 "先运行迁移或设置正确的 --db"
             )
+        link_rebuild = (
+            link_index.rebuild_all_page_links(conn, config)
+            if args.rebuild_links
+            else None
+        )
         result = _collect(conn, config)
+        if link_rebuild is not None:
+            result["link_rebuild"] = link_rebuild
     except (ValidateError, WikiConfigError, recovery.RecoveryError) as exc:
         print(f"validate_wiki: error: {exc}", file=sys.stderr)
         return 2

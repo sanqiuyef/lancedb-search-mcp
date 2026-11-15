@@ -6,7 +6,12 @@
 更新页面。
 
 状态机：pending → rejected / stale / cancelled / approved → applied；
-``cancel_proposal`` 只允许取消 pending 提案。
+apply 失败时 approved 会恢复为 pending（error_message 记录原因，可重试），
+不会永久停在 approved；``cancel_proposal`` 只允许取消 pending 提案。
+状态迁移全部用 CAS（WHERE status=?）并检查 rowcount，终态不可被普通更新覆盖。
+
+apply 是人工审核通过，允许把页面发布为 published；该语义与
+``WIKI_AUTO_PUBLISH``（自动发布开关）无关。
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from .db import transaction
 from .ids import new_ulid
 from .models import PageRecord, PageRevisionRecord, ProposalRecord
 from .page_store import (
+    GitCommitError,
     PageFileMissingError,
     PageNotFoundError,
     PageStore,
@@ -33,6 +39,7 @@ from .page_store import (
     RevisionConflictError,
     atomic_write_text,
 )
+from .repositories import pages as pages_repo
 from .repositories import proposals as proposals_repo
 
 PROPOSAL_STATES = C.PROPOSAL_STATUSES
@@ -234,6 +241,74 @@ class ProposalService:
         return proposals_repo.list_proposals(self.conn, status=status)
 
     # ── 审核 ──
+    def _current_decision(
+        self, proposal_id: str, message: str
+    ) -> ProposalDecision:
+        """CAS 失败后读取最新记录并返回当前状态（并发下只有一方成功）。"""
+        current = proposals_repo.get_proposal(self.conn, proposal_id)
+        if current is None:  # pragma: no cover - 行不会在审核期间被删
+            raise ProposalNotFoundError(f"提案不存在: {proposal_id}")
+        return ProposalDecision(
+            ok=False,
+            status=str(current.status),
+            message=f"{message}（当前状态: {current.status}）",
+            proposal=current,
+        )
+
+    def _restore_pending(
+        self,
+        record: ProposalRecord,
+        error: BaseException | str,
+        *,
+        expected_revision_id: str | None = None,
+    ) -> ProposalDecision:
+        """apply 失败后把 approved 提案恢复为 pending（可重试、审核队列可见）。
+
+        状态机没有 failed；pending + error_message 是唯一可重试的持久状态，
+        终态 applied/rejected/stale/cancelled 不会从这里写入。
+        """
+        message = f"应用失败，提案已恢复 pending 可重试: {error}"
+        fields: dict[str, Any] = {
+            "status": "pending",
+            "error_message": message,
+        }
+        if expected_revision_id:
+            fields["expected_revision_id"] = expected_revision_id
+        try:
+            with transaction(self.conn):
+                changed = proposals_repo.update_proposal(
+                    self.conn,
+                    record.proposal_id,
+                    expected_status="approved",
+                    **fields,
+                )
+        except BaseException:
+            changed = 0
+        current = proposals_repo.get_proposal(self.conn, record.proposal_id)
+        if current is None:  # pragma: no cover - 行不会在审核期间被删
+            raise ProposalNotFoundError(
+                f"提案不存在: {record.proposal_id}"
+            )
+        if changed != 1 and str(current.status) == "applied":
+            # 恢复 CAS 失败但更新实际已提交（如 COMMIT 后异常）。
+            return ProposalDecision(
+                ok=True,
+                status="applied",
+                message="提案已应用并提交",
+                proposal=current,
+            )
+        if changed != 1 and str(current.status) == "approved":
+            message = (
+                "应用失败且无法恢复 pending（数据库不可写），需要人工处理: "
+                f"{error}"
+            )
+        return ProposalDecision(
+            ok=False,
+            status=str(current.status),
+            message=message,
+            proposal=current,
+        )
+
     def cancel_proposal(
         self,
         proposal_id: str,
@@ -262,14 +337,19 @@ class ProposalService:
             payload["cancel_reason"] = reason
         reviewed_at = proposals_repo.utc_now()
         with transaction(self.conn):
-            proposals_repo.update_proposal(
+            changed = proposals_repo.update_proposal(
                 self.conn,
                 proposal_id,
+                expected_status="pending",
                 status="cancelled",
                 reviewed_by=actor,
                 reviewed_at=reviewed_at,
                 payload_json=_dump_payload(payload),
                 error_message="",
+            )
+        if changed != 1:
+            return self._current_decision(
+                proposal_id, "取消失败：提案状态已被并发修改"
             )
         updated = proposals_repo.get_proposal(self.conn, proposal_id)
         assert updated is not None
@@ -309,13 +389,18 @@ class ProposalService:
 
         if not approve:
             with transaction(self.conn):
-                proposals_repo.update_proposal(
+                changed = proposals_repo.update_proposal(
                     self.conn,
                     proposal_id,
+                    expected_status="pending",
                     status="rejected",
                     reviewed_by=actor,
                     reviewed_at=reviewed_at,
                     payload_json=payload_json,
+                )
+            if changed != 1:
+                return self._current_decision(
+                    proposal_id, "拒绝失败：提案状态已被并发修改"
                 )
             updated = proposals_repo.get_proposal(self.conn, proposal_id)
             assert updated is not None
@@ -334,6 +419,7 @@ class ProposalService:
                 actor,
                 reviewed_at,
                 payload_json,
+                expected_status="pending",
             )
 
         try:
@@ -344,11 +430,21 @@ class ProposalService:
             )
         except (PageNotFoundError, PageFileMissingError, PageValidationError) as exc:
             return self._mark_stale(
-                record, f"目标页面不可用: {exc}", actor, reviewed_at, payload_json
+                record,
+                f"目标页面不可用: {exc}",
+                actor,
+                reviewed_at,
+                payload_json,
+                expected_status="pending",
             )
         if page_view is None:
             return self._mark_stale(
-                record, "目标页面不存在", actor, reviewed_at, payload_json
+                record,
+                "目标页面不存在",
+                actor,
+                reviewed_at,
+                payload_json,
+                expected_status="pending",
             )
 
         current_revision_id = page_view.page.current_revision_id or ""
@@ -359,17 +455,23 @@ class ProposalService:
                 actor,
                 reviewed_at,
                 payload_json,
+                expected_status="pending",
             )
 
-        # 审核通过先落 approved，再执行写入；写入后置 applied。
+        # 人工审核通过：CAS pending → approved。并发取消/审核只有一方成功。
         with transaction(self.conn):
-            proposals_repo.update_proposal(
+            approved = proposals_repo.update_proposal(
                 self.conn,
                 proposal_id,
+                expected_status="pending",
                 status="approved",
                 reviewed_by=actor,
                 reviewed_at=reviewed_at,
                 payload_json=payload_json,
+            )
+        if approved != 1:
+            return self._current_decision(
+                proposal_id, "审核失败：提案状态已被并发修改"
             )
 
         try:
@@ -381,18 +483,33 @@ class ProposalService:
                 commit=True,
                 source_proposal_id=proposal_id,
                 change_reason=record.rationale,
+                # apply 是人工批准，允许发布；与 WIKI_AUTO_PUBLISH 无关。
+                target_status="published",
             )
-        except (RevisionConflictError, PageFileMissingError, PageNotFoundError) as exc:
-            return self._mark_stale(
-                record, f"应用失败: {exc}", actor, reviewed_at, payload_json
+        except GitCommitError as exc:
+            # 文件与 DB 已提交、仅 git 失败：把 expected 前移到当前修订，
+            # 恢复 pending 后可再次 apply。
+            current_page = pages_repo.get_page(self.conn, record.page_id)
+            return self._restore_pending(
+                record,
+                exc,
+                expected_revision_id=(
+                    current_page.current_revision_id
+                    if current_page is not None
+                    else None
+                ),
             )
+        except (
+            RevisionConflictError,
+            PageFileMissingError,
+            PageNotFoundError,
+        ) as exc:
+            return self._restore_pending(record, exc)
+        except PageValidationError as exc:
+            self._restore_pending(record, exc)
+            raise
         except BaseException as exc:
-            with transaction(self.conn):
-                proposals_repo.update_proposal(
-                    self.conn,
-                    proposal_id,
-                    error_message=str(exc),
-                )
+            self._restore_pending(record, exc)
             raise
 
         if result.status != "updated":
@@ -402,19 +519,59 @@ class ProposalService:
                 actor,
                 reviewed_at,
                 payload_json,
+                expected_status="approved",
             )
 
         applied_at = proposals_repo.utc_now()
-        with transaction(self.conn):
-            proposals_repo.update_proposal(
-                self.conn,
-                proposal_id,
-                status="applied",
-                result_revision_id=(
-                    result.revision.revision_id if result.revision else ""
+        try:
+            with transaction(self.conn):
+                changed = proposals_repo.update_proposal(
+                    self.conn,
+                    proposal_id,
+                    expected_status="approved",
+                    status="applied",
+                    result_revision_id=(
+                        result.revision.revision_id if result.revision else ""
+                    ),
+                    applied_at=applied_at,
+                    error_message="",
+                )
+        except BaseException as exc:
+            current = proposals_repo.get_proposal(self.conn, proposal_id)
+            if current is not None and str(current.status) == "applied":
+                return ProposalDecision(
+                    ok=True,
+                    status="applied",
+                    message="提案已应用并提交",
+                    proposal=current,
+                    page=result.page,
+                    revision=result.revision,
+                )
+            self._restore_pending(
+                record,
+                exc,
+                expected_revision_id=(
+                    result.revision.revision_id if result.revision else None
                 ),
-                applied_at=applied_at,
-                error_message="",
+            )
+            raise
+        if changed != 1:
+            current = proposals_repo.get_proposal(self.conn, proposal_id)
+            if current is not None and str(current.status) == "applied":
+                return ProposalDecision(
+                    ok=True,
+                    status="applied",
+                    message="提案已应用并提交",
+                    proposal=current,
+                    page=result.page,
+                    revision=result.revision,
+                )
+            return self._restore_pending(
+                record,
+                "提案状态在写入后发生变化",
+                expected_revision_id=(
+                    result.revision.revision_id if result.revision else None
+                ),
             )
         updated = proposals_repo.get_proposal(self.conn, proposal_id)
         assert updated is not None
@@ -434,16 +591,23 @@ class ProposalService:
         actor: str,
         reviewed_at: str,
         payload_json: str,
+        *,
+        expected_status: str,
     ) -> ProposalDecision:
         with transaction(self.conn):
-            proposals_repo.update_proposal(
+            changed = proposals_repo.update_proposal(
                 self.conn,
                 record.proposal_id,
+                expected_status=expected_status,
                 status="stale",
                 reviewed_by=actor,
                 reviewed_at=reviewed_at,
                 error_message=message,
                 payload_json=payload_json,
+            )
+        if changed != 1:
+            return self._current_decision(
+                record.proposal_id, "标记 stale 失败：提案状态已被并发修改"
             )
         updated = proposals_repo.get_proposal(self.conn, record.proposal_id)
         assert updated is not None

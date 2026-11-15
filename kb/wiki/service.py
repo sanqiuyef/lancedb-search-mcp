@@ -432,16 +432,48 @@ def _page_evidence_summary(
         for evidence_row in evidence_rows:
             quote = str(evidence_row.get("quote") or "")
             stored_sha = str(evidence_row.get("text_sha256") or "")
+            chunk_id = str(evidence_row.get("chunk_id") or "")
+            verification = ""
+            if chunk_id:
+                chunk_ref = documents_repo.get_chunk_ref(conn, chunk_id)
+                if chunk_ref is not None:
+                    try:
+                        locator = json.loads(
+                            str(chunk_ref.get("locator_json") or "{}")
+                        )
+                    except (TypeError, ValueError):
+                        locator = {}
+                    if isinstance(locator, dict):
+                        offline_ids = locator.get(
+                            "offline_unverified_evidence_ids"
+                        )
+                        if isinstance(offline_ids, list) and offline_ids:
+                            is_offline = (
+                                evidence_row.get("evidence_id") in offline_ids
+                            )
+                        else:
+                            # 兼容只写 verification 标记的旧数据/人工数据。
+                            is_offline = (
+                                locator.get("verification")
+                                == _OFFLINE_VERIFICATION
+                            )
+                        if is_offline:
+                            verification = _OFFLINE_VERIFICATION
             evidence.append(
                 {
                     "evidence_id": evidence_row.get("evidence_id", ""),
-                    "chunk_id": evidence_row.get("chunk_id", ""),
+                    "chunk_id": chunk_id,
                     "quote": quote,
                     "char_start": evidence_row.get("char_start", 0),
                     "char_end": evidence_row.get("char_end", 0),
                     "confidence": evidence_row.get("confidence", 0.0),
+                    "verification": verification or (
+                        "quote_sha256" if stored_sha else ""
+                    ),
                     "verified": bool(
-                        stored_sha and stored_sha == wiki_evidence.quote_sha256(quote)
+                        stored_sha
+                        and stored_sha == wiki_evidence.quote_sha256(quote)
+                        and verification != _OFFLINE_VERIFICATION
                     ),
                 }
             )
@@ -1135,6 +1167,7 @@ def _process_entity(
     created: dict[str, list[dict[str, Any]]],
     rejected: list[dict[str, Any]],
     warnings: list[str],
+    page_id: str = "",
 ) -> None:
     try:
         normalized = entity_resolver.normalize_name(entity.name)
@@ -1189,6 +1222,9 @@ def _process_entity(
         description=entity.description,
         confidence=entity.confidence,
         aliases=entity.aliases,
+        page_id=page_id or None,
+        role="mention",
+        page_confidence=entity.confidence,
         created_by="agent",
     )
     aliases = [
@@ -1206,93 +1242,163 @@ def _process_entity(
             "aliases": aliases,
             "created": existing is None,
             "matched_by": matched_by or ("none" if existing is None else "canonical"),
+            "page_id": page_id or "",
         }
+    )
+
+
+_OFFLINE_VERIFICATION = "offline_unverified"
+
+
+def _lancedb_available() -> bool:
+    """LanceDB 主表是否可用；任何连接异常都按不可用处理。"""
+    try:
+        from .. import schema as kb_schema
+
+        return bool(kb_schema.table_exists())
+    except Exception:  # noqa: BLE001 - 库不可用时允许离线校验
+        return False
+
+
+def _resolve_evidence_text(
+    conn: sqlite3.Connection,
+    chunk_id: str,
+    provided_texts: Mapping[str, str],
+) -> tuple[str, str]:
+    """取得用于校验引文的 chunk 原文，返回 ``(text, verification)``。
+
+    LanceDB 可用时始终以库内原文为准，忽略调用方提供的 ``chunk_texts``；
+    只有库不可用（主表不存在/连接失败）时才回退到调用方文本，并标记
+    ``offline_unverified``。库可用但查不到该切片依然拒绝，防止伪造。
+    """
+    try:
+        return wiki_evidence.resolve_chunk_text(conn, chunk_id), ""
+    except wiki_evidence.ChunkTextUnavailable:
+        if _lancedb_available():
+            raise
+        text = provided_texts.get(chunk_id)
+        if text is None:
+            raise
+        return text, _OFFLINE_VERIFICATION
+
+
+def _prepare_claim_evidence(
+    conn: sqlite3.Connection,
+    claim,
+    index: int,
+    chunk_texts: Mapping[str, str],
+) -> tuple[list[tuple[Any, str, str]] | None, dict[str, Any] | None]:
+    """在写事务前完成 chunk 原文读取/引文校验（含 LanceDB 查询）。
+
+    返回 ``(verified, rejection)``：成功时 verified 为
+    ``[(EvidenceInput, chunk_text, verification), ...]``；失败时 rejection
+    为整条 claim 的拒绝项。
+    """
+    if claim.is_factual and not claim.evidence:
+        return None, _rejection(
+            "claim",
+            index,
+            "missing_evidence",
+            error="事实型 claim（factual/definition/result）必须提供证据",
+            name=claim.claim_text[:80],
+            item=claim.model_dump(mode="json"),
+        )
+
+    verified: list[tuple[Any, str, str]] = []
+    for evidence_input in claim.evidence:
+        ref = documents_repo.get_chunk_ref(conn, evidence_input.chunk_id)
+        if ref is None:
+            return None, _rejection(
+                "claim",
+                index,
+                "not_found",
+                error=f"chunk_ref 不存在: {evidence_input.chunk_id}",
+                name=claim.claim_text[:80],
+                item=claim.model_dump(mode="json"),
+            )
+        try:
+            chunk_text, verification = _resolve_evidence_text(
+                conn, evidence_input.chunk_id, chunk_texts
+            )
+        except Exception as exc:  # noqa: BLE001 - LanceDB 不可用按 not_found
+            return None, _rejection(
+                "claim",
+                index,
+                "not_found",
+                error=f"无法取得 chunk 原文: {exc}",
+                name=claim.claim_text[:80],
+                item=claim.model_dump(mode="json"),
+            )
+        status, _start, _end = wiki_evidence.verify_quote(
+            chunk_text, evidence_input.quote
+        )
+        if status != wiki_evidence.VERIFIED:
+            return None, _rejection(
+                "claim",
+                index,
+                "not_found",
+                error=f"引文未在 chunk 原文中找到: {evidence_input.quote[:80]!r}",
+                name=claim.claim_text[:80],
+                item=claim.model_dump(mode="json"),
+            )
+        verified.append((evidence_input, chunk_text, verification))
+    return verified, None
+
+
+def _mark_offline_unverified(
+    conn: sqlite3.Connection,
+    chunk_id: str,
+    evidence_id: str,
+) -> None:
+    """离线校验标记写入 chunk_ref.locator_json。
+
+    0003 schema 的 ``claim_evidence`` 没有 locator_json 列，无法在不改迁移的
+    前提下按证据行持久化；这里把 ``verification`` 与证据 id 合并进该 chunk
+    的 ``chunk_refs.locator_json``，``get_page`` 证据摘要据此不显示 verified。
+    """
+    ref = documents_repo.get_chunk_ref(conn, chunk_id)
+    if ref is None:
+        return
+    raw = str(ref.get("locator_json") or "{}")
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["verification"] = _OFFLINE_VERIFICATION
+    evidence_ids = data.get("offline_unverified_evidence_ids")
+    if not isinstance(evidence_ids, list):
+        evidence_ids = []
+    if evidence_id not in evidence_ids:
+        evidence_ids.append(evidence_id)
+    data["offline_unverified_evidence_ids"] = evidence_ids
+    documents_repo.update_chunk_ref_location(
+        conn,
+        chunk_id,
+        locator_json=json.dumps(data, ensure_ascii=False, sort_keys=True),
     )
 
 
 def _process_claim(
     conn: sqlite3.Connection,
     claim,
-    index: int,
     document_id: str,
-    chunk_texts: Mapping[str, str],
+    page_id: str,
+    verified: list[tuple[Any, str, str]],
     created: dict[str, list[dict[str, Any]]],
-    rejected: list[dict[str, Any]],
 ) -> None:
-    if claim.is_factual and not claim.evidence:
-        rejected.append(
-            _rejection(
-                "claim",
-                index,
-                "missing_evidence",
-                error="事实型 claim（factual/definition/result）必须提供证据",
-                name=claim.claim_text[:80],
-                item=claim.model_dump(mode="json"),
-            )
-        )
-        return
-
-    verified: list[tuple[Any, str]] = []
-    for evidence_input in claim.evidence:
-        ref = documents_repo.get_chunk_ref(conn, evidence_input.chunk_id)
-        if ref is None:
-            rejected.append(
-                _rejection(
-                    "claim",
-                    index,
-                    "not_found",
-                    error=f"chunk_ref 不存在: {evidence_input.chunk_id}",
-                    name=claim.claim_text[:80],
-                    item=claim.model_dump(mode="json"),
-                )
-            )
-            return
-        if evidence_input.chunk_id in chunk_texts:
-            chunk_text = chunk_texts[evidence_input.chunk_id]
-        else:
-            try:
-                chunk_text = wiki_evidence.resolve_chunk_text(
-                    conn, evidence_input.chunk_id
-                )
-            except Exception as exc:  # noqa: BLE001 - LanceDB 不可用按 not_found
-                rejected.append(
-                    _rejection(
-                        "claim",
-                        index,
-                        "not_found",
-                        error=f"无法取得 chunk 原文: {exc}",
-                        name=claim.claim_text[:80],
-                        item=claim.model_dump(mode="json"),
-                    )
-                )
-                return
-        status, _start, _end = wiki_evidence.verify_quote(
-            chunk_text, evidence_input.quote
-        )
-        if status != wiki_evidence.VERIFIED:
-            rejected.append(
-                _rejection(
-                    "claim",
-                    index,
-                    "not_found",
-                    error=f"引文未在 chunk 原文中找到: {evidence_input.quote[:80]!r}",
-                    name=claim.claim_text[:80],
-                    item=claim.model_dump(mode="json"),
-                )
-            )
-            return
-        verified.append((evidence_input, chunk_text))
-
     claim_id = claims_repo.insert_claim(
         conn,
         claim_text=claim.claim_text,
         claim_type=claim.db_claim_type,
         document_id=document_id or None,
+        page_id=page_id or None,
         confidence=claim.confidence,
         status="proposed",
     )
     evidence_ids: list[str] = []
-    for evidence_input, chunk_text in verified:
+    for evidence_input, chunk_text, verification in verified:
         result = wiki_evidence.add_claim_evidence(
             conn,
             claim_id,
@@ -1305,6 +1411,10 @@ def _process_claim(
             confidence=claim.confidence,
         )
         evidence_ids.append(str(result["evidence_id"]))
+        if verification == _OFFLINE_VERIFICATION:
+            _mark_offline_unverified(
+                conn, evidence_input.chunk_id, str(result["evidence_id"])
+            )
     created["claims"].append(
         {
             "claim_id": claim_id,
@@ -1314,8 +1424,14 @@ def _process_claim(
             "confidence": claim.confidence,
             "status": "proposed",
             "document_id": document_id or "",
+            "page_id": page_id or "",
             "evidence_ids": evidence_ids,
             "evidence_count": len(verified),
+            "verification": (
+                _OFFLINE_VERIFICATION
+                if any(item[2] == _OFFLINE_VERIFICATION for item in verified)
+                else "verified"
+            ),
         }
     )
 
@@ -1328,6 +1444,7 @@ def _process_relation(
     created: dict[str, list[dict[str, Any]]],
     rejected: list[dict[str, Any]],
     warnings: list[str],
+    page_id: str = "",
 ) -> None:
     if relation.predicate not in relations_repo.PREDICATES:
         rejected.append(
@@ -1412,6 +1529,7 @@ def _process_relation(
         evidence=json.dumps(relation.evidence_ids, ensure_ascii=False),
         created_by="agent",
         status="proposed",
+        source_page_id=page_id or None,
     )
     created["relations"].append(
         {
@@ -1425,6 +1543,7 @@ def _process_relation(
             "status": str(record.status),
             "evidence_ids": list(relation.evidence_ids),
             "created": existing is None,
+            "source_page_id": page_id or "",
         }
     )
 
@@ -1523,28 +1642,60 @@ def submit_extraction(
                 warnings.append(f"source_chunk_ids 中的 chunk 不存在: {chunk_id}")
 
         proposal_info: dict[str, Any] | None = None
+        suggestion = parsed.page_suggestion
+        page_id = ""
+        if suggestion is not None and suggestion.page_id.strip():
+            if pages_repo.get_page(connection, suggestion.page_id) is not None:
+                page_id = suggestion.page_id
+
+        # P1-10：所有 LanceDB 原文读取与引文校验都在 BEGIN IMMEDIATE 之前完成，
+        # 写事务内只做 SQLite 写入，不访问网络/模型/外部库。
+        prepared_claims: list[
+            tuple[Any, list[tuple[Any, str, str]] | None, dict[str, Any] | None]
+        ] = []
+        for index, claim in enumerate(parsed.claims):
+            verified, rejection = _prepare_claim_evidence(
+                connection, claim, index, parsed.chunk_texts
+            )
+            prepared_claims.append((claim, verified, rejection))
+
         with transaction(connection):
             for index, entity in enumerate(parsed.entities):
                 _process_entity(
-                    connection, cfg, entity, index, created, rejected, warnings
+                    connection,
+                    cfg,
+                    entity,
+                    index,
+                    created,
+                    rejected,
+                    warnings,
+                    page_id=page_id,
                 )
-            for index, claim in enumerate(parsed.claims):
+            for claim, verified, rejection in prepared_claims:
+                if rejection is not None:
+                    rejected.append(rejection)
+                    continue
                 _process_claim(
                     connection,
                     claim,
-                    index,
                     parsed.source_document_id,
-                    parsed.chunk_texts,
+                    page_id,
+                    verified or [],
                     created,
-                    rejected,
                 )
             for index, relation in enumerate(parsed.relations):
                 _process_relation(
-                    connection, cfg, relation, index, created, rejected, warnings
+                    connection,
+                    cfg,
+                    relation,
+                    index,
+                    created,
+                    rejected,
+                    warnings,
+                    page_id=page_id,
                 )
             # 页面建议的 proposal 记录同事务提交；提案服务在已开启事务中复用
             # 当前事务（kb.wiki.proposals）。
-            suggestion = parsed.page_suggestion
             if suggestion is not None:
                 if suggestion.content_md.strip():
                     proposal_info, proposal_warnings = _create_suggestion_proposal(
@@ -1768,15 +1919,9 @@ def apply_proposal(
         if page is None or revision is None:  # pragma: no cover - 防御性分支
             raise WikiServiceError("提案已应用但缺少页面或修订信息")
 
-        # 审核通过即发布：正文型提案不携带 frontmatter，页面仍是 draft。
-        # 这里把 create_page/update_page 的页面推进到 published，后续才会入索引。
-        if str(result.proposal.proposal_type) in ("create_page", "update_page") and str(
-            page.status
-        ) in ("draft", "review"):
-            pages_repo.update_page(connection, page.page_id, status="published")
-            refreshed = pages_repo.get_page(connection, page.page_id)
-            if refreshed is not None:
-                page = refreshed
+        # 发布状态已由 ProposalService 以 target_status="published" 交给
+        # PageStore 在同一次原子写中完成（含出链重建），这里不再旁路改 DB。
+        # apply 是人工审核通过，与 WIKI_AUTO_PUBLISH 无关。
 
         warnings: list[str] = []
 

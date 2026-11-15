@@ -31,6 +31,9 @@ _UPDATE_PROPOSAL_FIELDS = {
     "error_message",
 }
 
+# 终态不可被普通更新覆盖；状态迁移必须带 expected_status 做 CAS。
+TERMINAL_PROPOSAL_STATUSES = ("applied", "rejected", "stale", "cancelled")
+
 
 def utc_now() -> str:
     now = datetime.now(timezone.utc)
@@ -86,8 +89,18 @@ def list_proposals(
 
 
 def update_proposal(
-    conn: sqlite3.Connection, proposal_id: str, **fields: Any
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    expected_status: str | None = None,
+    **fields: Any,
 ) -> int:
+    """更新提案字段，返回受影响行数。
+
+    状态迁移应传 ``expected_status`` 做 CAS（``WHERE status = ?``）；未传时
+    若更新 status，则只允许从非终态迁移，终态行不会被覆盖。并发审批/取消
+    由 SQLite 的行锁与 rowcount 判定，只有一方能成功。
+    """
     unknown = set(fields) - _UPDATE_PROPOSAL_FIELDS
     if unknown:
         raise ValueError(
@@ -100,15 +113,27 @@ def update_proposal(
             f"未知 proposal status: {fields['status']!r}；"
             f"当前 schema 允许: {', '.join(C.PROPOSAL_STATUSES)}"
         )
+    if expected_status is not None and expected_status not in C.PROPOSAL_STATUSES:
+        raise ValueError(f"未知 expected_status: {expected_status!r}")
+
     fields.setdefault("updated_at", utc_now())
     assignments = ", ".join(f"{column} = ?" for column in fields)
     params = list(fields.values()) + [proposal_id]
+    where = "proposal_id = ?"
+    if expected_status is not None:
+        where += " AND status = ?"
+        params.append(expected_status)
+    elif "status" in fields:
+        placeholders = ", ".join("?" for _ in TERMINAL_PROPOSAL_STATUSES)
+        where += f" AND status NOT IN ({placeholders})"
+        params.extend(TERMINAL_PROPOSAL_STATUSES)
     return conn.execute(
-        f"UPDATE proposals SET {assignments} WHERE proposal_id = ?", params
+        f"UPDATE proposals SET {assignments} WHERE {where}", params
     ).rowcount
 
 
 __all__ = [
+    "TERMINAL_PROPOSAL_STATUSES",
     "get_proposal",
     "insert_proposal",
     "list_proposals",

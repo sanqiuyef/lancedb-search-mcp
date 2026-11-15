@@ -252,6 +252,54 @@ class TestLinkIndex(WikiLinkTestBase):
                 self.conn, "missing-page", "[[x]]", config=self.config
             )
 
+    def test_rebuild_all_page_links_restores_links_and_counts_broken(self):
+        target = self.create_page("target", title="Target Page")
+        source = self.create_page(
+            "source", body="[[Target Page]] [[missing]]\n"
+        )
+        draft = self.create_page(
+            "draft", body="[[target]]\n", status="draft"
+        )
+        self.conn.execute("DELETE FROM page_links")
+
+        stats = link_index.rebuild_all_page_links(self.conn, self.config)
+
+        self.assertEqual(stats["pages"], 3)
+        self.assertEqual(stats["published"], 2)
+        self.assertEqual(stats["unpublished"], 1)
+        self.assertEqual(stats["links"], 2)
+        self.assertEqual(stats["broken"], 1)
+        self.assertEqual(
+            stats["broken_links"],
+            [{"source_page_id": source.page_id, "target_slug": "missing"}],
+        )
+        links = link_index.outgoing_links(self.conn, source.page_id)
+        by_slug = {link.target_slug: link for link in links}
+        self.assertEqual(by_slug["Target Page"].target_page_id, target.page_id)
+        self.assertIsNone(by_slug["missing"].target_page_id)
+        self.assertEqual(
+            [link.source_page_id for link in link_index.backlinks(
+                self.conn, target.page_id
+            )],
+            [source.page_id],
+        )
+        self.assertEqual(
+            link_index.outgoing_links(self.conn, draft.page_id), []
+        )
+
+    def test_rebuild_all_page_links_keeps_links_for_missing_file(self):
+        target = self.create_page("target")
+        source = self.create_page("source", body="[[target]]\n")
+        os.unlink(self.path(source))
+
+        stats = link_index.rebuild_all_page_links(self.conn, self.config)
+
+        self.assertEqual(stats["missing_files"][0]["page_id"], source.page_id)
+        self.assertTrue(stats["errors"])
+        self.assertEqual(
+            len(link_index.outgoing_links(self.conn, source.page_id)), 1
+        )
+
 
 class TestParseWikiLinks(unittest.TestCase):
     def test_iter_links(self):
