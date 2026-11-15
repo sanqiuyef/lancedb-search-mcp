@@ -1,7 +1,7 @@
 # Wiki V1 架构决策记录（ADR）
 
 > 状态：Phase 7 归档。记录 Wiki V1 已落地或已确定的关键决策，便于后续阶段
-> （页面索引、检索接入、UI）沿用同一套边界。
+> （页面索引、检索接入）沿用同一套边界。
 
 ## 决策总览
 
@@ -13,6 +13,7 @@
 | ADR-004 | 不内置 LLM，只做证据与提案 | 已实施 |
 | ADR-005 | `wiki_pages` 是可重建的派生索引 | 已确定（Phase 4 实施） |
 | ADR-006 | `WIKI_ENABLED` 默认关闭 | 已实施 |
+| ADR-007 | Wiki 不提供专用 UI，内容全部落在 vault Markdown | 已实施（2026-11-15 撤回 Wiki UI） |
 
 ---
 
@@ -210,3 +211,25 @@ Wiki 会写入用户 vault 与本地 SQLite，并可能触发 Git 提交。默�
 - 首次使用需要显式配置 `WIKI_ENABLED=1` 并重启服务；
 - 禁用状态下不能调用页面创建/更新等写入接口；
 - 环境变量变更不会热加载，需要重启进程。
+
+---
+
+## ADR-007：Wiki 不提供专用 UI
+
+**背景**
+
+曾实现 `ui_server.py` 的 Wiki 阅读与提案审核标签，但实际使用中所有内容都由 Agent
+读写，额外窗口只增加维护面与安全面（跨域、CSRF、XSS）。
+
+**决策**
+
+- 撤回 Wiki UI 与对应测试，保留原有检索面板（`127.0.0.1:8002`）不变；
+- 页面、证据、提案、审核结果全部落在 vault 的 Markdown 与 MCP 工具返回中；
+- 人通过 `wiki-维基/ai-index.md`、`ai-overview.md`、`ai-log.md`、`ai-purpose.md`
+  和页面本身查看，不需要浏览器界面。
+
+**后果**
+
+- 审核通过只能由 Agent 调用 `wiki_apply_proposal` 完成；
+- 页面浏览依赖 vault（Obsidian 或任何 Markdown 编辑器）；
+- 检索面板仍是可选的原文检索入口，不涉及 Wiki 数据。
