@@ -191,8 +191,9 @@ def validate_page_frontmatter(
 ) -> dict[str, Any]:
     """校验 vault 必需字段；默认同时校验 wiki 追加字段并强制 ``type=permanent``。
 
-    返回浅拷贝后的 data；不修改入参。``require_wiki=False`` 时只校验 vault 契约，
-    供普通 Markdown 页面复用。
+    可选字段 ``sources``（``list[str]``，可为空）出现时校验为字符串列表，
+    不出现时不强制。返回浅拷贝后的 data；不修改入参。``require_wiki=False``
+    时只校验 vault 契约，供普通 Markdown 页面复用。
     """
     if not isinstance(data, Mapping):
         raise FrontmatterValidationError(["frontmatter 顶层必须是映射"])
@@ -209,6 +210,9 @@ def validate_page_frontmatter(
         errors.append("created 缺失")
     elif not _is_valid_date(created):
         errors.append("created 必须是 YYYY-MM-DD 日期")
+
+    if "sources" in data:
+        _require_string_list(data, "sources", errors)
 
     if require_wiki:
         _require_nonempty_string(data, "page_id", errors)
