@@ -1768,6 +1768,16 @@ def apply_proposal(
         if page is None or revision is None:  # pragma: no cover - 防御性分支
             raise WikiServiceError("提案已应用但缺少页面或修订信息")
 
+        # 审核通过即发布：正文型提案不携带 frontmatter，页面仍是 draft。
+        # 这里把 create_page/update_page 的页面推进到 published，后续才会入索引。
+        if str(result.proposal.proposal_type) in ("create_page", "update_page") and str(
+            page.status
+        ) in ("draft", "review"):
+            pages_repo.update_page(connection, page.page_id, status="published")
+            refreshed = pages_repo.get_page(connection, page.page_id)
+            if refreshed is not None:
+                page = refreshed
+
         warnings: list[str] = []
 
         # 1) 重建导航（purpose/index/overview），失败只告警。

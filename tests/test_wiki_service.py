@@ -528,6 +528,34 @@ class TestCreateAndReview(WikiServiceTestBase):
         self.assertEqual(updated.body, "# 发布正文\n")
         self.assertEqual(self.index_mock.call_count, 1)
 
+    def test_apply_body_only_update_publishes_draft(self):
+        page = self.make_page(
+            "正文型提案页面",
+            status="draft",
+            slug="body-only-publish",
+            body="草稿正文\n",
+        )
+        proposal = service.propose_update(
+            page.page_id,
+            "# 审核后的正文\n",
+            "正文型提案，不带 frontmatter",
+            page.current_revision_id,
+            config=self.config,
+            conn=self.conn,
+        )
+        applied = service.apply_proposal(
+            proposal["proposal_id"],
+            "approve",
+            config=self.config,
+            conn=self.conn,
+        )
+        self.assertTrue(applied["ok"])
+        self.assertEqual(applied["page_status"], "published")
+        updated = self.store.read_page(page.page_id)
+        self.assertEqual(str(updated.page.status), "published")
+        self.assertEqual(updated.body, "# 审核后的正文\n")
+        self.assertEqual(self.index_mock.call_count, 1)
+
     def test_apply_reject_does_not_change_page(self):
         page = self.make_page(
             "拒绝页面",
