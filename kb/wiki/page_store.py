@@ -509,11 +509,24 @@ class PageStore:
         *,
         source_proposal_id: str | None = None,
         change_reason: str = "",
+        target_status: str | None = None,
     ) -> UpdateResult:
+        """更新页面正文/frontmatter 并写入新修订。
+
+        ``target_status`` 为本次更新要落盘的目标状态（默认沿用现有状态；完整
+        文档提供的 status 会被它覆盖）。审核通过提案时传入 ``published``，
+        使 status 与内容、revision_id、updated、content_sha256 在同一次原子
+        写中完成，并在同一事务内重建该页出链（反链随之变化）。
+        """
         if not isinstance(content, str):
             raise PageValidationError("content 必须是字符串")
         if not isinstance(expected_revision_id, str):
             raise PageValidationError("expected_revision_id 必须是字符串")
+        if target_status is not None:
+            if not isinstance(target_status, str) or target_status not in C.PAGE_STATUSES:
+                raise PageValidationError(
+                    f"未知 target_status: {target_status!r}"
+                )
         page = pages_repo.get_page(self.conn, page_id)
         if page is None:
             raise PageNotFoundError(f"页面不存在: {page_id}")
@@ -597,6 +610,7 @@ class PageStore:
                         content,
                         revision_id=new_revision_id,
                         updated=now,
+                        target_status=target_status,
                     )
                     rendered = render_frontmatter(frontmatter, body)
                     digest = content_sha256(rendered)
@@ -631,6 +645,7 @@ class PageStore:
                         new_revision_id,
                         status=status,
                         updated_at=now,
+                        title=frontmatter["title"],
                     )
                     updated_page = pages_repo.get_page(self.conn, page_id)
                     assert updated_page is not None
@@ -711,13 +726,18 @@ class PageStore:
         *,
         revision_id: str,
         updated: str,
+        target_status: str | None = None,
     ) -> tuple[dict[str, Any], str, str]:
         """把更新输入适配为 frontmatter + body。
 
         - ``new_content`` 以 ``---`` 开头时视为完整文档，frontmatter 必须合法且
           page_id/slug/page_type 与库中记录一致；
-        - 否则视为 body，保留磁盘上现有 frontmatter（title/tags/summary/aliases/
-          created），status 沿用数据库当前值。
+        - 否则视为 body，保留磁盘上现有 frontmatter。
+
+        两种输入都以现有/提供的 frontmatter 为基底，只覆盖 wiki 管理字段
+        （page_id/slug/page_type/status/aliases/revision_id/updated/title/
+        summary/tags/created/type），未知字段（如 cssclasses/cover/rating）
+        原样保留。``target_status`` 非空时覆盖最终 status（审核通过发布）。
         """
         try:
             existing_fm, existing_body = parse_frontmatter(old_content)
@@ -749,10 +769,14 @@ class PageStore:
                         f"更新内容不能修改 {key}（库中={expected!r}, "
                         f"提供={provided_fm.get(key)!r}）"
                     )
-            title = provided_fm["title"]
-            tags = _string_list("tags", provided_fm.get("tags"))
-            summary = provided_fm["summary"]
-            aliases = _string_list("aliases", provided_fm.get("aliases"))
+            # 基底：磁盘现有字段（含未知字段）+ 完整文档提供的字段/未知字段；
+            # 后者覆盖同名值，管理字段随后统一由库值与修订参数覆盖。
+            base = dict(existing_fm)
+            base.update(provided_fm)
+            title = base["title"]
+            tags = _string_list("tags", base.get("tags"))
+            summary = base["summary"]
+            aliases = _string_list("aliases", base.get("aliases"))
             status = provided_fm["status"]
             sources = _string_list(
                 "sources",
@@ -761,6 +785,7 @@ class PageStore:
                 else existing_fm.get("sources"),
             )
         else:
+            base = dict(existing_fm)
             title = existing_fm["title"]
             tags = _string_list("tags", existing_fm.get("tags"))
             summary = existing_fm["summary"]
@@ -769,11 +794,15 @@ class PageStore:
             status = str(page.status)
             sources = _string_list("sources", existing_fm.get("sources"))
 
+        if target_status is not None:
+            status = target_status
+
         created = _format_created(
             existing_fm.get("created")
             or (page.created_at[:10] if page.created_at else None)
         )
-        frontmatter = validate_page_frontmatter(
+        frontmatter = dict(base)
+        frontmatter.update(
             {
                 "title": title,
                 "tags": tags,
@@ -787,9 +816,13 @@ class PageStore:
                 "aliases": aliases,
                 "revision_id": revision_id,
                 "updated": updated,
-                **({"sources": sources} if sources else {}),
             }
         )
+        if sources:
+            frontmatter["sources"] = sources
+        else:
+            frontmatter.pop("sources", None)
+        frontmatter = validate_page_frontmatter(frontmatter)
         return frontmatter, body, str(status)
 
     # ── 读取 ──

@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from kb.wiki import link_index
 from kb.wiki import page_store as page_store_module
 from kb.wiki.config import WikiConfig, WikiPathError
 from kb.wiki.db import connect, run_migrations
@@ -324,6 +325,109 @@ class TestUpdatePage(WikiPageStoreTestBase):
         self.assertEqual(view.frontmatter["summary"], "新的摘要。")
         self.assertEqual(str(view.page.status), "published")
         self.assertEqual(view.body, "# 新标题\n")
+        # 标题是管理字段：DB 同步，链接按新标题解析。
+        self.assertEqual(
+            pages_repo.get_page(self.conn, page.page_id).title, "新标题"
+        )
+
+    def test_target_status_publishes_atomically_with_links(self):
+        target = self.store.create_page(
+            self.make_draft(slug="target-page", status="published")
+        )
+        source = self.store.create_page(
+            self.make_draft(
+                slug="source-page",
+                body="[[target-page]]\n",
+                status="draft",
+            )
+        )
+        self.assertEqual(
+            link_index.outgoing_links(
+                self.conn, source.page_id
+            ),
+            [],
+        )
+
+        result = self.store.update_page(
+            source.page_id,
+            "参见 [[target-page]]。\n",
+            expected_revision_id=source.current_revision_id,
+            commit=False,
+            target_status="published",
+        )
+
+        self.assertEqual(result.status, "updated")
+        self.assertEqual(str(result.page.status), "published")
+        view = self.store.read_page(source.page_id)
+        self.assertEqual(view.frontmatter["status"], "published")
+        self.assertEqual(view.frontmatter["revision_id"], result.revision.revision_id)
+        self.assertEqual(view.content_sha256, result.revision.content_sha256)
+        self.assertEqual(view.revision.revision_id, result.revision.revision_id)
+        import hashlib
+
+        self.assertEqual(
+            result.revision.content_sha256,
+            hashlib.sha256(self.read_bytes(self.page_path(source))).hexdigest(),
+        )
+        links = link_index.outgoing_links(
+            self.conn, source.page_id
+        )
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0].target_page_id, target.page_id)
+        backlinks = link_index.backlinks(
+            self.conn, target.page_id
+        )
+        self.assertEqual([item.source_page_id for item in backlinks], [source.page_id])
+
+    def test_target_status_overrides_full_document_status(self):
+        page = self.store.create_page(self.make_draft(status="published"))
+        view = self.store.read_page(page.page_id)
+        frontmatter = dict(view.frontmatter)
+        frontmatter["status"] = "draft"
+        result = self.store.update_page(
+            page.page_id,
+            render_frontmatter(frontmatter, "完整文档正文\n"),
+            expected_revision_id=page.current_revision_id,
+            commit=False,
+            target_status="published",
+        )
+        self.assertEqual(result.status, "updated")
+        view = self.store.read_page(page.page_id)
+        self.assertEqual(view.frontmatter["status"], "published")
+        self.assertEqual(str(view.page.status), "published")
+
+    def test_update_preserves_unknown_frontmatter_fields(self):
+        page = self.store.create_page(self.make_draft())
+        view = self.store.read_page(page.page_id)
+        frontmatter = dict(view.frontmatter)
+        frontmatter["cssclasses"] = ["wide", "cards"]
+        frontmatter["cover"] = "assets/cover.png"
+        frontmatter["rating"] = 5
+        first = self.store.update_page(
+            page.page_id,
+            render_frontmatter(frontmatter, "第一版\n"),
+            expected_revision_id=page.current_revision_id,
+            commit=False,
+        )
+        self.assertEqual(first.status, "updated")
+        view = self.store.read_page(page.page_id)
+        self.assertEqual(view.frontmatter["cssclasses"], ["wide", "cards"])
+        self.assertEqual(view.frontmatter["cover"], "assets/cover.png")
+        self.assertEqual(view.frontmatter["rating"], 5)
+
+        second = self.store.update_page(
+            page.page_id,
+            "第二版正文\n",
+            expected_revision_id=view.revision.revision_id,
+            commit=False,
+        )
+        self.assertEqual(second.status, "updated")
+        view = self.store.read_page(page.page_id)
+        self.assertEqual(view.body, "第二版正文\n")
+        self.assertEqual(view.frontmatter["cssclasses"], ["wide", "cards"])
+        self.assertEqual(view.frontmatter["cover"], "assets/cover.png")
+        self.assertEqual(view.frontmatter["rating"], 5)
+        self.assertEqual(view.frontmatter["title"], "城市洪涝")
 
     def test_stale_expected_revision_rejected(self):
         page = self.store.create_page(self.make_draft())

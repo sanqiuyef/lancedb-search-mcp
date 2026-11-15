@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from kb.wiki.config import WikiConfig
 from kb.wiki.db import connect, run_migrations
 from kb.wiki.evidence import quote_sha256
+from kb.wiki import link_index
 from kb.wiki.markdown import render_frontmatter
 from kb.wiki.page_store import PageDraft, PageStore
 from kb.wiki.repositories import jobs as jobs_repo
@@ -264,7 +265,35 @@ class TestValidateWikiCLI(WikiOpsTestBase):
         self.assertEqual(code, 0)
         self.assertIn("# Wiki 校验报告", stdout)
         self.assertIn("未发现问题", stdout)
+        self.assertIn("## 链接重建", stdout)
+        self.assertIn("未执行", stdout)
         self.assertIn("未完成写入日志", stdout)
+
+    def test_rebuild_links_flag_restores_page_links(self):
+        target = self.create_page("target-page")
+        source = self.create_page(
+            "source-page", body="参见 [[target-page]]。\n"
+        )
+        self.conn.execute("DELETE FROM page_links")
+        self.assertEqual(
+            link_index.outgoing_links(self.conn, source.page_id), []
+        )
+
+        code, stdout, _stderr = self.run_cli("--json", "--rebuild-links")
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["link_rebuild"]["links"], 1)
+        self.assertEqual(payload["link_rebuild"]["broken"], 0)
+        links = link_index.outgoing_links(self.conn, source.page_id)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0].target_page_id, target.page_id)
+        self.assertEqual(
+            [item.source_page_id for item in link_index.backlinks(
+                self.conn, target.page_id
+            )],
+            [source.page_id],
+        )
 
 
 class TestQualityReport(WikiOpsTestBase):
@@ -542,14 +571,16 @@ class TestRebuildMetadata(WikiOpsTestBase):
         data.update(overrides)
         return data
 
-    def write_page(self, slug, page_id, revision_id, **overrides):
+    def write_page(
+        self, slug, page_id, revision_id, body="正文。\n", **overrides
+    ):
         directory = self.config.page_type_dir("concept")
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"{slug}.md")
         data = self.frontmatter(slug, page_id, revision_id, **overrides)
         if page_id is None:
             data.pop("page_id", None)
-        content = render_frontmatter(data, "正文。\n")
+        content = render_frontmatter(data, body)
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
         return path
@@ -650,6 +681,43 @@ class TestRebuildMetadata(WikiOpsTestBase):
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM page_revisions").fetchone()[0],
             revisions_after_apply,
+        )
+
+    def test_apply_rebuilds_links_for_imported_pages(self):
+        self.write_page(
+            "link-source",
+            "01JABCDEFGHJKMNPQRSTVWXYZ9",
+            "01JABCDEFGHJKMNPQRSTVWXYZB",
+            body="参见 [[link-target]]。\n",
+        )
+        self.write_page(
+            "link-target",
+            "01JABCDEFGHJKMNPQRSTVWXYZA",
+            "01JABCDEFGHJKMNPQRSTVWXYZC",
+            body="目标页面。\n",
+        )
+
+        report = rebuild_wiki_metadata.rebuild(
+            self.conn, self.config, apply=True
+        )
+
+        self.assertEqual(len(report["registered"]), 2)
+        self.assertIsNotNone(report["link_rebuild"])
+        self.assertEqual(report["link_rebuild"]["links"], 1)
+        self.assertEqual(report["link_rebuild"]["broken"], 0)
+        links = link_index.outgoing_links(
+            self.conn, "01JABCDEFGHJKMNPQRSTVWXYZ9"
+        )
+        self.assertEqual(len(links), 1)
+        self.assertEqual(
+            links[0].target_page_id, "01JABCDEFGHJKMNPQRSTVWXYZA"
+        )
+        backlinks = link_index.backlinks(
+            self.conn, "01JABCDEFGHJKMNPQRSTVWXYZA"
+        )
+        self.assertEqual(
+            [item.source_page_id for item in backlinks],
+            ["01JABCDEFGHJKMNPQRSTVWXYZ9"],
         )
 
     def test_cli_json_dry_run_and_apply(self):

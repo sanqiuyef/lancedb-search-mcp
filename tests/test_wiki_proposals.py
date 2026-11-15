@@ -6,19 +6,26 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from kb.wiki.config import WikiConfig
 from kb.wiki.db import connect, run_migrations
 from kb.wiki.markdown import render_frontmatter
-from kb.wiki.page_store import PageDraft, PageStore, PageValidationError
+from kb.wiki.page_store import (
+    GitCommitError,
+    PageDraft,
+    PageStore,
+    PageValidationError,
+)
 from kb.wiki.proposals import (
     ProposalError,
     ProposalNotFoundError,
     ProposalService,
 )
 from kb.wiki.repositories import pages as pages_repo
+from kb.wiki.repositories import proposals as proposals_repo
 
 
 class WikiProposalTestBase(unittest.TestCase):
@@ -62,15 +69,22 @@ class WikiProposalTestBase(unittest.TestCase):
             check=False,
         )
 
-    def create_page(self, body="旧内容\n"):
+    def create_page(
+        self,
+        body="旧内容\n",
+        *,
+        status="published",
+        slug="proposal-page",
+        title="提案页面",
+    ):
         return self.store.create_page(
             PageDraft(
-                title="提案页面",
+                title=title,
                 page_type="concept",
                 summary="用于提案测试的页面。",
                 body=body,
-                slug="proposal-page",
-                status="published",
+                slug=slug,
+                status=status,
             ),
             commit=False,
         )
@@ -398,12 +412,236 @@ class TestApplyProposal(WikiProposalTestBase):
             self.store.read_page(page.page_id).body, "旧内容\n"
         )
         updated = self.service.get_proposal(proposal.proposal_id).record
-        self.assertEqual(str(updated.status), "approved")
+        # P1-2：apply 失败不能永久停在 approved；恢复为可重试的 pending。
+        self.assertEqual(str(updated.status), "pending")
         self.assertIn("slug", updated.error_message)
+        self.assertEqual(
+            [item.proposal_id for item in self.service.review_queue()],
+            [proposal.proposal_id],
+        )
         self.assertEqual(
             pages_repo.get_page(self.conn, page.page_id).current_revision_id,
             page.current_revision_id,
         )
+
+
+class TestApplyPublishingAndFrontmatter(WikiProposalTestBase):
+    def test_approve_publishes_through_page_store_atomically(self):
+        target = self.create_page(
+            body="目标正文\n", slug="target-page", title="目标页面"
+        )
+        source = self.create_page(
+            body="[[target-page]]\n", status="draft", slug="source-page"
+        )
+        proposal = self.create_update_proposal(
+            source,
+            "# 新正文\n\n参见 [[target-page]]。\n",
+        )
+
+        decision = self.service.apply_proposal(
+            proposal.proposal_id, approve=True, actor="human"
+        )
+
+        self.assertTrue(decision.ok)
+        self.assertEqual(decision.status, "applied")
+        self.assertEqual(str(decision.page.status), "published")
+        view = self.store.read_page(source.page_id)
+        self.assertEqual(str(view.page.status), "published")
+        self.assertEqual(view.frontmatter["status"], "published")
+        self.assertEqual(
+            view.frontmatter["revision_id"], decision.revision.revision_id
+        )
+        self.assertEqual(
+            view.content_sha256, decision.revision.content_sha256
+        )
+        self.assertEqual(view.body, "# 新正文\n\n参见 [[target-page]]。\n")
+        links = view.links
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0].target_page_id, target.page_id)
+        backlinks = self.store.read_page(target.page_id).backlinks
+        self.assertEqual([item.source_page_id for item in backlinks], [source.page_id])
+
+    def test_full_document_proposal_preserves_unknown_frontmatter(self):
+        page = self.create_page()
+        frontmatter = dict(self.store.read_page(page.page_id).frontmatter)
+        frontmatter["cssclasses"] = ["wide"]
+        frontmatter["cover"] = "assets/cover.png"
+        frontmatter["rating"] = 4
+        proposal = self.create_update_proposal(
+            page, render_frontmatter(frontmatter, "新正文\n")
+        )
+
+        decision = self.service.apply_proposal(
+            proposal.proposal_id, approve=True, actor="human"
+        )
+
+        self.assertTrue(decision.ok)
+        view = self.store.read_page(page.page_id)
+        self.assertEqual(view.frontmatter["cssclasses"], ["wide"])
+        self.assertEqual(view.frontmatter["cover"], "assets/cover.png")
+        self.assertEqual(view.frontmatter["rating"], 4)
+        self.assertEqual(view.body, "新正文\n")
+
+
+class TestApplyFailureRecovery(WikiProposalTestBase):
+    def test_update_page_exception_restores_pending_and_retry(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(page, "# 重试正文\n")
+
+        with mock.patch.object(
+            self.store, "update_page", side_effect=RuntimeError("update boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.service.apply_proposal(
+                    proposal.proposal_id, approve=True, actor="human"
+                )
+
+        restored = self.service.get_proposal(proposal.proposal_id).record
+        self.assertEqual(str(restored.status), "pending")
+        self.assertIn("update boom", restored.error_message)
+        self.assertEqual(self.store.read_page(page.page_id).body, "旧内容\n")
+        self.assertEqual(
+            [item.proposal_id for item in self.service.review_queue()],
+            [proposal.proposal_id],
+        )
+
+        retried = self.service.apply_proposal(
+            proposal.proposal_id, approve=True, actor="human"
+        )
+        self.assertTrue(retried.ok)
+        self.assertEqual(retried.status, "applied")
+        self.assertEqual(self.store.read_page(page.page_id).body, "# 重试正文\n")
+
+    def test_git_commit_failure_restores_pending_and_retry(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(page, "# git 重试\n")
+        real_commit = PageStore.git_commit_page
+        calls = {"count": 0}
+
+        def flaky_commit(store_self, relative_path, message):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise GitCommitError("git boom")
+            return real_commit(store_self, relative_path, message)
+
+        with mock.patch.object(PageStore, "git_commit_page", new=flaky_commit):
+            first = self.service.apply_proposal(
+                proposal.proposal_id, approve=True, actor="human"
+            )
+
+            self.assertFalse(first.ok)
+            self.assertEqual(first.status, "pending")
+            self.assertIn("git boom", first.message)
+            restored = self.service.get_proposal(proposal.proposal_id).record
+            self.assertEqual(str(restored.status), "pending")
+            current = pages_repo.get_page(self.conn, page.page_id)
+            self.assertEqual(
+                restored.expected_revision_id, current.current_revision_id
+            )
+
+            retried = self.service.apply_proposal(
+                proposal.proposal_id, approve=True, actor="human"
+            )
+        self.assertTrue(retried.ok)
+        self.assertEqual(retried.status, "applied")
+        self.assertEqual(calls["count"], 2)
+        view = self.store.read_page(page.page_id)
+        self.assertEqual(view.body, "# git 重试\n")
+        self.assertEqual(view.revision.revision_no, 3)
+
+    def test_status_update_failure_restores_pending_and_retry(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(page, "# 状态重试\n")
+        real_update = proposals_repo.update_proposal
+
+        def flaky_update(conn, proposal_id, *, expected_status=None, **fields):
+            if fields.get("status") == "applied":
+                raise RuntimeError("status boom")
+            return real_update(
+                conn, proposal_id, expected_status=expected_status, **fields
+            )
+
+        with mock.patch.object(
+            proposals_repo, "update_proposal", side_effect=flaky_update
+        ):
+            with self.assertRaises(RuntimeError):
+                self.service.apply_proposal(
+                    proposal.proposal_id, approve=True, actor="human"
+                )
+
+        restored = self.service.get_proposal(proposal.proposal_id).record
+        self.assertEqual(str(restored.status), "pending")
+        self.assertIn("status boom", restored.error_message)
+
+        retried = self.service.apply_proposal(
+            proposal.proposal_id, approve=True, actor="human"
+        )
+        self.assertTrue(retried.ok)
+        self.assertEqual(retried.status, "applied")
+
+
+class TestProposalStatusCas(WikiProposalTestBase):
+    def test_terminal_status_cannot_be_overwritten(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(page, "# 已应用\n")
+        decision = self.service.apply_proposal(
+            proposal.proposal_id, approve=True, actor="human"
+        )
+        self.assertTrue(decision.ok)
+
+        self.assertEqual(
+            proposals_repo.update_proposal(
+                self.conn, proposal.proposal_id, status="pending"
+            ),
+            0,
+        )
+        self.assertEqual(
+            proposals_repo.update_proposal(
+                self.conn, proposal.proposal_id, status="rejected"
+            ),
+            0,
+        )
+        self.assertEqual(
+            str(self.service.get_proposal(proposal.proposal_id).record.status),
+            "applied",
+        )
+
+        # 非状态字段仍可更新，但不会把终态改回去。
+        self.assertEqual(
+            proposals_repo.update_proposal(
+                self.conn, proposal.proposal_id, error_message="audit note"
+            ),
+            1,
+        )
+        record = self.service.get_proposal(proposal.proposal_id).record
+        self.assertEqual(str(record.status), "applied")
+        self.assertEqual(record.error_message, "audit note")
+
+    def test_concurrent_cancel_after_approval_cannot_win(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(page, "# 并发\n")
+        original_update = self.store.update_page
+
+        def racing_update(*args, **kwargs):
+            cancel = self.service.cancel_proposal(
+                proposal.proposal_id, actor="human"
+            )
+            self.assertFalse(cancel.ok)
+            self.assertEqual(cancel.status, "approved")
+            return original_update(*args, **kwargs)
+
+        with mock.patch.object(self.store, "update_page", side_effect=racing_update):
+            decision = self.service.apply_proposal(
+                proposal.proposal_id, approve=True, actor="human"
+            )
+
+        self.assertTrue(decision.ok)
+        self.assertEqual(decision.status, "applied")
+        self.assertEqual(
+            str(self.service.get_proposal(proposal.proposal_id).record.status),
+            "applied",
+        )
+        self.assertEqual(self.store.read_page(page.page_id).body, "# 并发\n")
 
 
 if __name__ == "__main__":

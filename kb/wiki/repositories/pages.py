@@ -142,13 +142,16 @@ def set_current_revision(
     revision_id: str | None,
     status: str | None = None,
     updated_at: str | None = None,
+    title: str | None = None,
 ) -> int:
-    """更新 current_revision_id（可选同时更新 status/updated_at）。"""
+    """更新 current_revision_id（可选同时更新 status/updated_at/title）。"""
     fields: dict[str, Any] = {"current_revision_id": revision_id}
     if status is not None:
         fields["status"] = status
     if updated_at is not None:
         fields["updated_at"] = updated_at
+    if title is not None:
+        fields["title"] = title
     return update_page(conn, page_id, **fields)
 
 
