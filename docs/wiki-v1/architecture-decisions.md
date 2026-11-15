@@ -14,6 +14,7 @@
 | ADR-005 | `wiki_pages` 是可重建的派生索引 | 已确定（Phase 4 实施） |
 | ADR-006 | `WIKI_ENABLED` 默认关闭 | 已实施 |
 | ADR-007 | Wiki 不提供专用 UI，内容全部落在 vault Markdown | 已实施（2026-11-15 撤回 Wiki UI） |
+| ADR-008 | vault 是唯一向量化来源 | 已实施（2026-11-15） |
 
 ---
 
@@ -233,3 +234,49 @@ Wiki 会写入用户 vault 与本地 SQLite，并可能触发 Git 提交。默�
 - 审核通过只能由 Agent 调用 `wiki_apply_proposal` 完成；
 - 页面浏览依赖 vault（Obsidian 或任何 Markdown 编辑器）；
 - 检索面板仍是可选的原文检索入口，不涉及 Wiki 数据。
+
+---
+
+## ADR-008：vault 是唯一向量化来源
+
+**背景**
+
+2026-11-15 之前，`my_docs` 可以直接索引任意目录、PDF 文本层甚至 URL 派生的
+`网页-<host>-<hash>` source；同一文件既可能以 basename 入库，也可能以绝对路径或
+相对路径入库，Wiki 的 `documents.canonical_uri` / `chunk_refs.source_value` 与
+LanceDB source 因此容易漂移。vault 已经是用户维护 Markdown 的工作区，适合作为
+所有内容的统一落点与身份基准。
+
+**决策**
+
+- 所有入库内容先成为 vault 内的 Markdown/文本，`my_docs.source` 只能是 vault
+  相对路径；不再索引 vault 外文件或 PDF 文本层；
+- 二进制转换边界固定：PDF 走本地 MinerU；`.docx/.pptx/.xlsx` 走 docling，
+  失败回退 markitdown；网页正文写成
+  `00-inbox-收件箱/from-web-网页/<safe-title>-<sha1(canonical)[:8]>.md`；
+- 转换产物落点：paper 类进 `08-literature-文献/papers-论文全文/`，其他进
+  `raw-素材/converted-转换/`；
+- `add_documents` 只接受 vault 内目录，`reindex_all=True` 只接受 vault 根且扫描
+  结果非空；vault 外文件统一用 `add_single_document` 自动转换/复制进 vault；
+- 批量脚本 `rebuild_from_sources.py` 只接受 vault 内目录，遇到二进制先调用
+  `vault_source.prepare_markdown`，再按生成的 vault md 分块；
+  `pdf_pipeline.py` 的 md 输出目录也必须在 vault 内；
+- 历史 basename source 用 `scripts/relink_sources_to_vault.py` 原地重指向，
+  只更新 source，不删除 LanceDB 行。
+
+**与 Wiki 的关系**
+
+- Wiki SQLite 是元数据/证据层，不是第二个向量化来源。`documents.canonical_uri`
+  与 `chunk_refs.source_value` 必须与 LanceDB 的 vault 相对 source 一致；
+- 重指向脚本在 `--apply` 时同步更新 `documents`（保留 `document_id`）与
+  `chunk_refs.source_value`；无匹配来源可用 `--mark-missing` 标记
+  `documents.status='missing'`，不删除历史修订与证据；
+- Wiki 页面正文仍只存在于 vault Markdown；页面索引是可重建派生数据。
+
+**后果**
+
+- PDF 入库强依赖本地 MinerU，转换失败即失败，不再静默产出压平公式的文本；
+- 转换产物会写入 vault，需要用户接受 `08-literature-文献/`、`raw-素材/` 与
+  `00-inbox-收件箱/` 三个固定目录；
+- 旧库若仍有 vault 外 source，必须先重指向或重新入库；脚本默认 dry-run，
+  避免误改。

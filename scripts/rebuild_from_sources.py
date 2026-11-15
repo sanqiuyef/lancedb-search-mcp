@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
-"""知识库批量重建脚本：扫描指定目录，解析 → 分块 → 批量嵌入 → 写入单库。
+"""知识库批量重建脚本：扫描 vault 内目录，准备 Markdown → 分块 → 批量嵌入。
 
 单库不分区的扁平结构（2026-10-02 起）：直接给目录，全部文档进同一个池子。
-流程：扫描目录 → 解析（含 OCR 链）→ 分块 → 批量嵌入 → 写表（checkpoint 断点续传）
+来源规则（2026-11-15 起）：只接受 vault 内目录；source 一律为 vault 相对路径。
+PDF/docx/pptx/xlsx 先经 ``kb.vault_source.prepare_markdown`` 转成 vault 内
+Markdown（PDF 走 MinerU，Office 走 docling → markitdown），再按 Markdown 入库，
+不再把 PDF 文本层直接写库。
+流程：扫描目录 → 准备/转换来源 → 分块 → 批量嵌入 → 写表（checkpoint 断点续传）
 → 建向量/FTS 索引 → 输出报告。
 
 用法（在项目根目录）：
-  D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py --dry-run D:\\cherry-workplace\\通用
-  D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py D:\\dir1 D:\\dir2
+  D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py --dry-run "<vault>/raw-素材"
+  D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py "<vault>/dir1" "<vault>/dir2"
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from kb import config as cfg  # noqa: E402
 from kb import ingest as kb_ingest  # noqa: E402
 from kb import schema as kb_schema  # noqa: E402
+from kb import vault_source  # noqa: E402
 
 STATE_FILENAME = "rebuild_state.json"
 
@@ -52,6 +57,30 @@ def save_state(state_path: str, state: dict) -> None:
     os.replace(tmp, state_path)
 
 
+def _is_binary(filepath: str) -> bool:
+    return Path(filepath).suffix.lower() in vault_source.BINARY_EXTENSIONS
+
+
+def _reusable_generated(filepath: str) -> list[str]:
+    """二进制文件已有、且由本工具为同一原文件生成的 vault Markdown。"""
+    return vault_source.generated_markdown_candidates(
+        filepath, kb_ingest.guess_category(filepath))
+
+
+def _vault_roots_error(roots: list[str]) -> list[str]:
+    return [root for root in roots if not vault_source.is_under_vault(root)]
+
+
+def _print_outside_vault(roots: list[str]) -> None:
+    print(
+        "[ERROR] 只接受 vault 内目录；外部文件请用 add_single_document 或先导入 vault",
+        file=sys.stderr,
+    )
+    print(f"        vault 根: {vault_source.vault_root()}", file=sys.stderr)
+    for root in roots:
+        print(f"        不在 vault 内: {root}", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="从源目录重建知识库（单库扁平结构）")
     parser.add_argument("dirs", nargs="+", help="要扫描入库的源目录（可多个）")
@@ -69,23 +98,50 @@ def main() -> int:
     if bad:
         print(f"目录不存在: {bad}")
         return 1
+    outside = _vault_roots_error(roots)
+    if outside:
+        _print_outside_vault(outside)
+        return 1
 
     db_path = cfg.resolve_db_path()
     print(f"目标库: {db_path}")
     print(f"源目录: {roots}")
+    print(f"vault 根: {vault_source.vault_root()}")
 
     if args.dry_run:
         files = [fp for root in roots for fp in kb_ingest.scan_files(root)]
+        if args.limit_files:
+            files = files[: args.limit_files]
         total_chars = 0
         empty = 0
+        pending_conversions = 0
+        generated_skip: set[str] = set()
+        reusable: dict[str, str] = {}
         for fp in files:
-            text = kb_ingest.extract_text(fp)
+            if not _is_binary(fp):
+                continue
+            generated = _reusable_generated(fp)
+            if generated:
+                reusable[fp] = generated[0]
+                generated_skip.add(vault_source._norm_path(generated[0]))
+            else:
+                pending_conversions += 1
+        for fp in files:
+            if _is_binary(fp):
+                if fp not in reusable:
+                    continue
+                text = kb_ingest.extract_text(reusable[fp])
+            else:
+                if vault_source._norm_path(fp) in generated_skip:
+                    continue
+                text = kb_ingest.extract_text(fp)
             if not text or len(text) < 20:
                 empty += 1
                 continue
             total_chars += len(text)
         est_chunks = total_chars // cfg.CHUNK_SIZE + len(files)
         print(f"  源文件 {len(files)} 个 | 无文本 {empty} 个 | "
+              f"待转换二进制 {pending_conversions} 个 | "
               f"约 {total_chars} 字符 → 预估 ~{est_chunks} chunks")
         print("（dry-run 结束，未写入任何数据）")
         return 0
@@ -141,22 +197,58 @@ def main() -> int:
         buffer.clear()
         buffer_counts.clear()
 
-    for i, (root, fp) in enumerate(files, 1):
+    # 先处理二进制：统一经 vault_source 转换/复用 vault 内 Markdown，
+    # 后续只按生成的 md 分块，绝不直接写入 PDF 文本层。
+    generated_skip: set[str] = set()
+    failed_md_paths: set[str] = set()
+    tasks: list[tuple[str, str, str, str]] = []  # (checkpoint key, 文本文件, source, category)
+
+    for root, fp in files:
+        if not _is_binary(fp):
+            continue
+        key = f"{root}::{fp}"
+        cached = state["files"].get(key)
+        if cached and cached.get("status") == "done":
+            done_chunks += cached.get("chunks", 0)
+            for old_md in _reusable_generated(fp):
+                generated_skip.add(vault_source._norm_path(old_md))
+            continue
+        try:
+            prepared = vault_source.prepare_markdown(
+                fp, category_hint=kb_ingest.guess_category(fp))
+            generated_skip.add(vault_source._norm_path(prepared.md_path))
+            tasks.append(
+                (key, prepared.md_path, prepared.source, prepared.category))
+        except Exception as e:
+            failed.append(f"{os.path.basename(fp)}（转换失败: {e}）")
+            state["files"][key] = {"status": "failed", "error": str(e)[:200]}
+            for old_md in _reusable_generated(fp):
+                failed_md_paths.add(vault_source._norm_path(old_md))
+
+    # 再处理 vault 内文本：source 取 vault 相对路径；二进制生成的 md、
+    # 转换失败原文件对应的旧 md 都在同一次扫描中跳过，避免重复切片。
+    for root, fp in files:
+        if _is_binary(fp):
+            continue
+        norm_fp = vault_source._norm_path(fp)
+        if norm_fp in generated_skip or norm_fp in failed_md_paths:
+            continue
         key = f"{root}::{fp}"
         cached = state["files"].get(key)
         if cached and cached.get("status") == "done":
             done_chunks += cached.get("chunks", 0)
             continue
+        tasks.append(
+            (key, fp, vault_source.rel_to_vault(fp), kb_ingest.guess_category(fp)))
+
+    for i, (key, text_path, source, category) in enumerate(tasks, 1):
         try:
-            text = kb_ingest.extract_text(fp)
+            text, is_md = kb_ingest.extract_content(text_path)
             if not text or len(text) < 20:
                 skipped += 1
                 state["files"][key] = {"status": "empty"}
                 continue
-            rel_path = os.path.relpath(fp, root)
-            chunks = kb_ingest.chunk_text(text, rel_path)
-            # 类别按完整路径推断（source 存的是相对路径，缺目录信息）
-            category = kb_ingest.guess_category(os.path.join(root, rel_path))
+            chunks = kb_ingest.chunk_text(text, source, is_md, category)
             for ch in chunks:
                 if category:
                     ch["category"] = category
@@ -165,14 +257,14 @@ def main() -> int:
             buffer.extend(chunks)
             buffer_counts[key] = buffer_counts.get(key, 0) + len(chunks)
         except Exception as e:
-            failed.append(f"{os.path.basename(fp)}: {e}")
+            failed.append(f"{os.path.basename(text_path)}: {e}")
             state["files"][key] = {"status": "failed", "error": str(e)[:200]}
         if len(buffer) >= FLUSH_CHUNKS:
             flush_buffer()
         save_state(state_path, state)
-        if i % 50 == 0 or i == len(files):
+        if i % 50 == 0 or i == len(tasks):
             rate = (time.time() - started) / max(i, 1)
-            print(f"  {i}/{len(files)} 文件 | chunks={done_chunks} "
+            print(f"  {i}/{len(tasks)} 文件 | chunks={done_chunks} "
                   f"| 失败={len(failed)} | {rate:.2f}s/文件", flush=True)
     flush_buffer()
     report.update({"files": len(files), "chunks": done_chunks,

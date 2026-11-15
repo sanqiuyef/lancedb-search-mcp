@@ -1,23 +1,22 @@
 # -*- coding: utf-8 -*-
 """[自建模块 · 待后期单独优化]
 
-网页抓取入库（ingest_url）：requests 抓取 → BeautifulSoup 剥离标签 → 分块入库。
-同一 canonical URL 重复抓取时先补写新块，成功后再删除不在新 doc_id 集合中的旧块
-（幂等且避免写入失败丢旧数据）；单线程串行、无 JS 渲染。优化方向：反爬重试、
-正文智能抽取、与 web-search-server 抓取链复用。
+网页抓取入库（ingest_url）：requests 抓取 → BeautifulSoup 剥离标签 →
+kb.vault_source.save_web_markdown 写 vault 剪藏 → add_single_document 分块入库。
+网页正文与所有其他来源一样只从 vault Markdown 进入向量库；同一 canonical URL
+重复抓取复用同一快照路径，由 add_single_document 幂等替换切片。
+单线程串行、无 JS 渲染。优化方向：反爬重试、正文智能抽取、与
+web-search-server 抓取链复用。
 """
 
 from __future__ import annotations
 
-import hashlib
-import re
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import requests
 
-from . import config as cfg
 from . import ingest as kb_ingest
-from . import schema as kb_schema
+from . import vault_source
 
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -76,34 +75,6 @@ def _is_tracking_param(segment: str) -> bool:
     return key.startswith("utm_") or key in _TRACKING_PARAMS
 
 
-def _sql_quote(value: str) -> str:
-    return value.replace("'", "''")
-
-
-def _source_for(canonical_url: str) -> str:
-    """canonical URL → source：网页-<清洗后的 host>-<sha1 前 12 位>。"""
-    host = urlsplit(canonical_url).hostname or ""
-    host_part = re.sub(r'[\\/:*?"<>|]', "_", host)[:60]
-    digest = hashlib.sha1(canonical_url.encode("utf-8")).hexdigest()[:12]
-    return f"网页-{host_part}-{digest}"
-
-
-def _existing_doc_ids(table, source: str) -> set[str]:
-    """读取该 source 现有行的 doc_id（旧行可能为空串）。"""
-    where = f"source = '{_sql_quote(source)}'"
-    arrow = table.to_lance().to_table(columns=["doc_id"], filter=where)
-    return {value or "" for value in arrow.column("doc_id").to_pylist()}
-
-
-def _stale_rows_where(source: str, new_doc_ids: set[str]) -> str:
-    """删除该 source 下不属于新 doc_id 集合的旧行；空 doc_id（旧格式）一并清理。"""
-    quoted = ",".join(f"'{_sql_quote(doc_id)}'" for doc_id in sorted(new_doc_ids))
-    return (
-        f"source = '{_sql_quote(source)}' AND "
-        f"(doc_id = '' OR doc_id NOT IN ({quoted}))"
-    )
-
-
 def fetch_page(url: str, timeout: int = 30) -> tuple[str, str]:
     """抓取 URL 并抽取正文，返回 (title, content)。抛异常表示抓取失败。"""
     resp = requests.get(
@@ -129,10 +100,11 @@ def fetch_page(url: str, timeout: int = 30) -> tuple[str, str]:
 
 
 def ingest_url(url: str) -> str:
-    """抓取网页内容并索引到知识库；同一 canonical URL 重复抓取幂等。
+    """抓取网页 → 写 vault 剪藏 Markdown → 按 vault 相对路径入库。
 
-    写入顺序：先补写新 doc_id 的块，add_chunks 成功后才删除旧块——写入失败时
-    旧数据保持原样（宁可重试后多出部分新块，也不丢已有内容）。
+    同一 canonical URL 重复抓取使用同一快照文件，切片由
+    :func:`kb.ingest.add_single_document` 幂等替换，不会产生第二个 source。
+    抓取失败时不会写 vault，也不会改库；快照写入或入库失败会明确返回错误。
     """
     raw = (url or "").strip()
     if not raw.lower().startswith(("http://", "https://")):
@@ -148,43 +120,28 @@ def ingest_url(url: str) -> str:
     if len(content) < 50:
         return f"❌ 页面内容太少，无法索引: {url}"
 
-    source = _source_for(canonical)
-    chunks = kb_ingest._chunk_by_paragraph(content, source)
-    if not chunks:
-        return f"❌ 无法从页面提取有效内容: {url}"
+    try:
+        md_path = vault_source.save_web_markdown(raw, title, content)
+    except Exception as e:
+        return f"❌ 网页快照写入失败: {e}"
+    try:
+        snapshot = vault_source.rel_to_vault(md_path)
+    except (TypeError, ValueError) as e:
+        return f"❌ 网页快照不在 vault 内: {e}"
 
-    for ch in chunks:
-        ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
-        ch["ingested_at"] = kb_ingest.datetime_now_iso()
-    new_doc_ids = {ch["doc_id"] for ch in chunks}
+    try:
+        result = kb_ingest.add_single_document(str(md_path))
+    except Exception as e:
+        return (
+            f"❌ 网页入库失败（快照已保存: {snapshot}）: {e}"
+        )
+    if result.startswith("[ERROR]"):
+        return f"❌ 网页入库失败（快照已保存: {snapshot}）\n{result}"
 
-    with kb_ingest._write_lock:
-        # 检查已有 doc_id → 写入新块 → 清理旧块整段串行，避免与 watcher
-        # 的 update/delete 交错删除对方刚写入的行。
-        table = kb_schema.get_or_create_table()
-        # 只补写库里还没有的块：内容未变的重复抓取不产生重复行。
-        existing_ids = _existing_doc_ids(table, source)
-        pending = [ch for ch in chunks if ch["doc_id"] not in existing_ids]
-        added = kb_ingest.add_chunks(table, pending) if pending else 0
-        # add 成功后才收敛旧行；失败会直接抛出，旧行保持不变。
-        replaced = 0
-        if existing_ids - new_doc_ids:
-            stale = table.delete(_stale_rows_where(source, new_doc_ids))
-            replaced = int(getattr(stale, "num_deleted_rows", 0) or 0)
-        kb_schema.ensure_vector_index(table)
-        kb_schema.ensure_fts_index(table)
-        kb_schema.fold_new_rows(table)
-        kb_schema.update_db_readme()
-    kb_ingest._register_wiki_safely(
-        source,
-        canonical,
-        chunks,
-        str(chunks[0].get("category", "")) if chunks else "",
-    )
     return (
         f"✅ **网页已索引**\n{'─' * 40}\n"
-        f"标题: {title}\nURL: {url}\n"
-        f"文本块: {len(chunks)}\n已入库: {added}\n替换旧块: {replaced}\n"
-        f"知识库总块数: {len(table)}\n"
+        f"标题: {title}\nURL: {url}\ncanonical: {canonical}\n"
+        f"网页快照: {snapshot}\n"
+        f"{result}\n"
         f"💡 用 search_knowledge 搜索此内容。"
     )

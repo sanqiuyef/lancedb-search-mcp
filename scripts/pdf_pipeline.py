@@ -5,26 +5,31 @@
 9256 处 LaTeX 公式、检索实测命中公式原文）：
 
   阶段 1（转换）PDF → Markdown（本地 MinerU pipeline，公式 → LaTeX，图片另存）
-      多 worker 并行；带磁盘缓存（路径+大小+mtime）；产物落盘到 --md-dir；
-      `--resume` 时已存在同名 .md 的文件跳过。
+      多 worker 并行；带磁盘缓存（路径+大小+mtime）；产物必须落盘到 vault 内
+      （默认 `08-literature-文献/papers-论文全文`）；`--resume` 时已存在同名 .md 跳过。
   阶段 2（入库）Markdown → LanceDB（委托 scripts/rebuild_from_sources.py）
       标题感知分块 + 主线程预计算向量 + 按 doc_id 去重 + 向量/FTS 索引维护，
-      自带 checkpoint 断点续传。
+      自带 checkpoint 断点续传；source 为 vault 相对路径。
 
 用法（项目根目录执行）：
-  # 全流程：论文目录 → md 目录 → 向量库
-  python -X utf8 scripts/pdf_pipeline.py "D:\\论文\\文献" --md-dir "D:\\论文\\文献_md" --workers 3
+  # 全流程：论文目录 → vault 论文 Markdown 目录 → 向量库
+  python -X utf8 scripts/pdf_pipeline.py "D:\\论文\\文献" --workers 3
+
+  # 非论文 PDF 指定到 vault 转换目录
+  python -X utf8 scripts/pdf_pipeline.py <目录> --md-dir "<vault>/raw-素材/converted-转换"
 
   # 只转换不入库
-  python -X utf8 scripts/pdf_pipeline.py <目录> --md-dir <md目录> --no-ingest
+  python -X utf8 scripts/pdf_pipeline.py <目录> --no-ingest
 
   # 只看会做什么
   python -X utf8 scripts/pdf_pipeline.py <目录> --dry-run
 
 注意：
+  - 2026-11-15 起 md 输出目录必须在 vault 内，否则拒绝运行；入库统一走
+    rebuild_from_sources.py 的 vault 来源规则；
   - 内容有更新的 PDF 需先用 update_document / delete_documents 处理旧源（增量入库按
     source 判重，同名不会覆盖）；
-  - 阶段 1 需要 .mineru-venv（见 README「启用 PDF 公式解析」）；MinerU 不可用时
+  - 阶段 1 需要 .mineru-venv（见 README「安装 PDF 转换环境」）；MinerU 不可用时
     本脚本直接报错退出（不做静默降级，避免把压平公式入进库）。
 """
 
@@ -45,6 +50,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from kb import config as cfg  # noqa: E402
 from kb import pdf_convert  # noqa: E402
+from kb import vault_source  # noqa: E402
+
+DEFAULT_MD_REL_DIR = ("08-literature-文献", "papers-论文全文")
 
 
 def collect_pdfs(target: Path) -> list[Path]:
@@ -112,7 +120,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="PDF → Markdown → 向量知识库 标准管道")
     ap.add_argument("input", help="PDF 目录或单个 PDF")
     ap.add_argument("--md-dir", default="",
-                    help="Markdown 输出目录（默认：<输入目录>_md）")
+                    help="Markdown 输出目录（必须在 vault 内；默认 "
+                         "<vault>/08-literature-文献/papers-论文全文）")
     ap.add_argument("--workers", type=int, default=3,
                     help="阶段 1 并行 worker 数（实测单实例约 1.8G 显存，8G 卡建议 ≤3）")
     ap.add_argument("--resume", action="store_true", help="阶段 1 跳过已存在的 .md")
@@ -125,8 +134,19 @@ def main() -> int:
     if not target.exists():
         print(f"[ERROR] 输入不存在: {target}", file=sys.stderr)
         return 1
-    md_dir = Path(args.md_dir).resolve() if args.md_dir else \
-        target.with_name(target.stem + "_md" if target.is_file() else target.name + "_md")
+    if args.md_dir:
+        md_dir = Path(args.md_dir).resolve()
+    else:
+        md_dir = Path(vault_source.vault_root()).joinpath(*DEFAULT_MD_REL_DIR)
+    if not vault_source.is_under_vault(md_dir):
+        print(
+            f"[ERROR] Markdown 输出目录必须在 vault 内: {md_dir}\n"
+            f"        vault 根: {vault_source.vault_root()}\n"
+            "        非论文 PDF 可用 --md-dir "
+            f"\"<vault>/{cfg.VAULT_CONVERT_DIR}\"",
+            file=sys.stderr,
+        )
+        return 1
 
     pdfs = collect_pdfs(target)
     if not pdfs:
@@ -134,8 +154,8 @@ def main() -> int:
         return 1
     if not pdf_convert.mineru_available():
         print(f"[ERROR] MinerU 不可用：{cfg.MINERU_BIN}\n"
-              f"        请按 README「启用 PDF 公式解析」安装 .mineru-venv"
-              f"（或用 LANCEDB_MINERU_BIN 指定路径），避免公式被降级压平。",
+              f"        请按 README「安装 PDF 转换环境」安装 .mineru-venv"
+              f"（或用 LANCEDB_MINERU_BIN 指定路径）；PDF 入库不再回退文本层。",
               file=sys.stderr)
         return 1
 
