@@ -228,8 +228,36 @@ def _scan_images(scan_dir: str) -> List[str]:
     return sorted(str(p) for p in root.rglob("*") if p.suffix.lower() in _IMAGE_EXT and p.is_file())
 
 
+def plan_image_ingest(
+    existing: dict[str, int],
+    scanned: list[tuple[str, int]],
+) -> dict:
+    """把扫描结果 (路径, mtime_ns) 分类为 new/changed/skipped/duplicates。
+
+    同批扫描中重复出现的路径只按首次出现分类，后续计入 duplicates。
+    """
+    plan = {"new": [], "changed": [], "skipped": [], "duplicates": []}
+    seen: set[str] = set()
+    for path, mtime_ns in scanned:
+        if path in seen:
+            plan["duplicates"].append(path)
+            continue
+        seen.add(path)
+        previous = existing.get(path)
+        if previous is None:
+            plan["new"].append(path)
+        elif previous != mtime_ns:
+            plan["changed"].append(path)
+        else:
+            plan["skipped"].append(path)
+    return plan
+
+
 def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | None = None) -> str:
-    """扫描目录向量化入库；按 (image_path, mtime_ns) 增量跳过未变更图片。"""
+    """扫描目录向量化入库；按 (image_path, mtime_ns) 增量跳过未变更图片。
+
+    mtime 变化的图片先按 image_path 删除旧行再插入，避免同一路径留下新旧两行。
+    """
     scan_dir = scan_dir or cfg.IMAGE_SCAN_DIR_DEFAULT
     paths = _scan_images(scan_dir)
     if not paths:
@@ -245,11 +273,15 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
         existing = dict(zip(arrow.column("image_path").to_pylist(),
                             arrow.column("mtime_ns").to_pylist()))
 
-    todo = [p for p in paths if existing.get(p) != os.stat(p).st_mtime_ns]
-    skipped = len(paths) - len(todo)
+    scanned = [(path, os.stat(path).st_mtime_ns) for path in paths]
+    plan = plan_image_ingest(existing, scanned)
+    todo = plan["new"] + plan["changed"]
+    skipped = len(plan["skipped"])
     if not todo:
         return f"✅ 无新增/变更图片（共 {len(paths)} 张，全部已入库）"
 
+    mtime_by_path = dict(scanned)
+    changed = set(plan["changed"])
     bs = batch_size or cfg.IMAGE_BATCH_SIZE
     added = failed = 0
     for start in range(0, len(todo), bs):
@@ -257,16 +289,18 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
         embedded = embed_images(chunk, bs)
         rows = []
         for path, vec in embedded:
-            stat = os.stat(path)
             rows.append({
                 "image_path": path,
                 "file_name": Path(path).name,
                 "source_doc": Path(path).parent.name,
                 "caption": "",
-                "mtime_ns": stat.st_mtime_ns,
+                "mtime_ns": mtime_by_path[path],
                 "vector": vec.tolist(),
             })
         failed += len(chunk) - len(rows)
+        for row in rows:
+            if row["image_path"] in changed:
+                table.delete(f"image_path = '{_sql_quote(row['image_path'])}'")
         if rows:
             table.add(rows)
         added += len(rows)
@@ -274,14 +308,15 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
 
     total = image_count()
     skip_note = f"，损坏跳过 {failed} 张" if failed else ""
-    return f"✅ 图像入库完成：新增/更新 {added} 张，未变更跳过 {skipped} 张{skip_note}，表内共 {total} 张（库: {cfg.resolve_db_path()} / 表: {cfg.IMAGE_TABLE_NAME}）"
+    dup_note = f"，批内重复 {len(plan['duplicates'])} 张" if plan["duplicates"] else ""
+    return f"✅ 图像入库完成：新增/更新 {added} 张，未变更跳过 {skipped} 张{dup_note}{skip_note}，表内共 {total} 张（库: {cfg.resolve_db_path()} / 表: {cfg.IMAGE_TABLE_NAME}）"
 
 
 # =============================================================
 # 检索
 # =============================================================
 
-def _sql_escape(value: str) -> str:
+def _sql_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
@@ -295,7 +330,7 @@ def search_images_structured(
     vec = embed_query_text(query)
     q = get_image_table().search(vec, vector_column_name="vector").metric("cosine").limit(limit * 4)
     if source_filter:
-        sf = _sql_escape(source_filter).replace("%", "")
+        sf = _sql_quote(source_filter).replace("%", "")
         q = q.where(f"image_path LIKE '%{sf}%' OR source_doc LIKE '%{sf}%'")
     rows = q.to_list()
 
