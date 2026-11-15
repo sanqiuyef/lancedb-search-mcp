@@ -304,3 +304,69 @@ D:/anaconda3/python.exe -X utf8 scripts/rebuild_wiki_metadata.py \
 - [ ] 备份 manifest 的 `integrity_check == "ok"`，备份文件 sha256 与 manifest 一致；
 - [ ] vault Git 工作区状态符合预期，`.wiki/` 未被提交；
 - [ ] 页面索引状态为已建立，published 页面无未索引项。
+
+## 12. 知识库来源与重建（2026-11-15）
+
+来源规则：vault 是唯一向量化来源，`my_docs.source` 只能是 vault 相对路径。
+PDF 用本地 MinerU，docx/pptx/xlsx 用 docling → markitdown；paper 类进
+`08-literature-文献/papers-论文全文/`，其他转换产物进
+`raw-素材/converted-转换/`，网页进 `00-inbox-收件箱/from-web-网页/`。
+
+### 12.1 全量/增量重索引
+
+```python
+# MCP 工具；reindex_all=True 只允许 vault 根，扫描结果为空时拒绝清空
+add_documents(scan_dir=r"D:\cherry-workplace\knowledge-hub\vault", reindex_all=True)
+# 日常增量：扫描 vault 子目录即可
+add_documents(scan_dir=r"D:\cherry-workplace\knowledge-hub\vault\08-literature-文献")
+```
+
+外部文件不要传给 `add_documents`；用单文件工具自动转换/复制进 vault：
+
+```python
+add_single_document(filepath=r"D:\外部\论文.pdf")
+```
+
+### 12.2 网页入库
+
+```python
+ingest_url("https://example.com/page")
+```
+
+- 快照路径：`<vault>/00-inbox-收件箱/from-web-网页/<safe-title>-<sha1(canonical)[:8]>.md`；
+- source 是该 md 的 vault 相对路径；同一 canonical URL 重复抓取幂等；
+- 抓取失败不写 vault、不改库；快照或入库失败会在返回文本中明确报错。
+
+### 12.3 批量重建（只接受 vault 内目录）
+
+```bash
+D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py --dry-run \
+  "D:/path/to/vault/08-literature-文献"
+D:/anaconda3/python.exe -X utf8 scripts/rebuild_from_sources.py \
+  "D:/path/to/vault/08-literature-文献" "D:/path/to/vault/raw-素材"
+```
+
+- 外部目录直接报错退出，提示用 `add_single_document` 或先导入 vault；
+- PDF/docx/pptx/xlsx 先转 vault Markdown 再入库，checkpoint/去重行为不变；
+- PDF 管道：`scripts/pdf_pipeline.py <PDF目录>` 的 md 输出目录必须在 vault 内
+  （默认 `08-literature-文献/papers-论文全文`；非论文 PDF 用 `--md-dir` 指到
+  `raw-素材/converted-转换`），随后委托 `rebuild_from_sources.py` 入库。
+
+### 12.4 旧 basename source 重指向
+
+```bash
+# 默认 dry-run：只报告可重指向/无匹配/已相对
+D:/anaconda3/python.exe -X utf8 scripts/relink_sources_to_vault.py \
+  --db "D:/cherry-workplace/knowledge-hub/lancedb" \
+  --vault "D:/cherry-workplace/knowledge-hub/vault"
+# 执行并同步 Wiki SQLite；无匹配文档标 missing（不删行）
+D:/anaconda3/python.exe -X utf8 scripts/relink_sources_to_vault.py \
+  --db "D:/cherry-workplace/knowledge-hub/lancedb" \
+  --vault "D:/cherry-workplace/knowledge-hub/vault" \
+  --wiki-db "D:/cherry-workplace/knowledge-hub/vault/.wiki/wiki.sqlite3" \
+  --apply --mark-missing
+```
+
+- 只在 `08-literature-文献/papers-论文全文/` 找到唯一同名 `.md` 时改 source；
+- `--apply` 后必须确认行数不变；重复执行幂等；
+- `--mark-missing` 只改 `documents.status`，保留 `document_id`、修订与证据。

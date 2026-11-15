@@ -27,9 +27,25 @@
 - **原生 FTS**：Lance 原生 BM25 倒排索引，默认 ngram 2–3 分词（避免 lancedb 0.39 的 jieba 中文查询 panic）；
 - **证据打包（非生成式问答）**：`ask_knowledge` 检索并打包 `[n]` 编号证据块（来源 + 全文
   chunk），不调用任何生成模型；作答与引用标注由 MCP 宿主模型基于证据完成；
-- **PDF → Markdown（含 LaTeX 公式）**：本地 MinerU pipeline 优先，失败回退
-  PyMuPDF/pdfminer 文本层，扫描件再回退 OCR 链（云 MinerU API → 本地 Tesseract）；
-- **网页抓取 + 目录监听**自动重索引（自建）。
+- **PDF → Markdown（含 LaTeX 公式）**：所有 PDF 先经本地 MinerU 转成 vault 内
+  Markdown 再入库；转换失败即报错，不再回退 PDF 文本层（避免公式被压平）；
+- **网页抓取 + 目录监听**：网页正文先写成 vault 剪藏再入库；监听 vault 目录自动重索引。
+
+## 来源规则（2026-11-15）
+
+**vault 是唯一向量化来源**：`my_docs.source` 只能是 vault 相对路径，不再直接索引
+vault 外文件或 PDF 文本层。
+
+- **所有二进制先转 Markdown 入 vault**：PDF 用本地 MinerU；`.docx/.pptx/.xlsx`
+  先用 docling，失败回退 markitdown；
+- **落点固定**：paper 类 → `08-literature-文献/papers-论文全文/`；其他转换产物 →
+  `raw-素材/converted-转换/`；网页剪藏 → `00-inbox-收件箱/from-web-网页/`；
+- `add_documents(scan_dir)` 只接受 vault 内目录；`add_documents(reindex_all=True)`
+  只接受 vault 根（且扫描结果非空），否则拒绝清空知识库；
+- **外部文件用 `add_single_document`**：自动转换/复制进 vault 后再入库；`scan_dir`
+  参数仅为兼容保留，不参与 source 计算；
+- 历史遗留的 basename source 用 `scripts/relink_sources_to_vault.py` 重指向
+  （默认 dry-run，`--apply` 才写库）。
 
 ## 快速开始
 
@@ -45,8 +61,8 @@ copy .mcp.example.json .mcp.json
 python -X utf8 server.py
 
 # 4) 入库（在 MCP 客户端里调用工具）
-#    add_documents(scan_dir="D:\your\docs")        目录批量入库
-#    add_single_document(filepath="...")           单文件入库
+#    add_documents(scan_dir="<vault>")             目录批量入库（只接受 vault 内目录）
+#    add_single_document(filepath="...")           单文件入库（外部文件自动转换进 vault）
 #    search_knowledge(query="...", search_mode="hybrid")
 ```
 
@@ -54,9 +70,10 @@ python -X utf8 server.py
 `LANCEDB_DB_PATH` 不设时默认建在 `D:\cherry-workplace\knowledge-hub\lancedb`
 （作者机器布局），**建议显式设置成你自己的路径**。
 
-### 启用 PDF 公式解析（可选增强）
+### 安装 PDF 转换环境（PDF 入库必需）
 
-不做这一步也能用：PDF 会走 PyMuPDF/pdfminer 文本层抽取（公式会被压平）。
+2026-11-15 起 PDF 入库不再回退文本层：未安装 MinerU 时 PDF 转换会直接失败，请先
+安装本地 MinerU，或先把 PDF 转成 Markdown 放入 vault 再入库。
 
 ```powershell
 # MinerU 本地 pipeline 需要独立 venv（其 transformers 版本要求与主环境常冲突）
@@ -67,7 +84,8 @@ mineru-models-download -s modelscope -m pipeline      # 首次下载模型（约
 
 之后 PDF 入库会自动调用它（转换产物按 路径+大小+mtime 缓存在 `<库目录>/_pdf_md_cache/`）：
 文本层含乱码/数学字母 → 自动切 OCR 模式，中文论文同样自动识别。
-可用 `LANCEDB_MINERU=0` 关闭、`LANCEDB_MINERU_BIN` 指定可执行文件路径。
+可用 `LANCEDB_MINERU=0` 关闭（关闭后 PDF 入库会失败，只适合纯 Markdown 库）、
+`LANCEDB_MINERU_BIN` 指定可执行文件路径。
 
 ## 配置（环境变量）
 
@@ -115,16 +133,19 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
   都必须显式 `confirm_all=True` 才会清空。
 - `update_document`：按完整文件路径唯一确定已有 source；同名 basename 匹配到多个 source
   且路径后缀无法唯一判定时返回错误并列出候选，不执行任何写入或删除。
-- `add_single_document`：不传 `scan_dir` 时 source 退化为文件名；若库中已有同名 source
-  会报错拒绝覆盖，请传 `scan_dir`（按相对路径入库）或改用 `update_document`。
+- `add_single_document`：source 一律取 vault 相对路径；vault 外文件先转换/复制进
+  vault 再入库，`scan_dir` 仅兼容保留。若库中已有等价 source，会按新内容幂等替换。
 
 ### 网页入库
 
-- source 形如 `网页-<host>-<sha1(canonical)[:12]>`；canonical 只做 scheme/host 小写、
-  去默认端口、去 fragment、清 `utm_*` / `fbclid` / `gclid`，**不折叠尾斜杠**，query
-  参数不排序。
-- 同一 canonical URL 重复抓取时先补写新块，成功后再删除不在新 `doc_id` 集合中的旧块；
-  内容未变的块不重复写入。
+- `ingest_url` 的顺序：抓取 → `kb.vault_source.save_web_markdown` 写
+  `00-inbox-收件箱/from-web-网页/<safe-title>-<sha1(canonical)[:8]>.md` →
+  `add_single_document(md_path)` 分块入库；
+- source 是该剪藏的 vault 相对路径，不再产生 `网页-<host>-<hash>` 形式的 source；
+- 同一 canonical URL 重复抓取复用同一快照文件，切片按内容幂等替换；抓取失败不写
+  vault、不改库，快照/入库失败会明确返回错误；
+- canonical 规则不变：scheme/host 小写、去默认端口、去 fragment、清
+  `utm_*` / `fbclid` / `gclid`，**不折叠尾斜杠**，query 参数不排序。
 
 ### 目录监听
 
@@ -243,6 +264,7 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 | `scripts/wiki_quality_report.py` | 质量报告：证据覆盖、断链、孤儿页、重复候选等 |
 | `scripts/rebuild_wiki_metadata.py` | 从 vault frontmatter 补齐 `pages/page_revisions` |
 | `scripts/rebuild_wiki_page_index.py` | 重建/增量更新 `wiki_pages` 页面索引 |
+| `scripts/relink_sources_to_vault.py` | 旧 basename source 重指向 vault 论文 Markdown（默认 dry-run，`--apply` 同步 LanceDB/Wiki） |
 
 迁移状态：2026-11-15 已对真实库执行（218 documents / 218 revisions / 26,583 chunk_refs）；`--apply` 才写 SQLite，重复执行幂等。迁移报告见 `docs/wiki-v1/migration-report.md`。
 
@@ -259,7 +281,7 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 
 | 模块 | 说明 | 优化方向 |
 |---|---|---|
-| `kb/web.py` | 网页抓取入库（canonical source + 幂等替换） | 反爬重试、正文智能抽取、与 web-search-server 抓取链复用 |
+| `kb/web.py` | 网页抓取 → vault 剪藏 Markdown → 幂等入库 | 反爬重试、正文智能抽取、与 web-search-server 抓取链复用 |
 | `kb/watcher.py` | watchdog 6.0 目录监听（多目录、删除/移动同步、5 秒尾沿防抖） | 整目录移入/移出的递归迁移兜底、事件队列 |
 | `mineru_pdf_splitter.py` | MinerU 大 PDF 预切分 | 按需使用，独立工具 |
 
@@ -274,10 +296,11 @@ kb/                      知识库核心包
   model_lifecycle.py     本地模型生命周期：用时挂载、闲置自动卸载（gc + empty_cache）
   schema.py              LanceModel schema、建表、FTS/向量索引维护、库目录 README
   pdf_convert.py         ★PDF→Markdown（本地 MinerU pipeline；公式→LaTeX，缓存+档位判定）
-  ingest.py              解析（MinerU→文本层→OCR 回退链）、分块（800/100）、增删改查
+  vault_source.py        ★vault 唯一来源层（文本复制/PDF/Office 转换/网页剪藏，source 取 vault 相对路径）
+  ingest.py              来源准备、分块（800/100）、增删改查（只接受 vault 来源）
   search.py              官方 hybrid + 本地 CrossEncoder 精排（失败回退 RRF）
   ask.py                 检索证据打包（[n] 编号证据块，不调用生成模型）
-  web.py / watcher.py    [自建模块] 网页入库 / 目录监听（watchdog 6.0）
+  web.py / watcher.py    [自建模块] 网页剪藏入库 / 目录监听（watchdog 6.0）
   wiki/                  Wiki V1 知识层：SQLite 元数据/证据/提案 + vault 页面 + Git
                          （config/db/ids/markdown/models 基础设施；document_registry/
                          evidence/entity_resolver/page_store/link_index/proposals/
@@ -292,8 +315,10 @@ ui_server.py / ui/       检索面板（零插件版，HTTP 8002，复用 kb.sea
 
 PDF 入库优先调用本地 MinerU（`D:\cherry-workplace\mcp_servers\lancedb-search\.mineru-venv`，
 mineru 3.4.4 + transformers 4.57；Anaconda 的 transformers v5 与其不兼容）把 PDF 转成
-**含 LaTeX 公式的 Markdown**，走标题感知分块；失败回退 PyMuPDF/pdfminer 文本层，扫描件再回退
-OCR 链（云 MinerU → Tesseract）。转换产物按 `路径+大小+mtime` 缓存在 `<库>/_pdf_md_cache/`。
+**含 LaTeX 公式的 Markdown**，落到 vault 后走标题感知分块。转换失败直接报错，不再回退
+PDF 文本层；`kb.ingest.extract_content` 仍保留旧的文本层/OCR 回退链供直接调用与兼容，
+但 `add_documents` / `add_single_document` 等入库入口不再使用它。转换产物按
+`路径+大小+mtime` 缓存在 `<库>/_pdf_md_cache/`。
 
 - 档位自动判定：文本层含 `U+FFFD`/私用区/数学字母（U+1D400-1D7FF）/`(cid:` → 强制 OCR；
   正文 CJK≥15% → 中文+OCR；其余 → 英文+auto（详见 `kb/pdf_convert.py` docstring）。
@@ -309,18 +334,22 @@ OCR 链（云 MinerU → Tesseract）。转换产物按 `路径+大小+mtime` �
 ## 入库与批量重建
 
 - **一条命令走完（推荐）**：`python -X utf8 scripts/pdf_pipeline.py <PDF目录>
-  [--md-dir <md输出>] [--workers 3] [--resume] [--no-ingest] [--dry-run]`
-  —— 阶段 1 PDF → Markdown（MinerU 并行转换、带缓存、可断点），阶段 2 Markdown → 向量库
-  （标题分块 + 预计算向量 + 按 doc_id 去重 + 索引维护）。MinerU 不可用时直接报错退出，
-  不做静默降级（避免把压平公式入进库）；
-- **按需入库**：MCP 工具 `add_documents`（扫目录）/ `add_single_document`（单文件，
-  PDF 自动走 MinerU → LaTeX）；两者都支持 `export_markdown_dir` 参数，把转换出的
-  Markdown + 图片同步导出留档（可再用于 Obsidian 等阅读端）；
+  [--md-dir <vault内md目录>] [--workers 3] [--resume] [--no-ingest] [--dry-run]`
+  —— 阶段 1 PDF → Markdown（MinerU 并行转换、带缓存、可断点），md 必须落在 vault 内
+  （默认 `08-literature-文献/papers-论文全文`）；阶段 2 委托
+  `rebuild_from_sources.py`，按 vault 相对路径入库。MinerU 不可用时直接报错退出；
+- **按需入库**：MCP 工具 `add_documents`（只扫 vault 内目录）/ `add_single_document`
+  （单文件，外部文件自动转换进 vault，PDF 走 MinerU → LaTeX）；两者都支持
+  `export_markdown_dir` 参数，把转换出的 Markdown + 图片额外导出留档（不改变 source）；
 - **只转换不入库**：`python -X utf8 scripts/mineru_to_markdown.py <PDF目录> <md目录>
   --workers 3`（每篇产出 `<名>.md` + `<名>_images/`，可断点续跑）；
   备选引擎 docling 见 `scripts/pdf_to_markdown.py`；
-- **重建/更新**：`python -X utf8 scripts/rebuild_from_sources.py <源目录>`
-  （`--dry-run`、`--limit-files`，checkpoint 断点续传，自动按 `doc_id` 去重）；
+- **重建/更新**：`python -X utf8 scripts/rebuild_from_sources.py <vault内目录>`
+  （`--dry-run`、`--limit-files`，checkpoint 断点续传，自动按 `doc_id` 去重）。
+  只接受 vault 内目录；二进制先转 vault Markdown 再入库；
+- **历史 source 重指向**：`python -X utf8 scripts/relink_sources_to_vault.py
+  --db "<lancedb>" --vault "<vault>"`（默认 dry-run；`--apply` 写 LanceDB 与 Wiki
+  SQLite，`--mark-missing` 标记无匹配文档）；
 - **实测规模参考**（作者使用场景）：116 篇论文（2205 页）→ 18k 切片，
   3 并行转换约 1.5 小时（RTX 4060），重建入库约 12 分钟。
 
@@ -347,7 +376,7 @@ run_ui.cmd                     # 启动器（内部设好 HF/env 后拉起 ui_se
 python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-当前全量基线 485 项（2026-11-15 实测 `unittest discover`）。离线测试（假 embedding、
+当前全量基线 592 项（2026-11-15 实测 `unittest discover`）。离线测试（假 embedding、
 mock HTTP）覆盖配置、分块、schema/检索端到端、reranker 回退、证据打包、网页
 canonical/幂等、目录监听（防抖/删除/多目录）、图像入库计划与替换，以及 Wiki 层
 （配置/ID/frontmatter/迁移、文档登记、证据链、实体关系、页面存储、双链、提案、

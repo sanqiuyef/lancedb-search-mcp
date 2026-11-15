@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""kb_web：网页抓取与正文抽取（mock HTTP，不联网）。"""
+"""kb_web：网页抓取、vault 剪藏与幂等入库（mock HTTP，不联网）。"""
 
+import hashlib
 import os
-import re
 import sys
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from kb import web as kb_web
+from kb import config as cfg  # noqa: E402
+from kb import schema as kb_schema  # noqa: E402
+from kb import vault_source  # noqa: E402
+from kb import web as kb_web  # noqa: E402
+from tests.kb_test_support import activate_fake_embedding, temp_db_env  # noqa: E402
 
 HTML = """
 <html><head><title>测试页面</title></head>
@@ -24,6 +27,8 @@ HTML = """
 
 CONTENT_A = "# 标题\n\n" + "甲" * 200 + "\n\n" + "乙" * 200
 CONTENT_B = "# 标题\n\n" + "丙" * 200 + "\n\n" + "丁" * 200
+
+WEB_REL_DIR = os.path.join("00-inbox-收件箱", "from-web-网页")
 
 
 class FakeResponse:
@@ -46,20 +51,6 @@ class TestFetchPage(unittest.TestCase):
         self.assertNotIn("页脚", content)
         self.assertNotIn("var x = 1;", content)
         self.assertIn("https://example.com/docs", content)
-
-
-class TestIngestUrl(unittest.TestCase):
-    def test_invalid_url_rejected(self):
-        self.assertEqual(
-            kb_web.ingest_url("ftp://example.com"),
-            "❌ 无效的 URL: ftp://example.com",
-        )
-
-    def test_fetch_failure_reported(self):
-        with mock.patch.object(kb_web.requests, "get",
-                               side_effect=ConnectionError("refused")):
-            out = kb_web.ingest_url("https://example.com")
-        self.assertIn("抓取失败", out)
 
 
 class TestCanonicalizeUrl(unittest.TestCase):
@@ -134,183 +125,176 @@ class TestCanonicalizeUrl(unittest.TestCase):
                 kb_web.canonicalize_url(bad)
 
 
-class _FakeColumn:
-    def __init__(self, values):
-        self._values = values
+class WebIngestTestBase(unittest.TestCase):
+    """临时库 + 临时 vault + 假 embedding，验证真实入库链路。"""
 
-    def to_pylist(self):
-        return list(self._values)
-
-
-class _FakeArrow:
-    def __init__(self, data):
-        self._data = data
-
-    def column(self, name):
-        return _FakeColumn(self._data[name])
-
-
-class _FakeChunkLance:
-    def __init__(self, rows):
-        self._rows = rows
-
-    def to_table(self, columns=None, filter=None):
-        columns = columns or ["source", "doc_id"]
-        rows = self._rows
-        if filter:
-            match = re.match(r"^source = '((?:[^']|'')*)'$", filter)
-            if not match:
-                raise AssertionError(f"unexpected filter: {filter}")
-            source = match.group(1).replace("''", "'")
-            rows = [row for row in rows if row["source"] == source]
-        return _FakeArrow({name: [row.get(name, "") for row in rows]
-                           for name in columns})
-
-
-class FakeChunkTable:
-    """记录 add/delete 顺序；to_lance 支持按 source 过滤读取 doc_id。"""
-
-    def __init__(self, rows=None):
-        self.rows = list(rows or [])
-        self.delete_calls = []
-        self.operations = []
-
-    def to_lance(self):
-        return _FakeChunkLance(self.rows)
-
-    def delete(self, where):
-        self.delete_calls.append(where)
-        self.operations.append(("delete", where))
-        match = re.match(
-            r"^source = '((?:[^']|'')*)' AND "
-            r"\(doc_id = '' OR doc_id NOT IN \((.*)\)\)$",
-            where,
-        )
-        if not match:
-            raise AssertionError(f"unexpected delete where: {where}")
-        source = match.group(1).replace("''", "'")
-        new_ids = {
-            value.replace("''", "'")
-            for value in re.findall(r"'((?:[^']|'')*)'", match.group(2))
-        }
-        stale = [
-            row for row in self.rows
-            if row["source"] == source
-            and (not row.get("doc_id") or row["doc_id"] not in new_ids)
-        ]
-        self.rows = [row for row in self.rows if row not in stale]
-        return SimpleNamespace(num_deleted_rows=len(stale))
-
-    def __len__(self):
-        return len(self.rows)
-
-
-def _fake_add_chunks(table, chunks):
-    table.operations.append(("add", [ch["doc_id"] for ch in chunks]))
-    table.rows.extend(chunks)
-    return len(chunks)
-
-
-class TestIngestUrlIdentity(unittest.TestCase):
     def setUp(self):
-        self.table = FakeChunkTable()
-        self.last_fetch = None
+        activate_fake_embedding()
+        cfg.FTS_BASE_TOKENIZER = "simple"
+        self.db_path = temp_db_env(self)
+        self.vault = os.path.join(self.db_path, "vault")
 
-    def _ingest(self, url, content=CONTENT_A, add_failure=False,
-                patch_fetch=True):
-        fetch = mock.Mock(return_value=("测试页面", content))
-        self.last_fetch = fetch
-        add = mock.Mock(side_effect=_fake_add_chunks)
-        if add_failure:
-            add.side_effect = RuntimeError("embedding down")
-        patches = [
-            mock.patch.object(kb_web.kb_schema, "get_or_create_table",
-                              return_value=self.table),
-            mock.patch.object(kb_web.kb_schema, "ensure_vector_index"),
-            mock.patch.object(kb_web.kb_schema, "ensure_fts_index"),
-            mock.patch.object(kb_web.kb_schema, "fold_new_rows"),
-            mock.patch.object(kb_web.kb_schema, "update_db_readme"),
-            mock.patch.object(kb_web.kb_ingest, "add_chunks", add),
-        ]
-        if patch_fetch:
-            patches.append(mock.patch.object(kb_web, "fetch_page", fetch))
-        for patcher in patches:
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return kb_web.ingest_url(url)
+    def web_dir(self):
+        return os.path.join(self.vault, WEB_REL_DIR)
 
-    def test_different_pages_get_different_sources(self):
-        self._ingest("https://example.com/a")
-        source_a = self.table.rows[0]["source"]
-        self._ingest("https://example.com/b")
-        sources = {row["source"] for row in self.table.rows}
-        self.assertEqual(len(sources), 2)
-        self.assertIn(source_a, sources)
-        self.assertRegex(source_a, r"^网页-example\.com-[0-9a-f]{12}$")
-        self.assertEqual(len(source_a.rsplit("-", 1)[1]), 12)
+    def snapshot_from_output(self, output: str) -> str:
+        line = next(
+            line for line in output.splitlines()
+            if line.startswith("网页快照: ")
+        )
+        return line.split(": ", 1)[1].strip()
 
-    def test_utm_variants_share_source(self):
-        self._ingest("https://example.com/a?utm_source=feed")
-        source_first = self.table.rows[0]["source"]
-        self._ingest("https://example.com/a?utm_medium=social")
-        self.assertEqual({row["source"] for row in self.table.rows}, {source_first})
+    def table_rows(self):
+        table = kb_schema.get_or_create_table()
+        arrow = table.to_lance().to_table(columns=["source", "text", "chunk_index"])
+        return list(zip(
+            arrow.column("source").to_pylist(),
+            arrow.column("text").to_pylist(),
+            arrow.column("chunk_index").to_pylist(),
+        ))
 
-    def test_repeat_ingest_does_not_duplicate_rows(self):
-        self._ingest("https://example.com/page?utm_source=feed")
-        row_count = len(self.table.rows)
-        self.assertGreater(row_count, 0)
-        source = self.table.rows[0]["source"]
-        self.table.operations.clear()
+    def ingest(self, url, title="测试页面", content=CONTENT_A):
+        with mock.patch.object(kb_web, "fetch_page", return_value=(title, content)):
+            return kb_web.ingest_url(url)
 
-        output = self._ingest("https://Example.com/page#section")
 
-        self.assertIn("已入库: 0", output)
-        self.assertEqual(len(self.table.rows), row_count)
-        self.assertEqual({row["source"] for row in self.table.rows}, {source})
-        self.assertEqual(self.table.operations, [])
+class TestIngestUrlRejects(WebIngestTestBase):
+    def test_invalid_url_rejected(self):
+        self.assertEqual(
+            kb_web.ingest_url("ftp://example.com"),
+            "❌ 无效的 URL: ftp://example.com",
+        )
 
-    def test_changed_content_adds_before_deleting_stale_rows(self):
-        self._ingest("https://example.com/page")
-        old_ids = {row["doc_id"] for row in self.table.rows}
-        old_count = len(self.table.rows)
-        self.table.operations.clear()
+    def test_fetch_failure_does_not_write_vault_or_db(self):
+        with mock.patch.object(kb_web, "fetch_page",
+                               side_effect=ConnectionError("refused")):
+            out = kb_web.ingest_url("https://example.com")
+        self.assertIn("抓取失败", out)
+        self.assertFalse(os.path.exists(self.web_dir()))
+        self.assertEqual(kb_schema.row_count(), 0)
 
-        output = self._ingest("https://example.com/page", content=CONTENT_B)
+    def test_snapshot_failure_does_not_write_db(self):
+        with mock.patch.object(kb_web, "fetch_page",
+                               return_value=("测试页面", CONTENT_A)), \
+                mock.patch.object(kb_web.vault_source, "save_web_markdown",
+                                  side_effect=OSError("disk full")):
+            out = kb_web.ingest_url("https://example.com/page")
+        self.assertIn("网页快照写入失败", out)
+        self.assertEqual(kb_schema.row_count(), 0)
 
-        self.assertIn("替换旧块", output)
-        add_index = next(i for i, op in enumerate(self.table.operations)
-                         if op[0] == "add")
-        delete_index = next(i for i, op in enumerate(self.table.operations)
-                            if op[0] == "delete")
-        self.assertLess(add_index, delete_index)
-        self.assertEqual(len(self.table.rows), old_count)
-        self.assertFalse(old_ids & {row["doc_id"] for row in self.table.rows})
-        self.assertTrue(any("丙" in row["text"] for row in self.table.rows))
-        self.assertFalse(any("甲" in row["text"] for row in self.table.rows))
 
-    def test_add_failure_keeps_old_rows(self):
-        self._ingest("https://example.com/page")
-        old_rows = list(self.table.rows)
-        self.table.operations.clear()
-        self.table.delete_calls.clear()
+class TestIngestUrlVaultSource(WebIngestTestBase):
+    def test_snapshot_lands_in_web_inbox_and_source_is_vault_relative(self):
+        original = "https://example.com/a?utm_source=feed&id=1"
+        output = self.ingest(original)
 
-        with self.assertRaises(RuntimeError):
-            self._ingest("https://example.com/page", content=CONTENT_B,
-                         add_failure=True)
-
-        self.assertEqual(self.table.delete_calls, [])
-        self.assertEqual(self.table.rows, old_rows)
-
-    def test_whitespace_and_uppercase_scheme_accepted(self):
-        output = self._ingest("  HTTPS://Example.com/page  ")
         self.assertIn("网页已索引", output)
-        self.last_fetch.assert_called_once_with("HTTPS://Example.com/page")
+        self.assertIn("网页快照: ", output)
+        snapshot_rel = self.snapshot_from_output(output)
+        self.assertTrue(
+            snapshot_rel.startswith(WEB_REL_DIR + os.sep),
+            snapshot_rel,
+        )
+        snapshot_path = os.path.join(self.vault, snapshot_rel)
+        self.assertTrue(os.path.isfile(snapshot_path))
+
+        canonical = kb_web.canonicalize_url(original)
+        digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
+        self.assertTrue(os.path.basename(snapshot_path).endswith(f"-{digest}.md"))
+        self.assertTrue(os.path.basename(snapshot_path).startswith("测试页面-"))
+
+        expected_source = vault_source.rel_to_vault(snapshot_path)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected_source},
+        )
+        self.assertIn(f"文件: {expected_source}", output)
+        self.assertIn("新增记录:", output)
+
+        with open(snapshot_path, "r", encoding="utf-8") as handle:
+            markdown = handle.read()
+        self.assertTrue(markdown.startswith("---"))
+        self.assertIn("tags: [web-clip]", markdown)
+        self.assertIn(f"url: '{original}'", markdown)
+
+    def test_chunk_text_has_no_yaml_frontmatter(self):
+        self.ingest("https://example.com/page")
+        rows = self.table_rows()
+        self.assertTrue(rows)
+        for _source, text, _index in rows:
+            self.assertNotIn("generator: lancedb-search", text)
+            self.assertNotIn("tags: [web-clip]", text)
+            self.assertNotIn("clipped:", text)
+            self.assertFalse(text.lstrip().startswith("---"), text[:80])
+
+    def test_different_canonical_urls_get_different_sources(self):
+        self.ingest("https://example.com/a")
+        self.ingest("https://example.com/b")
+        sources = kb_schema.existing_sources(kb_schema.get_or_create_table())
+        self.assertEqual(len(sources), 2)
+        self.assertFalse(any(src.startswith("网页-") for src in sources))
+        snapshots = [
+            name for name in os.listdir(self.web_dir())
+            if name.endswith(".md")
+        ]
+        self.assertEqual(len(snapshots), 2)
 
     def test_header_keeps_original_url(self):
         url = "https://example.com/a?utm_source=feed&id=1"
         with mock.patch.object(kb_web.requests, "get", return_value=FakeResponse()):
-            self._ingest(url, patch_fetch=False)
-        self.assertTrue(any(url in row["text"] for row in self.table.rows))
+            output = kb_web.ingest_url(url)
+        self.assertIn("网页已索引", output)
+        rows = self.table_rows()
+        self.assertTrue(any(url in text for _src, text, _idx in rows))
+
+    def test_whitespace_and_uppercase_scheme_accepted(self):
+        with mock.patch.object(kb_web, "fetch_page",
+                               return_value=("测试页面", CONTENT_A)) as fetch:
+            output = kb_web.ingest_url("  HTTPS://Example.com/page  ")
+        self.assertIn("网页已索引", output)
+        fetch.assert_called_once_with("HTTPS://Example.com/page")
+
+
+class TestIngestUrlIdempotency(WebIngestTestBase):
+    def test_repeat_ingest_same_canonical_url_does_not_duplicate(self):
+        first = self.ingest("https://example.com/page?utm_source=feed")
+        row_count = kb_schema.row_count()
+        snapshot_rel = self.snapshot_from_output(first)
+        self.assertGreater(row_count, 0)
+
+        second = self.ingest("https://Example.com/page#section")
+
+        self.assertIn("新增记录: 0", second)
+        self.assertIn("替换旧记录: 0", second)
+        self.assertEqual(kb_schema.row_count(), row_count)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {vault_source.rel_to_vault(os.path.join(self.vault, snapshot_rel))},
+        )
+        snapshots = [
+            name for name in os.listdir(self.web_dir())
+            if name.endswith(".md")
+        ]
+        self.assertEqual(len(snapshots), 1)
+
+    def test_changed_content_replaces_old_chunks_in_same_source(self):
+        first = self.ingest("https://example.com/page")
+        snapshot_rel = self.snapshot_from_output(first)
+        row_count = kb_schema.row_count()
+        old_texts = [text for _src, text, _idx in self.table_rows()]
+
+        second = self.ingest("https://example.com/page", content=CONTENT_B)
+
+        self.assertIn("替换旧记录: 1", second)
+        self.assertEqual(kb_schema.row_count(), row_count)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {vault_source.rel_to_vault(os.path.join(self.vault, snapshot_rel))},
+        )
+        texts = [text for _src, text, _idx in self.table_rows()]
+        self.assertFalse(any("甲" in text or "乙" in text for text in texts))
+        self.assertTrue(any("丙" in text or "丁" in text for text in texts))
+        self.assertNotEqual(old_texts, texts)
 
 
 if __name__ == "__main__":

@@ -11,9 +11,10 @@ lancedb-search/
 │   ├── schema.py                   LanceModel schema、建表、FTS/向量索引、库目录 README
 │   ├── ingest.py                   文档解析（MinerU→文本层→OCR 回退链）、分块、增删改查
 │   ├── pdf_convert.py              ★PDF→Markdown 核心（本地 MinerU pipeline，缓存+档位判定；与 scripts 批量脚本共用）
+│   ├── vault_source.py             ★vault 唯一来源层：文本复制、PDF/Office 转换、网页剪藏；source 取 vault 相对路径
 │   ├── search.py                   检索内核：vector/text/hybrid + 本地 CrossEncoder 精排（回退 RRF）
 │   ├── ask.py                      检索证据打包（[n] 编号证据块，不调用生成模型）
-│   ├── web.py                      [自建模块 · 待优化] 网页抓取入库（canonical source + 幂等替换）
+│   ├── web.py                      [自建模块 · 待优化] 网页抓取 → vault 剪藏 Markdown → 幂等入库
 │   ├── watcher.py                  [自建模块 · 待优化] watchdog 6.0 目录监听（多目录、删除/移动同步、防抖）
 │   └── wiki/                       Wiki V1 知识层（SQLite 元数据 + vault 页面 + Git）
 │       ├── __init__.py             包导出：配置、迁移、ID、frontmatter 等公共接口
@@ -47,7 +48,7 @@ lancedb-search/
 │           └── relations.py        relations / 谓词白名单 / 邻域 BFS
 │
 ├── scripts/
-│   ├── rebuild_from_sources.py     批量重建脚本（攒批 + checkpoint 断点续传）
+│   ├── rebuild_from_sources.py     批量重建脚本（vault 内目录 + 二进制转换 + checkpoint 断点续传）
 │   ├── smoke_local_backend.py      本地双模型真实加载冒烟（GPU 推理验证）
 │   ├── smoke_idle_unload.py        闲置自动卸载冒烟（显存释放 + 重载验证）
 │   ├── test_jina_clip_smoke.py     图像嵌入冒烟（kb.image_search 生产路径 + 中文查询×样图矩阵）
@@ -61,6 +62,7 @@ lancedb-search/
 │   ├── audit_wiki_environment.py   Wiki 只读审计：运行环境、LanceDB 表与 source 形态
 │   ├── migrate_wiki_v1.py          Wiki V1 迁移入口（默认 dry-run，--apply 写 SQLite）
 │   ├── migrate_sources_to_relative.py  my_docs 的 basename source → vault 相对路径（不重算向量）
+│   ├── relink_sources_to_vault.py  ★旧 basename source 按论文同名 md 重指向（默认 dry-run，--apply 同步 Wiki）
 │   ├── validate_wiki.py            Wiki 一致性校验 CLI（--strict/--json，只读）
 │   ├── backup_wiki.py              Wiki SQLite + proposals 备份与 manifest
 │   ├── wiki_quality_report.py      Wiki 质量报告（证据覆盖/断链/孤儿页/重复候选等）
@@ -85,9 +87,10 @@ lancedb-search/
 │   ├── test_kb_schema_search.py    schema/检索端到端（FTS/hybrid/过滤/回退）
 │   ├── test_kb_model_lifecycle.py  闲置卸载逻辑 + 本地嵌入懒加载（假模型）
 │   ├── test_kb_ask.py              证据检索打包（mock）
-│   ├── test_kb_web.py              网页 canonical/幂等与正文解析（mock HTTP）
+│   ├── test_kb_web.py              网页 canonical、vault 剪藏路径与幂等入库（mock HTTP）
 │   ├── test_kb_watcher.py          watchdog 事件、尾沿防抖、删除/移动、多目录
 │   ├── test_kb_image_search.py     图像入库计划、旧行替换、过滤转义
+│   ├── test_relink_sources.py      旧 basename source 重指向：唯一匹配、行数不变、幂等与 missing
 │   ├── test_wiki_config.py         WikiConfig/env 覆盖/vault 路径边界
 │   ├── test_wiki_ids.py            稳定 ID、ULID、文本指纹
 │   ├── test_wiki_markdown.py       frontmatter 安全解析/校验、wikilink
@@ -127,7 +130,10 @@ LanceDB 库、Obsidian vault 与 Wiki SQLite 都在仓库外，仓库只保留�
   - `wiki_pages`：启用 Wiki 层并完成索引重建后才出现的派生页面索引（与 `my_docs` 同库、独立表）
   - `web_figure_chunks`：95 行，2026-10-29 遗留实验表；当前代码不引用，
     **勿删勿迁移**，后续单独评估
-- `D:\cherry-workplace\knowledge-hub\vault` — Obsidian vault（**不在仓库内**）：
+- `D:\cherry-workplace\knowledge-hub\vault` — Obsidian vault（**不在仓库内**，唯一向量化来源）：
+  - `00-inbox-收件箱/from-web-网页/`：`ingest_url` 生成的网页剪藏 Markdown
+  - `08-literature-文献/papers-论文全文/`：论文类 PDF/Office 转换产物（MinerU / docling → markitdown）
+  - `raw-素材/converted-转换/`：其他二进制转换产物
   - `wiki-维基/`：Wiki 页面正文与 `ai-index.md`、`ai-log.md`、`ai-purpose.md`、`ai-overview.md`
   - `.wiki/wiki.sqlite3`：Wiki 元数据（默认 `WIKI_DB_PATH`），同级有 `proposals/`、`backups/`
 - `D:\huggingface\hub` — bge-m3 / bge-reranker-v2-m3 / jina 模型缓存（HF_HOME）
