@@ -70,11 +70,12 @@ WIKI_DB_PATH="D:\cherry-workplace\knowledge-hub\wiki\wiki.sqlite3" \
 ### source 改为相对路径
 
 - 用 `scripts/migrate_sources_to_relative.py` 原地更新 `source` 列，不重算向量。
-- 216/218 个 source 在 vault 中唯一匹配并改写为相对路径；2 个无文件保持 basename：
-  - `Sharifian 等 - 2023 - LISFLOOD-FP 8.1 ... .pdf`
-  - `SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty.md`
-- `my_docs` 行数 26,583 不变；`text_idx` / `vector_idx` 重建后仍覆盖 26,583 行。
-- 备份：`D:\cherry-workplace\knowledge-hub\backups\my_docs.lance-20261115-src-rewrite`。
+- 第一批 216/218 个 source 唯一匹配并改写为相对路径；剩余 2 个在 `relink_sources_to_vault.py` 阶段完成：
+  - `Sharifian 等 - 2023 - LISFLOOD-FP 8.1 ... .pdf` → 同名 vault md（226 行）；
+  - `SoilGrids 2.0: ... .md` → 用 MinerU 把 `D:\cherry-workplace\论文\文献\Poggio ...pdf` 转成 vault md（251 行），再重指向。
+- **最终 218/218 个 source 都是 vault 相对路径**；`my_docs` 行数 26,583 不变；`text_idx` / `vector_idx` 仍覆盖 26,583 行。
+- Wiki SQLite 同步：2 个 documents 的 `canonical_uri`/`display_name`、477 条 `chunk_refs.source_value` 更新。
+- 备份：`backups\my_docs.lance-20261115-src-rewrite`、`backups\my_docs.lance-20261115-relink`、`backups\wiki-pre-relink-20261115.sqlite3`。
 
 ### FTS 分词器改为 ngram
 

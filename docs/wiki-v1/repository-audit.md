@@ -17,7 +17,7 @@
 
 - 路径: `D:\cherry-workplace\knowledge-hub\lancedb`
 - 存在: True
-- 体积: 621.9 MB
+- 体积: 693.5 MB
 
 | 表 | 行数 | 索引 |
 |---|---|---|
@@ -30,8 +30,8 @@
 
 - 总行数: 26583
 - 去重 source: 218
-- 含路径分隔符的 source: 216 (99.08%)
-- 纯 basename source: 2
+- 含路径分隔符的 source: 218 (100.00%)
+- 纯 basename source: 0
 - `网页-` source: 0，单 source 最大行数: 0
 - 空 source 行: 0，空 doc_id 行: 0
 - 重复 `(source, chunk_index)`: 3654 组 / 21147 行
@@ -58,7 +58,7 @@
 | `08-literature-文献\papers-论文全文\Physics-informed deep learning for hillslope subsurface flow prediction integrating soil moisture d.md` | 258 |
 | `08-literature-文献\papers-论文全文\Fusion of data-driven models with a knowledge-guided loss function for flood forecasting.md` | 257 |
 | `08-literature-文献\papers-论文全文\Improving River Routing Using a Differentiable Muskingum‐Cunge Model and Physics‐Informed Machine Le.md` | 257 |
-| `SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty.md` | 251 |
+| `08-literature-文献\papers-论文全文\Poggio 等 - 2021 - SoilGrids 2.0 producing soil information for the globe with quantified spatial uncertainty.md` | 251 |
 | `08-literature-文献\papers-论文全文\基于遥感的中国格网暴雨强度公式推求及研究.md` | 250 |
 | `08-literature-文献\papers-论文全文\Urban Flood Modeling and Forecasting with Deep Neural Operator and Transfer Learning.md` | 240 |
 | `08-literature-文献\papers-论文全文\Physics-informed neural networks A deep learning framework for solving forward and inverse problems.md` | 229 |
@@ -84,6 +84,6 @@
     "entities-实体",
     "topics-主题"
   ],
-  "existing_md_count": 8
+  "existing_md_count": 9
 }
 ```

@@ -1,6 +1,6 @@
 # Wiki 质量报告
 
-- 生成时间: 2026-11-15T12:45:56.589Z
+- 生成时间: 2026-11-15T15:38:02.283Z
 - 数据库: `D:\cherry-workplace\knowledge-hub\wiki\wiki.sqlite3`
 - vault: `D:\cherry-workplace\knowledge-hub\vault`
 - 页面索引表: `wiki_pages`

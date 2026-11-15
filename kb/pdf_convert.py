@@ -103,6 +103,14 @@ def run_mineru(pdf: Path, staging_root: Path, lang: str, method: str,
     env.setdefault("MODELSCOPE_CACHE", r"D:\huggingface\modelscope")
     env["HF_HUB_OFFLINE"] = "0"
     env["TEMP"] = env["TMP"] = str(tmpdir)
+    # MinerU 3.4 会启动本地 mineru-api 并做健康检查；若系统代理接管了
+    # 127.0.0.1，会得到 502 并超时。回环地址必须绕过代理。
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = [part.strip() for part in env.get(key, "").split(",") if part.strip()]
+        for host in ("127.0.0.1", "localhost", "::1"):
+            if host not in parts:
+                parts.append(host)
+        env[key] = ",".join(parts)
     cmd = [
         str(cfg.MINERU_BIN), "-p", str(short_pdf), "-o", str(staging / "out"),
         "-b", "pipeline", "-m", method, "-l", lang,

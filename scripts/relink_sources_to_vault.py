@@ -188,7 +188,9 @@ def _wiki_apply_missing(conn: sqlite3.Connection,
 # 扫描与输出
 # =============================================================
 
-def _scan_sources(counts: Counter, vault: str, paper_dir: Path) -> dict:
+def _scan_sources(counts: Counter, vault: str, paper_dir: Path,
+                  manual: "dict[str, str] | None" = None) -> dict:
+    manual = manual or {}
     sources = set(counts)
     legacy = sorted(
         source for source in sources
@@ -203,12 +205,30 @@ def _scan_sources(counts: Counter, vault: str, paper_dir: Path) -> dict:
         if _is_web_like(source):
             continue
         stem = Path(source).stem
-        candidates = _paper_markdown_candidates(paper_dir, stem)
         item = {
             "source": source,
             "rows": int(counts[source]),
             "stem": stem,
         }
+        # 手工映射优先：--map "旧的 basename=vault 相对 md"
+        manual_target = manual.get(_norm_source(source))
+        if manual_target:
+            target_path = Path(vault) / manual_target
+            if target_path.is_file():
+                item.update({
+                    "new_source": os.path.relpath(target_path, vault),
+                    "markdown": str(target_path),
+                    "manual": True,
+                })
+                relinkable.append(item)
+                continue
+            item.update({
+                "reason": "manual_target_missing",
+                "candidates": [manual_target],
+            })
+            no_match.append(item)
+            continue
+        candidates = _paper_markdown_candidates(paper_dir, stem)
         if len(candidates) == 1:
             new_source = os.path.relpath(candidates[0], vault)
             item.update({
@@ -327,6 +347,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument("--mark-missing", action="store_true",
                         help="无匹配来源对应的 documents.status 置 missing")
+    parser.add_argument("--map", action="append", default=[],
+                        metavar="OLD=VAULT_REL",
+                        help="手工映射旧的 basename source 到 vault 相对 md；可重复")
     args = parser.parse_args(argv)
 
     if args.apply and args.dry_run:
@@ -357,7 +380,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] 无法读取 LanceDB: {exc}", file=sys.stderr)
         return 1
 
-    scanned = _scan_sources(counts, vault, paper_dir)
+    manual_maps: dict[str, str] = {}
+    for raw_map in args.map:
+        old, sep, new = raw_map.partition("=")
+        if not sep or not old.strip() or not new.strip():
+            print(f"[ERROR] --map 需要 OLD=VAULT_REL: {raw_map!r}", file=sys.stderr)
+            return 2
+        manual_maps[_norm_source(old.strip())] = new.strip().replace("\\", "/")
+
+    scanned = _scan_sources(counts, vault, paper_dir, manual_maps)
     all_norm = {_norm_source(source) for source in counts}
 
     # LanceDB 目标 source 已存在（且不是自身）时拒绝合并，避免制造重复来源。

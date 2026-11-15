@@ -297,5 +297,37 @@ class TestAmbiguousMatch(RelinkTestBase):
         self.assertIn("Dup.pdf", self.sources())
 
 
+class TestManualMap(RelinkTestBase):
+    def test_manual_map_can_use_different_stem(self):
+        manual_md = os.path.join(self.paper_dir, "Manual Target.md")
+        with open(manual_md, "w", encoding="utf-8") as handle:
+            handle.write("# Manual\n")
+        mapping = "Paper A.pdf=" + os.path.relpath(manual_md, self.vault)
+        before = len(self.lance_snapshot())
+
+        dry = self.run_json("--dry-run", "--map", mapping)
+        self.assertEqual(dry["mode"], "dry-run")
+        self.assertEqual(len(dry["relinkable"]), 1)
+        self.assertTrue(dry["relinkable"][0]["manual"])
+        self.assertEqual(
+            dry["relinkable"][0]["new_source"],
+            os.path.relpath(manual_md, self.vault),
+        )
+
+        stats = self.run_json("--apply", "--map", mapping)
+        self.assertEqual(stats["applied"], 1)
+        self.assertEqual(len(self.lance_snapshot()), before)
+        sources = self.sources()
+        self.assertEqual(sources.count(os.path.relpath(manual_md, self.vault)), 2)
+        self.assertNotIn("Paper A.pdf", sources)
+
+    def test_manual_map_missing_target_is_reported(self):
+        mapping = "Paper A.pdf=" + os.path.join(PAPER_REL, "Not There.md")
+        stats = self.run_json("--dry-run", "--map", mapping)
+        self.assertEqual(stats["relinkable"], [])
+        item = next(x for x in stats["no_match"] if x["source"] == "Paper A.pdf")
+        self.assertEqual(item["reason"], "manual_target_missing")
+
+
 if __name__ == "__main__":
     unittest.main()

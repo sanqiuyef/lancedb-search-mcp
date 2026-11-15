@@ -5,10 +5,10 @@
 | 项目 | 结果 |
 |---|---|
 | 基线（Phase 0 之前） | 40 项 |
-| 当前全量 discover | **539 项，全部通过** |
+| 当前全量 discover | **594 项，全部通过** |
 | 失败/错误/跳过 | 0 / 0 / 0 |
 | 运行环境 | Windows 10.0.19045，Python 3.13.9（`D:\anaconda3\python.exe`） |
-| 全量耗时 | 约 34 秒 |
+| 全量耗时 | 约 42 秒 |
 
 ## 测试演进
 
@@ -27,6 +27,7 @@
 | 终审修复 | 550 | UI Host/Origin/CSRF（随 UI 撤回）、发布原子化、提案 CAS、链接重建、frontmatter 保留、legacy 源保护 |
 | 收尾 | 552 | source 相对路径改写、FTS ngram 回归、导航文件 `ai-*` 与防覆盖标记 |
 | md-only 收尾 | 539 | 撤回 Wiki UI 与对应 13 项测试，保留原检索面板；内容全部在 vault md |
+| vault 源规则 | 594 | 二进制转换入 vault、source 只允许 vault 相对路径、网页快照、重指向脚本 |
 
 新增测试全部使用 `tempfile.TemporaryDirectory()`，不访问真实 vault、真实 Wiki SQLite 或 LanceDB。
 

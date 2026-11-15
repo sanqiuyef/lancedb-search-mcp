@@ -37,7 +37,8 @@
 vault 外文件或 PDF 文本层。
 
 - **所有二进制先转 Markdown 入 vault**：PDF 用本地 MinerU；`.docx/.pptx/.xlsx`
-  先用 docling，失败回退 markitdown；
+  先用 docling，失败回退 markitdown；MinerU 3.4 的本地 API 健康检查会绕过
+  `127.0.0.1/localhost/::1` 代理（代码已自动注入 `NO_PROXY`）；
 - **落点固定**：paper 类 → `08-literature-文献/papers-论文全文/`；其他转换产物 →
   `raw-素材/converted-转换/`；网页剪藏 → `00-inbox-收件箱/from-web-网页/`；
 - `add_documents(scan_dir)` 只接受 vault 内目录；`add_documents(reindex_all=True)`
