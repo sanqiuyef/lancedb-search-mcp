@@ -217,7 +217,9 @@ def add_single_document(
 
 @mcp.tool(
     name="update_document",
-    description="更新知识库中的文档（删除旧版本后重新索引）。用于文档内容变更后的重新索引。",
+    description="更新知识库中的文档（删除旧版本后重新索引）。按文件名（basename，"
+                "大小写不敏感）精确匹配库中已有 source；匹配到则沿用其原始 source 值"
+                "重新入库，未匹配到才以 basename 作为新 source。仅删除精确匹配的旧行。",
 )
 def update_document(
     filepath: Annotated[str, "文件路径"],
@@ -227,10 +229,12 @@ def update_document(
 
 @mcp.tool(
     name="delete_documents",
-    description="删除知识库中的文档。按来源文件名/路径模式删除，或清空整个知识库。",
+    description="删除知识库中的文档。source_pattern 先按完整 source 精确匹配；"
+                "未命中且含 * ? [ 通配符时按 fnmatch 通配匹配（如 '*.pdf'、"
+                "'docs/*'）。不再使用子串匹配；留空需 confirm_all。",
 )
 def delete_documents(
-    source_pattern: Annotated[str, "来源匹配模式（如 'paper.pdf'、'notes/'），留空则需 confirm_all"] = "",
+    source_pattern: Annotated[str, "来源（精确值或含 * ? [ 的通配模式，如 'paper.pdf'、'docs/*'、'*.pdf'），留空则需 confirm_all"] = "",
     confirm_all: Annotated[bool, "确认清空整个知识库"] = False,
 ) -> str:
     return kb_ingest.delete_documents(source_pattern, confirm_all=confirm_all)

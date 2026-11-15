@@ -11,6 +11,7 @@ OCR 链（云 MinerU → 本地 Tesseract）。
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import sys
@@ -278,8 +279,9 @@ def _pre_split_long_paragraphs(text: str, limit: int) -> List[str]:
 
 def _chunk_by_paragraph(text: str, source: str, category: str = "",
                         prefix: str = "") -> List[Dict]:
-    """按段落分块（带尾部 overlap）。"""
+    """按段落分块（尾部 overlap 按配置的字符数，最多半个 CHUNK_SIZE）。"""
     paragraphs = _pre_split_long_paragraphs(text, cfg.CHUNK_SIZE)
+    overlap = min(cfg.CHUNK_OVERLAP, cfg.CHUNK_SIZE // 2)
     chunks: List[Dict] = []
     current = prefix or ""
 
@@ -297,11 +299,10 @@ def _chunk_by_paragraph(text: str, source: str, category: str = "",
                     "chunk_index": len(chunks),
                     "category": category,
                 })
-                if cfg.CHUNK_OVERLAP > 0:
+                if overlap > 0:
                     stripped = current.strip()
                     overlap_text = (
-                        stripped[-cfg.CHUNK_SIZE // 2:]
-                        if len(stripped) > cfg.CHUNK_SIZE // 2 else stripped
+                        stripped[-overlap:] if len(stripped) > overlap else stripped
                     )
                     current = (prefix or "") + overlap_text + "\n" + para + "\n"
                 else:
@@ -394,9 +395,23 @@ def _rows_with_vectors(rows: List[Dict]) -> List[Dict]:
     return [{**r, "vector": v} for r, v in zip(rows, vectors)]
 
 
+def _dedupe_chunks_by_doc_id(chunks: List[Dict]) -> List[Dict]:
+    """批内按 doc_id 去重（保留首条）；空 doc_id 视为无指纹，不参与去重。"""
+    seen: set = set()
+    deduped: List[Dict] = []
+    for chunk in chunks:
+        doc_id = chunk.get("doc_id", "")
+        if doc_id:
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+        deduped.append(chunk)
+    return deduped
+
+
 def add_chunks(table, chunks: List[Dict], batch_size: int = 32,
                precompute_vectors: bool = True, write_batch: int = 256) -> int:
-    """分块批量入库并返回写入行数。
+    """分块批量入库并返回写入行数（写入前按 doc_id 做批内去重）。
 
     默认主线程预计算向量并显式写入：绕开 LanceModel 自动向量化回调
     （该回调在 Python 3.13 + torch 下有原生崩溃记录：_PyThreadState_Attach），
@@ -405,6 +420,7 @@ def add_chunks(table, chunks: List[Dict], batch_size: int = 32,
     嵌入按 batch_size 小批走（控制显存），写入按 write_batch 攒大批提交
     （减少 Lance 碎片，实测大表写入速度显著提升）。
     """
+    chunks = _dedupe_chunks_by_doc_id(chunks)
     added = 0
     step = max(batch_size, write_batch if precompute_vectors else batch_size)
     for i in range(0, len(chunks), step):
@@ -431,6 +447,49 @@ def add_chunks(table, chunks: List[Dict], batch_size: int = 32,
 # =============================================================
 # 增删改查
 # =============================================================
+
+def _delete_source_exact(table, source: str) -> int:
+    """按 source 精确删除并返回删除行数（不做子串匹配）。"""
+    where = "source = '" + source.replace("'", "''") + "'"
+    removed = table.count_rows(where)
+    if removed:
+        table.delete(where)
+    return removed
+
+
+def _match_existing_source(all_sources: set[str], basename: str) -> str:
+    """在 distinct source 中按 basename 精确匹配（大小写不敏感）。
+
+    优先整值相等（含大小写变体），其次比较 source 的 basename；
+    避免旧实现的子串匹配把 a.pdf 误判成 data.pdf。
+    """
+    candidates = sorted(all_sources)
+    lower = basename.lower()
+    for src in candidates:
+        if src == basename:
+            return src
+    for src in candidates:
+        if src.lower() == lower:
+            return src
+    for src in candidates:
+        if os.path.basename(src.replace("\\", "/")) == basename:
+            return src
+    for src in candidates:
+        if os.path.basename(src.replace("\\", "/")).lower() == lower:
+            return src
+    return ""
+
+
+def _match_sources_for_delete(all_sources: set[str], pattern: str) -> set[str]:
+    """删除用来源匹配：先精确相等，未命中且含通配符时走 fnmatch。
+
+    不使用子串匹配；pattern 无 * ? [ 且不精确相等时不删除任何行。
+    """
+    matched = {src for src in all_sources if src == pattern}
+    if not matched and any(ch in pattern for ch in "*?["):
+        matched = {src for src in all_sources if fnmatch.fnmatch(src, pattern)}
+    return matched
+
 
 def scan_files(scan_dir: str) -> List[str]:
     """按扩展名扫描目录（跳过排除目录与超限文件）。"""
@@ -524,7 +583,7 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
 
 def add_single_document(filepath: str, scan_dir: str = "",
                         export_markdown_dir: str = "") -> str:
-    """向量化单个文档（避免大批量超时）。
+    """向量化单个文档（避免大批量超时），按最终 source 幂等替换旧版本。
 
     export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
     """
@@ -554,6 +613,7 @@ def add_single_document(filepath: str, scan_dir: str = "",
         ch["ingested_at"] = datetime_now_iso()
 
     table = kb_schema.get_or_create_table()
+    replaced = _delete_source_exact(table, source)
     added = add_chunks(table, chunks)
     kb_schema.ensure_vector_index(table)
     kb_schema.ensure_fts_index(table)
@@ -564,12 +624,13 @@ def add_single_document(filepath: str, scan_dir: str = "",
         f"✅ 文档已入库!\n"
         f"文件: {source}\n"
         f"新增记录: {added}\n"
+        f"替换旧记录: {replaced}\n"
         f"知识库总块数: {len(table)}{extra}"
     )
 
 
 def update_document(filepath: str) -> str:
-    """更新文档：先按文件名删除旧版本，再重新入库。"""
+    """更新文档：按 basename 精确匹配已有 source，沿用原 source 重新入库。"""
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
     ext = Path(filepath).suffix.lower()
@@ -579,26 +640,24 @@ def update_document(filepath: str) -> str:
     fname = os.path.basename(filepath)
     table = kb_schema.get_or_create_table()
 
-    deleted_count = 0
+    matched_source = ""
     if kb_schema.table_exists():
         all_sources = kb_schema.existing_sources(table)
-        matched = {s for s in all_sources if fname.lower() in s.lower()}
-        for src in matched:
-            safe_src = src.replace("'", "''")
-            table.delete(f"source = '{safe_src}'")
-        deleted_count = len(matched)
+        matched_source = _match_existing_source(all_sources, fname)
 
     text, is_md = extract_content(filepath)
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {fname}"
 
-    chunks = chunk_text(text, fname, is_md)
+    source = matched_source or fname
+    chunks = chunk_text(text, source, is_md)
     if not chunks:
-        return f"[ERROR] 分块后无有效内容: {fname}"
+        return f"[ERROR] 分块后无有效内容: {source}"
     for ch in chunks:
         ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
         ch["ingested_at"] = datetime_now_iso()
 
+    deleted_rows = _delete_source_exact(table, source)
     added = add_chunks(table, chunks)
     kb_schema.ensure_vector_index(table)
     kb_schema.ensure_fts_index(table)
@@ -607,7 +666,7 @@ def update_document(filepath: str) -> str:
     return (
         f"✅ 文档已更新!\n"
         f"文件名: {fname}\n"
-        f"删除旧记录: {deleted_count}\n"
+        f"删除旧记录: {deleted_rows}\n"
         f"新增记录: {added}\n"
         f"知识库总块数: {kb_schema.row_count()}"
     )
@@ -615,7 +674,7 @@ def update_document(filepath: str) -> str:
 
 def delete_documents(source_pattern: str = "",
                      confirm_all: bool = False) -> str:
-    """按来源模式删除，或 confirm_all=True 清空整个知识库。"""
+    """按来源精确匹配删除（支持 * ? [ 通配），或 confirm_all=True 清空整个知识库。"""
     if not kb_schema.table_exists():
         return "知识库为空，无需删除。"
     table = kb_schema.get_or_create_table()
@@ -634,7 +693,7 @@ def delete_documents(source_pattern: str = "",
 
     if source_pattern:
         all_sources = kb_schema.existing_sources(table)
-        matched = {s for s in all_sources if source_pattern.lower() in s.lower()}
+        matched = _match_sources_for_delete(all_sources, source_pattern)
         if not matched:
             return f"未找到匹配「{source_pattern}」的文档。知识库中共有 {total_before} 条记录。"
         deleted = 0
