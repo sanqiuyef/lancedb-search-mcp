@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""kb_watcher：watchdog 事件处理与多目录监听。
+"""kb_watcher：watchdog 事件处理、尾沿防抖、批量删除与多目录监听。
 
 测试直接调用 handler 方法并伪造 SimpleNamespace 事件，不启动真实文件系统
 事件循环，也不访问 LanceDB / vault；ingest 的更新与删除均用 monkeypatch 替身。
+防抖计时器通过注入模块常量、手动 Timer 或 flush_pending() 控制，不真等 5 秒。
 """
 
 import os
@@ -39,12 +40,35 @@ def _write(path, text="这是足够长的测试内容，用于通过 watcher 的
         f.write(text)
 
 
+class _ManualTimer:
+    """可手动触发的 Timer 替身，用于确定性地验证尾沿防抖。"""
+
+    def __init__(self, interval, function, args=(), kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.cancelled = False
+        self.started = False
+        self.daemon = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function(*self.args, **self.kwargs)
+
+
 class TestEventHandlers(unittest.TestCase):
     def setUp(self):
         self.dir = _temp_dir(self)
         self.path = os.path.join(self.dir, "note.md")
         _write(self.path)
-        self.handler = kb_watcher._AutoIndexHandler()
+        self.handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(self.handler.cancel_pending)
 
     def test_created_event_reindexes_without_is_dir_attribute(self):
         event = _file_event(src_path=self.path)  # 无 is_dir 属性
@@ -52,6 +76,7 @@ class TestEventHandlers(unittest.TestCase):
             kb_watcher.kb_ingest, "update_document", return_value="✅ 文档已更新!"
         ) as update:
             self.handler.on_created(event)
+            self.handler.flush_pending()
         update.assert_called_once_with(self.path)
 
     def test_modified_event_reindexes_without_is_dir_attribute(self):
@@ -60,6 +85,7 @@ class TestEventHandlers(unittest.TestCase):
             kb_watcher.kb_ingest, "update_document", return_value="✅ 文档已更新!"
         ) as update:
             self.handler.on_modified(event)
+            self.handler.flush_pending()
         update.assert_called_once_with(self.path)
 
     def test_directory_events_are_ignored(self):
@@ -73,32 +99,46 @@ class TestEventHandlers(unittest.TestCase):
             self.handler.on_modified(event)
             self.handler.on_moved(event)
             self.handler.on_deleted(event)
+            self.handler.flush_pending()
         update.assert_not_called()
         delete.assert_not_called()
+        self.assertEqual(self.handler._TIMERS, {})
+        self.assertEqual(self.handler._pending_deletes, set())
 
     def test_created_and_modified_share_debounce_per_path(self):
         other = os.path.join(self.dir, "other.md")
         _write(other)
+        key = kb_watcher._normalize_path(self.path)
         with mock.patch.object(
             kb_watcher.kb_ingest, "update_document", return_value="ok"
         ) as update:
             self.handler.on_created(_file_event(src_path=self.path))
             self.handler.on_modified(_file_event(src_path=self.path))
             self.handler.on_created(_file_event(src_path=self.path))
+            self.assertIn(key, self.handler._TIMERS)
+            update.assert_not_called()
+
+            self.handler.flush_pending()
             self.assertEqual(update.call_count, 1)
-            self.assertIn(self.path, self.handler._debounce)
+            self.assertNotIn(key, self.handler._TIMERS)
 
             # 另一个路径不受同一路径防抖影响
             self.handler.on_created(_file_event(src_path=other))
+            self.assertEqual(update.call_count, 1)
+            self.handler.flush_pending()
             self.assertEqual(update.call_count, 2)
 
     def test_debounce_state_directly_suppresses_event(self):
-        self.handler._debounce[self.path] = time.time()
+        key = kb_watcher._normalize_path(self.path)
         with mock.patch.object(
             kb_watcher.kb_ingest, "update_document", return_value="ok"
         ) as update:
             self.handler.on_created(_file_event(src_path=self.path))
-        update.assert_not_called()
+            # 事件只登记待执行计时器，不在事件线程里立即执行
+            self.assertIn(key, self.handler._TIMERS)
+            update.assert_not_called()
+            self.handler.flush_pending()
+        update.assert_called_once_with(self.path)
 
     def test_moved_deletes_old_source_then_reindexes_dest(self):
         src = os.path.join(self.dir, "old.md")
@@ -120,6 +160,7 @@ class TestEventHandlers(unittest.TestCase):
             kb_watcher.kb_ingest, "delete_documents", side_effect=delete_side_effect
         ) as delete:
             self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
+            self.handler.flush_pending()
 
         self.assertEqual(calls, [("delete", "old.md"), ("update", dest)])
         delete.assert_called_once_with(source_pattern="old.md")
@@ -137,24 +178,35 @@ class TestEventHandlers(unittest.TestCase):
         ) as delete:
             self.handler.on_moved(event)
             self.handler.on_moved(event)
-        # 整个 move 操作按 dest_path 防抖：删旧 + 重建都只执行一次
+            self.handler.flush_pending()
+        # 整个 move 操作按 src+dest 组合键防抖：删旧 + 重建都只执行一次
         delete.assert_called_once_with(source_pattern="old.md")
         update.assert_called_once_with(dest)
 
     def test_deleted_immediately_removes_source_even_if_debounced(self):
         src = os.path.join(self.dir, "gone.md")
-        # 即使该路径刚被防抖记录，删除事件也必须立即处理
-        self.handler._debounce[src] = time.time()
+        key = kb_watcher._normalize_path(src)
         with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
             kb_watcher.kb_ingest, "delete_documents", return_value="ok"
         ) as delete:
+            # 该路径有待执行的重索引时，删除事件先取消它，再排队删除
+            self.handler.on_created(_file_event(src_path=src))
+            self.assertIn(key, self.handler._TIMERS)
             self.handler.on_deleted(_file_event(src_path=src))
+            self.assertNotIn(key, self.handler._TIMERS)
+            self.handler.flush_pending()
         delete.assert_called_once_with(source_pattern="gone.md")
+        update.assert_not_called()
 
     def test_handler_swallows_ingest_exceptions(self):
         src = os.path.join(self.dir, "old.md")
+        src2 = os.path.join(self.dir, "old2.md")
         dest = os.path.join(self.dir, "new.md")
+        other = os.path.join(self.dir, "other.md")
         _write(dest)
+        _write(other)
         with mock.patch.object(
             kb_watcher.kb_ingest,
             "update_document",
@@ -166,11 +218,233 @@ class TestEventHandlers(unittest.TestCase):
         ) as delete:
             # 任何 ingest 异常都不能从 handler 冒出（否则 watchdog 线程退出）
             self.handler.on_created(_file_event(src_path=self.path))
-            self.handler.on_modified(_file_event(src_path=self.path))
+            self.handler.on_modified(_file_event(src_path=other))
             self.handler.on_deleted(_file_event(src_path=src))
-            self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
+            self.handler.on_moved(_file_event(src_path=src2, dest_path=dest))
+            self.handler.flush_pending()
         self.assertGreaterEqual(update.call_count, 2)
         self.assertGreaterEqual(delete.call_count, 2)
+
+
+class TestIsIndexable(unittest.TestCase):
+    def test_supported_extension_is_indexable(self):
+        self.assertTrue(kb_watcher._is_indexable(os.path.join("root", "note.md")))
+        self.assertTrue(kb_watcher._is_indexable(os.path.join("root", "DATA.JSON")))
+        self.assertTrue(kb_watcher._is_indexable(os.path.join("root", "script.PY")))
+        self.assertFalse(kb_watcher._is_indexable(os.path.join("root", "note.exe")))
+        self.assertFalse(kb_watcher._is_indexable(os.path.join("root", "README")))
+
+    def test_excluded_directory_segments_are_rejected(self):
+        for name in ("node_modules", ".git", "__pycache__", ".venv",
+                     "truncated-results"):
+            with self.subTest(name=name):
+                self.assertFalse(
+                    kb_watcher._is_indexable(os.path.join("root", name, "note.md"))
+                )
+        self.assertFalse(
+            kb_watcher._is_indexable(os.path.join("root", ".git", "nested", "x.py"))
+        )
+
+    def test_similar_directory_or_filename_is_not_excluded(self):
+        self.assertTrue(
+            kb_watcher._is_indexable(
+                os.path.join("root", "node_modules_backup", "note.md")
+            )
+        )
+        self.assertTrue(
+            kb_watcher._is_indexable(os.path.join("root", "node_modules.md"))
+        )
+
+    def test_directory_like_paths_are_not_indexable(self):
+        directory = os.path.join("root", "notes")
+        self.assertFalse(kb_watcher._is_indexable(directory))
+        self.assertFalse(kb_watcher._is_indexable(directory + os.sep))
+        self.assertFalse(kb_watcher._is_indexable(""))
+
+
+class TestEventFiltering(unittest.TestCase):
+    def setUp(self):
+        self.dir = _temp_dir(self)
+        self.handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(self.handler.cancel_pending)
+
+    def test_deleted_event_in_excluded_dir_does_not_touch_index(self):
+        path = os.path.join(self.dir, ".git", "note.md")
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+        ) as delete:
+            self.handler.on_deleted(_file_event(src_path=path))
+            self.handler.flush_pending()
+        delete.assert_not_called()
+
+    def test_created_event_with_unsupported_extension_does_not_schedule(self):
+        path = os.path.join(self.dir, "note.exe")
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update:
+            self.handler.on_created(_file_event(src_path=path))
+            self.assertEqual(self.handler._TIMERS, {})
+            self.handler.flush_pending()
+        update.assert_not_called()
+
+
+class TestTrailingEdgeDebounce(unittest.TestCase):
+    def setUp(self):
+        self.dir = _temp_dir(self)
+        self.path = os.path.join(self.dir, "note.md")
+        _write(self.path)
+
+    def test_only_latest_timer_survives_and_stale_timer_is_ignored(self):
+        with mock.patch.object(kb_watcher.threading, "Timer", _ManualTimer):
+            handler = kb_watcher._AutoIndexHandler(self.dir)
+            self.addCleanup(handler.cancel_pending)
+            event = _file_event(src_path=self.path)
+            key = kb_watcher._normalize_path(self.path)
+            with mock.patch.object(
+                kb_watcher.kb_ingest, "update_document", return_value="ok"
+            ) as update:
+                handler.on_created(event)
+                first = handler._TIMERS[key]
+                handler.on_modified(event)
+                second = handler._TIMERS[key]
+
+                self.assertIsNot(first, second)
+                self.assertTrue(first.cancelled)
+                # 已过期的 Timer 即使触发也不能执行
+                first.fire()
+                self.assertEqual(update.call_count, 0)
+                second.fire()
+                self.assertEqual(update.call_count, 1)
+                self.assertEqual(update.call_args_list, [mock.call(self.path)])
+
+    def test_rapid_events_execute_once_after_quiet_period(self):
+        with mock.patch.object(kb_watcher, "_DEBOUNCE_SECONDS", 0.1):
+            handler = kb_watcher._AutoIndexHandler(self.dir)
+            self.addCleanup(handler.cancel_pending)
+            event = _file_event(src_path=self.path)
+            with mock.patch.object(
+                kb_watcher.kb_ingest, "update_document", return_value="ok"
+            ) as update:
+                handler.on_created(event)
+                handler.on_modified(event)
+                handler.on_created(event)
+                deadline = time.time() + 2.0
+                while update.call_count == 0 and time.time() < deadline:
+                    time.sleep(0.01)
+                time.sleep(0.15)  # 再等一段，确认没有第二次执行
+                self.assertEqual(update.call_count, 1)
+                self.assertNotIn(kb_watcher._normalize_path(self.path),
+                                 handler._TIMERS)
+
+    def test_failed_update_is_retried_on_next_event(self):
+        handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(handler.cancel_pending)
+        event = _file_event(src_path=self.path)
+        key = kb_watcher._normalize_path(self.path)
+        with mock.patch.object(
+            kb_watcher.kb_ingest,
+            "update_document",
+            side_effect=[RuntimeError("boom"), "ok"],
+        ) as update:
+            handler.on_created(event)
+            handler.flush_pending()
+            self.assertEqual(update.call_count, 1)
+            # 失败后不保留成功状态，下一次事件仍会重新安排
+            self.assertNotIn(key, handler._TIMERS)
+
+            handler.on_modified(event)
+            handler.flush_pending()
+        self.assertEqual(update.call_count, 2)
+        self.assertEqual(update.call_args_list,
+                         [mock.call(self.path), mock.call(self.path)])
+
+
+class TestMovedRootBoundary(unittest.TestCase):
+    def setUp(self):
+        self.dir = _temp_dir(self)
+        self.handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(self.handler.cancel_pending)
+
+    def test_moved_within_root_deletes_source_and_reindexes_dest(self):
+        src = os.path.join(self.dir, "old.md")
+        dest = os.path.join(self.dir, "new.md")
+        _write(dest)
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+        ) as delete:
+            self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
+            self.handler.flush_pending()
+        delete.assert_called_once_with(source_pattern="old.md")
+        update.assert_called_once_with(dest)
+
+    def test_moved_outside_root_only_deletes_source(self):
+        outside = _temp_dir(self)
+        src = os.path.join(self.dir, "old.md")
+        dest = os.path.join(outside, "new.md")
+        _write(dest)
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+        ) as delete:
+            self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
+            self.handler.flush_pending()
+        delete.assert_called_once_with(source_pattern="old.md")
+        update.assert_not_called()
+
+    def test_moved_into_excluded_subdir_is_not_reindexed(self):
+        src = os.path.join(self.dir, "old.md")
+        dest = os.path.join(self.dir, ".git", "new.md")
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+        ) as delete:
+            self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
+            self.handler.flush_pending()
+        delete.assert_called_once_with(source_pattern="old.md")
+        update.assert_not_called()
+
+
+class TestDeleteBatching(unittest.TestCase):
+    def setUp(self):
+        self.dir = _temp_dir(self)
+        self.handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(self.handler.cancel_pending)
+
+    def test_repeated_deletes_are_deduplicated_and_batched(self):
+        first = os.path.join(self.dir, "a.md")
+        second = os.path.join(self.dir, "b.md")
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+        ) as delete:
+            self.handler.on_deleted(_file_event(src_path=first))
+            self.handler.on_deleted(_file_event(src_path=first))
+            self.handler.on_deleted(_file_event(src_path=second))
+            self.assertEqual(len(self.handler._pending_deletes), 2)
+            delete.assert_not_called()
+            self.handler.flush_pending()
+        self.assertEqual(delete.call_count, 2)
+        patterns = {c.kwargs["source_pattern"] for c in delete.call_args_list}
+        self.assertEqual(patterns, {"a.md", "b.md"})
+
+    def test_delete_flush_timer_batches_within_window(self):
+        with mock.patch.object(kb_watcher, "_DELETE_FLUSH_SECONDS", 0.1):
+            handler = kb_watcher._AutoIndexHandler(self.dir)
+            self.addCleanup(handler.cancel_pending)
+            with mock.patch.object(
+                kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+            ) as delete:
+                handler.on_deleted(_file_event(src_path=os.path.join(self.dir, "a.md")))
+                handler.on_deleted(_file_event(src_path=os.path.join(self.dir, "b.md")))
+                delete.assert_not_called()
+                deadline = time.time() + 2.0
+                while delete.call_count < 2 and time.time() < deadline:
+                    time.sleep(0.01)
+                time.sleep(0.1)
+                self.assertEqual(delete.call_count, 2)
 
 
 class _FakeObserver:
@@ -183,6 +457,8 @@ class _FakeObserver:
         self.started = False
         self.stopped = False
         self.joined = None
+        self.alive = False
+        self.hang_on_join = False
         _FakeObserver.instances.append(self)
 
     def schedule(self, handler, path, recursive=False):
@@ -190,12 +466,18 @@ class _FakeObserver:
 
     def start(self):
         self.started = True
+        self.alive = True
 
     def stop(self):
         self.stopped = True
 
     def join(self, timeout=None):
         self.joined = timeout
+        if not self.hang_on_join:
+            self.alive = False
+
+    def is_alive(self):
+        return self.alive
 
 
 class TestWatcherLifecycle(unittest.TestCase):
@@ -228,25 +510,29 @@ class TestWatcherLifecycle(unittest.TestCase):
         self.assertEqual(len(observer.scheduled), 1)
         handler, path, recursive = observer.scheduled[0]
         self.assertIsInstance(handler, kb_watcher._AutoIndexHandler)
-        self.assertEqual(path, os.path.abspath(self.dir1))
+        self.assertEqual(path, os.path.realpath(self.dir1))
         self.assertTrue(recursive)
 
     def test_two_dirs_start_and_stop_individually(self):
         kb_watcher.start_watcher(self.dir1)
         kb_watcher.start_watcher(self.dir2)
 
+        key1 = kb_watcher._normalize_path(self.dir1)
+        key2 = kb_watcher._normalize_path(self.dir2)
         self.assertEqual(len(kb_watcher._OBSERVERS), 2)
         self.assertEqual(len(_FakeObserver.instances), 2)
         running, dirs = kb_watcher.watcher_running()
         self.assertTrue(running)
-        self.assertIn(os.path.abspath(self.dir1), dirs)
-        self.assertIn(os.path.abspath(self.dir2), dirs)
+        self.assertIn(key1, dirs)
+        self.assertIn(key2, dirs)
 
         message = kb_watcher.stop_watcher(self.dir1)
         self.assertIn("已停止", message)
         self.assertEqual(len(kb_watcher._OBSERVERS), 1)
         self.assertTrue(_FakeObserver.instances[0].stopped)
         self.assertFalse(_FakeObserver.instances[1].stopped)
+        self.assertFalse(_FakeObserver.instances[0].is_alive())
+        self.assertTrue(_FakeObserver.instances[1].is_alive())
 
         kb_watcher.stop_watcher()
         self.assertEqual(len(kb_watcher._OBSERVERS), 0)
@@ -256,7 +542,7 @@ class TestWatcherLifecycle(unittest.TestCase):
     def test_default_watch_dir_is_cwd_and_reported(self):
         message = kb_watcher.start_watcher()
         self.assertIn("文件监听已启动", message)
-        self.assertIn(os.path.abspath(os.getcwd()), message)
+        self.assertIn(os.path.realpath(os.getcwd()), message)
         self.assertIn("默认监听当前工作目录", message)
         self.assertEqual(len(_FakeObserver.instances), 1)
 
@@ -266,6 +552,91 @@ class TestWatcherLifecycle(unittest.TestCase):
         self.assertIn("目录不存在", message)
         self.assertEqual(len(_FakeObserver.instances), 0)
         self.assertEqual(len(kb_watcher._OBSERVERS), 0)
+
+    def test_registry_normalizes_case_dot_and_realpath(self):
+        kb_watcher.start_watcher(self.dir1)
+        key = kb_watcher._normalize_path(self.dir1)
+        self.assertIn(key, kb_watcher._OBSERVERS)
+
+        variants = [os.path.join(self.dir1, ".", "sub", "..")]
+        if os.path.normcase(self.dir1.upper()) == os.path.normcase(self.dir1):
+            variants.append(self.dir1.upper())
+        for variant in variants:
+            with self.subTest(variant=variant):
+                message = kb_watcher.start_watcher(variant)
+                self.assertIn("已在运行", message)
+                self.assertEqual(len(kb_watcher._OBSERVERS), 1)
+                self.assertEqual(len(_FakeObserver.instances), 1)
+
+    def test_parent_and_child_dirs_overlap_is_rejected(self):
+        child = os.path.join(self.dir1, "sub")
+        os.makedirs(child)
+
+        kb_watcher.start_watcher(self.dir1)
+        message = kb_watcher.start_watcher(child)
+        self.assertIn("父子目录重叠", message)
+        self.assertEqual(len(kb_watcher._OBSERVERS), 1)
+
+        kb_watcher.stop_watcher()
+        self.assertIn("文件监听已启动", kb_watcher.start_watcher(child))
+        message = kb_watcher.start_watcher(self.dir1)
+        self.assertIn("父子目录重叠", message)
+        self.assertEqual(len(kb_watcher._OBSERVERS), 1)
+
+    def test_stop_timeout_keeps_registry_and_allows_retry(self):
+        kb_watcher.start_watcher(self.dir1)
+        observer = _FakeObserver.instances[0]
+        observer.hang_on_join = True
+
+        message = kb_watcher.stop_watcher(self.dir1)
+        self.assertIn("停止失败", message)
+        self.assertIn(kb_watcher._normalize_path(self.dir1),
+                      kb_watcher._OBSERVERS)
+        self.assertTrue(observer.stopped)
+        self.assertTrue(observer.is_alive())
+
+        running, _ = kb_watcher.watcher_running()
+        self.assertTrue(running)
+
+        observer.hang_on_join = False
+        message = kb_watcher.stop_watcher(self.dir1)
+        self.assertIn("已停止", message)
+        self.assertEqual(kb_watcher._OBSERVERS, {})
+        self.assertFalse(observer.is_alive())
+
+    def test_stop_all_reports_failure_and_keeps_failed_entry(self):
+        kb_watcher.start_watcher(self.dir1)
+        kb_watcher.start_watcher(self.dir2)
+        _FakeObserver.instances[0].hang_on_join = True
+
+        message = kb_watcher.stop_watcher()
+        key1 = kb_watcher._normalize_path(self.dir1)
+        key2 = kb_watcher._normalize_path(self.dir2)
+        self.assertIn("停止失败", message)
+        self.assertIn(key1, message)
+        self.assertIn(key2, message)
+        self.assertIn(key1, kb_watcher._OBSERVERS)
+        self.assertNotIn(key2, kb_watcher._OBSERVERS)
+
+    def test_watcher_running_prunes_dead_observers(self):
+        kb_watcher.start_watcher(self.dir1)
+        _FakeObserver.instances[0].alive = False
+
+        running, dirs = kb_watcher.watcher_running()
+        self.assertFalse(running)
+        self.assertEqual(dirs, "")
+        self.assertEqual(kb_watcher._OBSERVERS, {})
+
+    def test_stop_then_restart_same_dir(self):
+        kb_watcher.start_watcher(self.dir1)
+        self.assertIn("已停止", kb_watcher.stop_watcher(self.dir1))
+
+        message = kb_watcher.start_watcher(self.dir1)
+        self.assertIn("文件监听已启动", message)
+        self.assertEqual(len(kb_watcher._OBSERVERS), 1)
+        self.assertEqual(len(_FakeObserver.instances), 2)
+        self.assertTrue(_FakeObserver.instances[1].started)
+        self.assertTrue(_FakeObserver.instances[1].is_alive())
 
 
 if __name__ == "__main__":
