@@ -5,17 +5,23 @@
 「查文献库」面板；检索内核直接复用 kb.search.search_structured
 （向量 / BM25 / 混合 + 本地 bge 精排），不依赖 MCP 与任何 Obsidian 插件。
 
+Phase 6 追加只读 Wiki 浏览与提案审核路由（``/api/wiki/*``），全部复用
+``kb.wiki.service`` 门面；WIKI_ENABLED 未开启或 vault/DB 未配置时返回 503，
+不影响原有检索接口。
+
 仅绑定 127.0.0.1（默认端口 8002）。启动器见 run_ui.cmd。
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -25,6 +31,34 @@ from kb import config as cfg  # noqa: E402
 PORT = int(os.environ.get("LANCEDB_UI_PORT", "8002"))
 UI_HTML = HERE / "ui" / "index.html"
 _search_lock = threading.Lock()  # 串行化检索（模型推理不并发）
+
+MAX_BODY_BYTES = 64 * 1024
+_WIKI_HINT = "设置 WIKI_ENABLED=1、WIKI_VAULT_PATH 与 WIKI_DB_PATH 后重启服务"
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+_WIKI_GET_ROUTES = frozenset(
+    {
+        "/api/wiki/status",
+        "/api/wiki/pages",
+        "/api/wiki/page",
+        "/api/wiki/proposals",
+        "/api/wiki/proposal",
+        "/api/wiki/validate",
+    }
+)
+
+
+class _WikiUnavailable(RuntimeError):
+    """Wiki 未启用或 vault/DB 未配置。"""
+
+
+class _BadRequest(ValueError):
+    """请求参数或 JSON 体非法。"""
+
+
+class _BodyTooLarge(ValueError):
+    """请求体超过上限。"""
 
 
 def _status() -> dict:
@@ -66,8 +100,73 @@ def _search(payload: dict) -> dict:
     return {"ok": True, **out}
 
 
+def _json_default(value):
+    """把 YAML 解析出的日期等对象转成 JSON 可序列化值。"""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def _wiki_config():
+    """每个请求按环境变量解析 Wiki 配置，运行时开关/路径变更即时生效。"""
+    from kb.wiki.config import WikiConfig, WikiConfigError
+
+    try:
+        config = WikiConfig.from_env()
+    except WikiConfigError as exc:
+        raise _WikiUnavailable(str(exc)) from exc
+    if not config.enabled:
+        raise _WikiUnavailable("WIKI_ENABLED 未开启")
+    if not config.vault_path or not os.path.isdir(config.vault_path):
+        raise _WikiUnavailable("Wiki vault 未配置或目录不存在")
+    if not config.db_path or os.path.isdir(config.db_path):
+        raise _WikiUnavailable("Wiki DB 未配置")
+    return config
+
+
+def _wiki_service():
+    from kb.wiki import service
+
+    return service
+
+
+def _query_value(params: dict, name: str, default: str = "") -> str:
+    values = params.get(name)
+    if not values:
+        return default
+    return values[0]
+
+
+def _int_query(params: dict, name: str, default: int) -> int:
+    raw = _query_value(params, name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise _BadRequest(f"{name} 必须是整数") from exc
+
+
+def _flag_query(params: dict, name: str) -> bool:
+    raw = _query_value(params, name, "").strip().lower()
+    if not raw:
+        return True
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    raise _BadRequest(f"{name} 只接受 1/0")
+
+
+def _required_query(params: dict, name: str) -> str:
+    value = _query_value(params, name, "").strip()
+    if not value:
+        raise _BadRequest(f"缺少参数 {name}")
+    return value
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LanceDBUI/0.1"
+    server_version = "LanceDBUI/0.2"
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
@@ -81,11 +180,137 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict) -> None:
         self._send(
             code,
-            json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+            json.dumps(
+                obj, ensure_ascii=False, default=_json_default
+            ).encode("utf-8"),
             "application/json; charset=utf-8",
         )
 
+    def _client_is_local(self) -> bool:
+        address = self.client_address[0] if self.client_address else ""
+        return address in _LOCAL_HOSTS
+
+    def _read_json_body(self) -> dict:
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None or not raw_length.strip():
+            length = 0
+        else:
+            try:
+                length = int(raw_length)
+            except ValueError as exc:
+                raise _BadRequest("bad request: Content-Length 非法") from exc
+        if length < 0:
+            raise _BadRequest("bad request: Content-Length 非法")
+        if length > MAX_BODY_BYTES:
+            raise _BodyTooLarge(f"请求体超过 {MAX_BODY_BYTES} 字节上限")
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _BadRequest(f"bad request: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise _BadRequest("bad request: JSON 必须是对象")
+        return payload
+
+    def _json_error(self, exc: Exception) -> None:
+        if isinstance(exc, _BodyTooLarge):
+            self._json(413, {"ok": False, "error": str(exc)})
+            return
+        if isinstance(exc, _BadRequest):
+            self._json(400, {"ok": False, "error": str(exc)})
+            return
+        if isinstance(exc, _WikiUnavailable):
+            self._json(
+                503,
+                {"ok": False, "error": "wiki disabled", "hint": _WIKI_HINT},
+            )
+            return
+        # 只回传异常文本，不把栈或内部路径细节写进响应。
+        self._json(500, {"ok": False, "error": str(exc)})
+
+    def _handle_wiki_get(self, parsed) -> None:
+        if parsed.path not in _WIKI_GET_ROUTES:
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            config = _wiki_config()
+            service = _wiki_service()
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            if parsed.path == "/api/wiki/status":
+                result = service.status(config=config)
+            elif parsed.path == "/api/wiki/pages":
+                result = service.list_pages(
+                    page_type=_query_value(params, "page_type", ""),
+                    status=_query_value(params, "status", "published"),
+                    limit=_int_query(params, "limit", 50),
+                    cursor=_query_value(params, "cursor", ""),
+                    config=config,
+                )
+            elif parsed.path == "/api/wiki/page":
+                result = service.get_page(
+                    _required_query(params, "id"),
+                    include_sources=_flag_query(params, "sources"),
+                    include_backlinks=_flag_query(params, "backlinks"),
+                    config=config,
+                )
+            elif parsed.path == "/api/wiki/proposals":
+                result = service.review_queue(
+                    status=_query_value(params, "status", "pending"),
+                    limit=_int_query(params, "limit", 20),
+                    config=config,
+                )
+            elif parsed.path == "/api/wiki/proposal":
+                result = service.get_proposal(
+                    _required_query(params, "id"), config=config
+                )
+            else:  # /api/wiki/validate
+                result = service.validate(
+                    scope=_query_value(params, "scope", "all") or "all",
+                    config=config,
+                )
+        except Exception as exc:  # noqa: BLE001 - 统一转 JSON 错误
+            self._json_error(exc)
+            return
+        try:
+            self._json(200, result)
+        except Exception as exc:  # noqa: BLE001 - 序列化失败也不泄露栈
+            self._json(500, {"ok": False, "error": str(exc)})
+
+    def _handle_wiki_apply(self) -> None:
+        try:
+            config = _wiki_config()
+            service = _wiki_service()
+            payload = self._read_json_body()
+            proposal_id = payload.get("proposal_id")
+            if not isinstance(proposal_id, str) or not proposal_id.strip():
+                raise _BadRequest("缺少 proposal_id")
+            decision = payload.get("decision")
+            decision_key = decision.strip().lower() if isinstance(decision, str) else ""
+            if decision_key not in ("approve", "reject"):
+                raise _BadRequest("decision 必须是 approve 或 reject")
+            review_note = payload.get("review_note", "")
+            if review_note is None:
+                review_note = ""
+            if not isinstance(review_note, str):
+                raise _BadRequest("review_note 必须是字符串")
+            result = service.apply_proposal(
+                proposal_id.strip(),
+                decision_key,
+                review_note,
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一转 JSON 错误
+            self._json_error(exc)
+            return
+        try:
+            self._json(200, result)
+        except Exception as exc:  # noqa: BLE001 - 序列化失败也不泄露栈
+            self._json(500, {"ok": False, "error": str(exc)})
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._client_is_local():
+            self._json(403, {"ok": False, "error": "只允许本机访问"})
+            return
         if self.path in ("/", "/index.html"):
             try:
                 html = UI_HTML.read_bytes()
@@ -99,22 +324,31 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/status":
             self._json(200, _status())
             return
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/wiki/"):
+            self._handle_wiki_get(parsed)
+            return
         self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/api/search":
-            self._json(404, {"ok": False, "error": "not found"})
+        if not self._client_is_local():
+            self._json(403, {"ok": False, "error": "只允许本机访问"})
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        except Exception as e:  # noqa: BLE001
-            self._json(400, {"ok": False, "error": f"bad request: {e}"})
+        if self.path == "/api/search":
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:  # noqa: BLE001 - 400/413
+                self._json_error(exc)
+                return
+            try:
+                self._json(200, _search(payload))
+            except Exception as e:  # noqa: BLE001 - 保留原有检索错误语义
+                self._json(200, {"ok": False, "error": str(e)})
             return
-        try:
-            self._json(200, _search(payload))
-        except Exception as e:  # noqa: BLE001
-            self._json(200, {"ok": False, "error": str(e)})
+        if urlparse(self.path).path == "/api/wiki/apply":
+            self._handle_wiki_apply()
+            return
+        self._json(404, {"ok": False, "error": "not found"})
 
     def log_message(self, fmt: str, *args) -> None:  # 静音常规访问日志
         pass

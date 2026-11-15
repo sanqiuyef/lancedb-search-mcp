@@ -72,9 +72,155 @@
     animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── 顶部标签 ── */
+  .tabs {
+    display: flex; gap: 2px; margin: -2px 0 10px; padding: 2px 0 0;
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--bg); z-index: 5;
+  }
+  .tab {
+    border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    background: transparent; color: var(--muted); padding: 5px 11px; font-size: 13px;
+  }
+  .tab:hover { color: var(--fg); border-bottom-color: var(--border); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .view[hidden] { display: none; }
+
+  /* ── Wiki / 审核共用 ── */
+  .muted { color: var(--muted); font-size: 12px; }
+  .notice {
+    border: 1px dashed var(--border); background: var(--card); color: var(--muted);
+    border-radius: 10px; padding: 13px 15px; margin-top: 10px; white-space: pre-wrap;
+  }
+  .notice.error { border-color: #ef4444; color: #ef4444; }
+  .wiki-layout, .review-layout {
+    display: flex; gap: 12px; margin-top: 10px; align-items: flex-start;
+  }
+  .wiki-side {
+    flex: 0 0 300px; min-width: 230px; max-width: 40%;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--card);
+    padding: 8px; position: sticky; top: 44px;
+    max-height: calc(100vh - 60px); overflow: auto;
+  }
+  .wiki-main { flex: 1 1 auto; min-width: 0; }
+  .wiki-filters { margin-top: 0; }
+  .wiki-list { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .wiki-item {
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+    padding: 7px 9px; cursor: pointer;
+  }
+  .wiki-item:hover { border-color: var(--accent); }
+  .wiki-item.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .wiki-item .t { font-weight: 600; word-break: break-word; }
+  .wiki-item .m { color: var(--muted); font-size: 11.5px; margin-top: 2px; word-break: break-all; }
+  .wiki-item .r {
+    color: var(--fg); font-size: 12px; margin-top: 3px; display: -webkit-box;
+    -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .badge {
+    display: inline-block; border-radius: 5px; padding: 0 5px; font-size: 11px;
+    background: var(--accent-soft); color: var(--accent); margin-right: 4px;
+  }
+  .badge.status-draft { background: #fef3c7; color: #92400e; }
+  .badge.status-review { background: #dbeafe; color: #1e40af; }
+  .badge.status-archived { background: #e5e7eb; color: #4b5563; }
+  @media (prefers-color-scheme: dark) {
+    .badge.status-draft { background: #422006; color: #fcd34d; }
+    .badge.status-review { background: #172554; color: #93c5fd; }
+    .badge.status-archived { background: #27272a; color: #a1a1aa; }
+  }
+  .more { width: 100%; margin-top: 8px; }
+  .reader-empty {
+    border: 1px dashed var(--border); border-radius: 10px; padding: 26px 18px;
+    color: var(--muted); text-align: center;
+  }
+  .reader {
+    border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+    background: var(--bg);
+  }
+  .reader h2 { margin: 0 0 5px; font-size: 17px; line-height: 1.4; word-break: break-word; }
+  .reader .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .reader .summary {
+    background: var(--accent-soft); border-radius: 8px; padding: 8px 10px;
+    margin: 10px 0; font-size: 12.5px; white-space: pre-wrap; word-break: break-word;
+  }
+  .reader .section { margin-top: 16px; }
+  .reader .section h3 {
+    font-size: 12px; margin: 0 0 6px; color: var(--muted);
+    letter-spacing: .04em; text-transform: uppercase;
+  }
+  .md { line-height: 1.7; word-break: break-word; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 14px 0 6px; line-height: 1.35; }
+  .md h1 { font-size: 18px; } .md h2 { font-size: 16px; } .md h3 { font-size: 14.5px; }
+  .md p { margin: 0 0 8px; }
+  .md ul, .md ol { margin: 0 0 8px; padding-left: 22px; }
+  .md li { margin: 2px 0; }
+  .md pre {
+    background: var(--code); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; overflow-x: auto; font-size: 12px; line-height: 1.5;
+  }
+  .md code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .92em; }
+  .md :not(pre) > code { background: var(--code); border-radius: 4px; padding: 1px 4px; }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  .linklist { margin: 0; padding-left: 18px; font-size: 12.5px; }
+  .linklist li { margin: 3px 0; word-break: break-word; }
+  .link {
+    color: var(--accent); cursor: pointer; text-decoration: underline;
+    background: none; border: none; padding: 0; font: inherit;
+  }
+  .link:hover { border: none; }
+  .evidence {
+    border-left: 3px solid var(--accent-soft); padding: 6px 10px; margin: 8px 0;
+    background: var(--card); border-radius: 6px; font-size: 12.5px;
+  }
+  .evidence blockquote {
+    margin: 5px 0 0; color: var(--muted); font-size: 12px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .rationale {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; white-space: pre-wrap; font-size: 12.5px; margin: 0;
+  }
+  .note {
+    width: 100%; min-height: 62px; padding: 7px 9px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit;
+    resize: vertical;
+  }
+  .note:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  button.approve { background: #16a34a; border-color: #16a34a; color: #fff; }
+  button.approve:hover { filter: brightness(1.06); }
+  button.danger { border-color: #ef4444; color: #ef4444; }
+  button.danger:hover { background: rgba(239, 68, 68, .08); }
+  .diff {
+    background: var(--code); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; overflow: auto; white-space: pre;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  .diff .add { color: #15803d; background: rgba(34, 197, 94, .14); display: block; }
+  .diff .del { color: #b91c1c; background: rgba(239, 68, 68, .14); display: block; }
+  .diff .hunk { color: var(--accent); display: block; }
+  .diff .head { color: var(--muted); font-weight: 600; display: block; }
+  @media (prefers-color-scheme: dark) {
+    .diff .add { color: #4ade80; } .diff .del { color: #f87171; }
+  }
+  .result { margin-top: 8px; font-size: 12.5px; white-space: pre-wrap; }
+  .result.ok { color: #15803d; } .result.err { color: #ef4444; }
+  @media (max-width: 760px) {
+    .wiki-layout, .review-layout { flex-direction: column; }
+    .wiki-side { position: static; max-height: none; flex-basis: auto; width: 100%; max-width: none; }
+  }
 </style>
 </head>
 <body>
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-view="search">检索</button>
+  <button class="tab" data-view="wiki">Wiki</button>
+  <button class="tab" data-view="review">审核</button>
+</nav>
+
+<section id="view-search" class="view">
 <h1><span class="dot" id="dot"></span>LanceDB 文献检索 <span class="rows" id="rows"></span></h1>
 
 <input id="q" placeholder="搜索 116 篇文献切片…（回车检索）" autocomplete="off">
@@ -100,6 +246,53 @@
 <div id="meta"></div>
 <div id="hint">提示：首次检索需加载本地向量模型（约 3–8 秒），之后空闲会自动卸载。</div>
 <div id="list"></div>
+</section>
+
+<section id="view-wiki" class="view" hidden>
+  <div id="wikiNotice" class="notice" hidden></div>
+  <div class="wiki-layout" id="wikiBody" hidden>
+    <aside class="wiki-side">
+      <div class="row wiki-filters">
+        <select id="wikiStatus" title="页面状态">
+          <option value="published" selected>已发布</option>
+          <option value="">全部状态</option>
+          <option value="draft">草稿</option>
+          <option value="review">审核中</option>
+          <option value="archived">已归档</option>
+        </select>
+        <select id="wikiType" title="页面类型">
+          <option value="">全部类型</option>
+          <option value="concept">概念</option>
+          <option value="entity">实体</option>
+          <option value="topic">主题</option>
+        </select>
+        <button id="wikiRefresh" title="刷新页面列表">刷新</button>
+      </div>
+      <div id="wikiListMeta" class="muted" style="margin-top:8px"></div>
+      <div id="wikiList" class="wiki-list"></div>
+      <button id="wikiMore" class="more" hidden>加载更多</button>
+    </aside>
+    <main class="wiki-main">
+      <div id="wikiReader" class="reader-empty">从左侧选择页面开始阅读。</div>
+    </main>
+  </div>
+</section>
+
+<section id="view-review" class="view" hidden>
+  <div id="reviewNotice" class="notice" hidden></div>
+  <div class="review-layout" id="reviewBody" hidden>
+    <aside class="wiki-side">
+      <div class="row" style="margin-top:0">
+        <button class="primary" id="reviewRefresh">刷新队列</button>
+        <span id="reviewMeta" class="muted"></span>
+      </div>
+      <div id="reviewList" class="wiki-list"></div>
+    </aside>
+    <main class="wiki-main">
+      <div id="proposalReader" class="reader-empty">从左侧选择待审核提案。</div>
+    </main>
+  </div>
+</section>
 
 <script>
 (() => {
@@ -116,7 +309,11 @@
     } catch (e) { dot.className = 'dot err'; rowsEl.textContent = '· 服务未启动'; }
   }
 
-  function esc(s) { return s.replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  }
 
   function copyText(t, btn) {
     navigator.clipboard.writeText(t).then(() => {
@@ -143,7 +340,7 @@
         '<div class="hd">' +
           '<span class="score">#' + (i + 1) + (score !== '' ? ' · ' + score : '') + '</span>' +
           '<span class="src">' + esc(r.source || '(未知)') + '</span>' +
-          '<span class="tag">chunk #' + r.chunk_index + (r.category ? ' · ' + esc(r.category) : '') + '</span>' +
+          '<span class="tag">chunk #' + esc(r.chunk_index) + (r.category ? ' · ' + esc(r.category) : '') + '</span>' +
         '</div>' +
         '<div class="txt clamp">' + esc(r.text || '') + '</div>' +
         '<div class="ops"><button data-a="cite">复制引用</button><button data-a="raw">复制正文</button><button data-a="expand">展开/收起</button></div>';
@@ -187,6 +384,489 @@
       list.innerHTML = '<div class="err">请求失败：' + esc(String(e)) + '（确认服务在运行）</div>';
     } finally { goBtn.disabled = false; }
   }
+
+  // ── 标签切换 ──
+  const views = { search: $('view-search'), wiki: $('view-wiki'), review: $('view-review') };
+  const tabs = document.querySelectorAll('.tab');
+  let wikiReady = null;        // null=未探测，true/false=已探测
+  let wikiLoaded = false;
+  let reviewLoaded = false;
+
+  function showView(name) {
+    tabs.forEach((t) => t.classList.toggle('active', t.dataset.view === name));
+    Object.keys(views).forEach((key) => { views[key].hidden = key !== name; });
+    if (name === 'wiki' && !wikiLoaded) {
+      wikiLoaded = true;
+      ensureWiki().then((ok) => { if (ok) loadPages(true); });
+    }
+    if (name === 'review' && !reviewLoaded) {
+      ensureWiki().then((ok) => { if (ok) loadProposals(); });
+    }
+  }
+
+  tabs.forEach((t) => t.addEventListener('click', () => showView(t.dataset.view)));
+
+  // ── Wiki 通用 ──
+  function showNotice(id, text, isError) {
+    const el = $(id);
+    if (!el) return;
+    el.className = 'notice' + (isError ? ' error' : '');
+    el.textContent = text;
+    el.hidden = false;
+  }
+
+  function hideNotice(id) {
+    const el = $(id);
+    if (el) { el.hidden = true; el.textContent = ''; }
+  }
+
+  function showWikiDisabled(data) {
+    const hintText = (data && data.hint) || '设置 WIKI_ENABLED=1 后重启服务。';
+    const message = 'Wiki 未启用。\n' + hintText;
+    showNotice('wikiNotice', message, false);
+    showNotice('reviewNotice', message, false);
+    $('wikiBody').hidden = true;
+    $('reviewBody').hidden = true;
+  }
+
+  async function ensureWiki() {
+    if (wikiReady !== null) return wikiReady;
+    try {
+      const r = await fetch('/api/wiki/status');
+      let d = null;
+      try { d = await r.json(); } catch (e) { d = null; }
+      if (r.status === 503) {
+        wikiReady = false;
+        showWikiDisabled(d);
+        return false;
+      }
+      if (!r.ok || !d || !d.ok) {
+        wikiReady = false;
+        const msg = 'Wiki 状态读取失败：' + ((d && (d.error || d.message)) || ('HTTP ' + r.status));
+        showNotice('wikiNotice', msg, true);
+        showNotice('reviewNotice', msg, true);
+        return false;
+      }
+      wikiReady = true;
+      hideNotice('wikiNotice');
+      hideNotice('reviewNotice');
+      $('wikiBody').hidden = false;
+      $('reviewBody').hidden = false;
+      return true;
+    } catch (e) {
+      wikiReady = false;
+      const msg = '无法连接服务：' + e;
+      showNotice('wikiNotice', msg, true);
+      showNotice('reviewNotice', msg, true);
+      return false;
+    }
+  }
+
+  async function apiGet(path) {
+    const r = await fetch(path);
+    let d = null;
+    try { d = await r.json(); } catch (e) { d = null; }
+    if (!r.ok) {
+      const err = new Error((d && (d.error || d.message)) || ('HTTP ' + r.status));
+      err.status = r.status;
+      err.data = d;
+      throw err;
+    }
+    return d;
+  }
+
+  const TYPE_LABELS = { concept: '概念', entity: '实体', topic: '主题' };
+  const STATUS_LABELS = { published: '已发布', draft: '草稿', review: '审核中', archived: '已归档' };
+  const PROPOSAL_LABELS = { update_page: '更新页面', create_page: '新建页面' };
+  const PROPOSAL_STATUS_LABELS = {
+    pending: '待审核', rejected: '已拒绝', stale: '已过期',
+    approved: '已批准', applied: '已应用', cancelled: '已取消'
+  };
+
+  function label(map, value) {
+    return map[value] || value || '';
+  }
+
+  // ── Markdown 最小安全渲染：先转义，再只插入固定标签 ──
+  function inlineMd(text) {
+    let out = esc(text);
+    out = out.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    return out;
+  }
+
+  function renderMarkdown(src) {
+    const lines = String(src || '').replace(/\r\n?/g, '\n').split('\n');
+    const out = [];
+    let para = [];
+    let listType = null;
+    let inCode = false;
+    let codeLines = [];
+    const flushPara = () => {
+      if (para.length) { out.push('<p>' + para.map(inlineMd).join('<br>') + '</p>'); para = []; }
+    };
+    const closeList = () => {
+      if (listType) { out.push('</' + listType + '>'); listType = null; }
+    };
+    for (const raw of lines) {
+      if (inCode) {
+        if (/^\s*```/.test(raw)) {
+          out.push('<pre><code>' + esc(codeLines.join('\n')) + '</code></pre>');
+          codeLines = [];
+          inCode = false;
+        } else {
+          codeLines.push(raw);
+        }
+        continue;
+      }
+      if (/^\s*```/.test(raw)) {
+        flushPara(); closeList(); inCode = true; continue;
+      }
+      if (!raw.trim()) { flushPara(); closeList(); continue; }
+      const heading = raw.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        flushPara(); closeList();
+        const level = heading[1].length;
+        out.push('<h' + level + '>' + inlineMd(heading[2].trim()) + '</h' + level + '>');
+        continue;
+      }
+      if (/^\s*[-*+]\s+/.test(raw)) {
+        flushPara();
+        if (listType !== 'ul') { closeList(); out.push('<ul>'); listType = 'ul'; }
+        out.push('<li>' + inlineMd(raw.replace(/^\s*[-*+]\s+/, '')) + '</li>');
+        continue;
+      }
+      const ordered = raw.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ordered) {
+        flushPara();
+        if (listType !== 'ol') { closeList(); out.push('<ol>'); listType = 'ol'; }
+        out.push('<li>' + inlineMd(ordered[1]) + '</li>');
+        continue;
+      }
+      if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(raw)) {
+        flushPara(); closeList(); out.push('<hr>'); continue;
+      }
+      closeList();
+      para.push(raw.trim());
+    }
+    if (inCode) out.push('<pre><code>' + esc(codeLines.join('\n')) + '</code></pre>');
+    flushPara(); closeList();
+    return out.join('\n');
+  }
+
+  // ── Wiki 页面列表与阅读器 ──
+  let wikiCursor = '';
+  let wikiSelected = '';
+
+  function resetWikiReader() {
+    wikiSelected = '';
+    const box = $('wikiReader');
+    box.className = 'reader-empty';
+    box.textContent = '从左侧选择页面开始阅读。';
+  }
+
+  function wikiItem(page) {
+    const div = document.createElement('div');
+    div.className = 'wiki-item' + (page.page_id === wikiSelected ? ' active' : '');
+    div.innerHTML =
+      '<div class="t">' + esc(page.title) + '</div>' +
+      '<div class="m">' +
+        '<span class="badge">' + esc(label(TYPE_LABELS, page.page_type)) + '</span>' +
+        '<span class="badge status-' + esc(page.status) + '">' + esc(label(STATUS_LABELS, page.status)) + '</span>' +
+        esc(page.slug) +
+      '</div>';
+    div.addEventListener('click', () => {
+      wikiSelected = page.page_id;
+      document.querySelectorAll('#wikiList .wiki-item').forEach((el) => el.classList.remove('active'));
+      div.classList.add('active');
+      loadPage(page.page_id);
+    });
+    return div;
+  }
+
+  async function loadPages(reset) {
+    if (reset) {
+      wikiCursor = '';
+      $('wikiList').innerHTML = '';
+      resetWikiReader();
+    }
+    $('wikiListMeta').innerHTML = '<span class="spinner"></span>加载中…';
+    const params = new URLSearchParams();
+    params.set('status', $('wikiStatus').value);
+    params.set('page_type', $('wikiType').value);
+    params.set('limit', '20');
+    if (!reset && wikiCursor) params.set('cursor', wikiCursor);
+    try {
+      const d = await apiGet('/api/wiki/pages?' + params.toString());
+      if (!d.ok) throw new Error(d.error || '加载失败');
+      const pages = Array.isArray(d.pages) ? d.pages : [];
+      if (reset) $('wikiList').innerHTML = '';
+      pages.forEach((p) => $('wikiList').appendChild(wikiItem(p)));
+      wikiCursor = d.next_cursor || '';
+      $('wikiMore').hidden = !d.has_more;
+      const total = $('wikiList').children.length;
+      $('wikiListMeta').textContent = total + ' 个页面' + (d.has_more ? '（还有更多）' : '');
+      if (!total) $('wikiListMeta').textContent = '没有符合条件的页面。';
+    } catch (e) {
+      $('wikiListMeta').textContent = '';
+      $('wikiList').innerHTML = '<div class="err">加载页面失败：' + esc(e.message) + '</div>';
+      $('wikiMore').hidden = true;
+    }
+  }
+
+  function renderBacklinks(items) {
+    if (!Array.isArray(items) || !items.length) return '<div class="muted">暂无反向链接。</div>';
+    return '<ul class="linklist">' + items.map((item) => {
+      const target = item.source_page_id || item.source_slug || '';
+      const name = item.source_title || item.source_slug || item.source_page_id || '（未知页面）';
+      const button = target
+        ? '<button class="link" data-page="' + esc(target) + '">' + esc(name) + '</button>'
+        : esc(name);
+      return '<li>' + button +
+        (item.source_status ? ' <span class="muted">' + esc(label(STATUS_LABELS, item.source_status)) + '</span>' : '') +
+        '</li>';
+    }).join('') + '</ul>';
+  }
+
+  function renderEvidence(evidence) {
+    const claims = evidence && Array.isArray(evidence.claims) ? evidence.claims : [];
+    if (!claims.length) return '<div class="muted">暂无证据片段。</div>';
+    return claims.map((claim) => {
+      const quotes = (Array.isArray(claim.evidence) ? claim.evidence : []).map((ev) => {
+        const verified = ev.verified ? ' · 已校验' : '';
+        return '<blockquote>“' + esc(ev.quote) + '”<div class="muted">chunk: ' +
+          esc(ev.chunk_id) + verified + '</div></blockquote>';
+      }).join('');
+      return '<div class="evidence">' +
+        '<div><span class="badge">' + esc(claim.claim_type || 'claim') + '</span>' + esc(claim.claim_text || '') + '</div>' +
+        (quotes || '<div class="muted">无引文</div>') +
+        '</div>';
+    }).join('');
+  }
+
+  function renderPage(d) {
+    const page = d.page || {};
+    const fm = d.frontmatter || {};
+    const aliases = Array.isArray(fm.aliases) ? fm.aliases : [];
+    const sources = Array.isArray(d.sources) ? d.sources : [];
+    const aliasesHtml = aliases.length
+      ? '<div class="section"><h3>别名</h3><div>' + aliases.map((a) => '<span class="badge">' + esc(a) + '</span>').join('') + '</div></div>'
+      : '';
+    const sourcesHtml = sources.length
+      ? '<div class="section"><h3>来源</h3><div class="muted">' + sources.map(esc).join('、') + '</div></div>'
+      : '';
+    return '<h2>' + esc(page.title || '（无标题）') + '</h2>' +
+      '<div class="meta">' +
+        '<span class="badge">' + esc(label(TYPE_LABELS, page.page_type)) + '</span>' +
+        '<span class="badge status-' + esc(page.status) + '">' + esc(label(STATUS_LABELS, page.status)) + '</span>' +
+        esc(page.slug || '') + (page.updated_at ? ' · 更新于 ' + esc(page.updated_at) : '') +
+      '</div>' +
+      (fm.summary ? '<div class="summary">' + esc(fm.summary) + '</div>' : '') +
+      aliasesHtml + sourcesHtml +
+      '<div class="section"><h3>正文</h3><div class="md">' + renderMarkdown(d.body || '') + '</div></div>' +
+      '<div class="section"><h3>反链</h3>' + renderBacklinks(d.backlinks) + '</div>' +
+      '<div class="section"><h3>证据片段</h3>' + renderEvidence(d.evidence) + '</div>';
+  }
+
+  async function loadPage(id) {
+    const box = $('wikiReader');
+    box.className = 'reader-empty';
+    box.innerHTML = '<span class="spinner"></span>加载页面…';
+    try {
+      const d = await apiGet('/api/wiki/page?id=' + encodeURIComponent(id) + '&sources=1&backlinks=1');
+      if (!d.ok) throw new Error(d.error || '加载失败');
+      box.className = 'reader';
+      box.innerHTML = renderPage(d);
+      box.querySelectorAll('[data-page]').forEach((el) => {
+        el.addEventListener('click', () => loadPage(el.dataset.page));
+      });
+    } catch (e) {
+      box.className = 'reader-empty';
+      box.innerHTML = '<div class="err">读取页面失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  $('wikiRefresh').addEventListener('click', () => loadPages(true));
+  $('wikiStatus').addEventListener('change', () => loadPages(true));
+  $('wikiType').addEventListener('change', () => loadPages(true));
+  $('wikiMore').addEventListener('click', () => loadPages(false));
+
+  // ── 审核队列与提案详情 ──
+  let reviewSelected = '';
+
+  function setProposalEmpty(text) {
+    const box = $('proposalReader');
+    box.className = 'reader-empty';
+    box.textContent = text;
+  }
+
+  function proposalItem(item) {
+    const div = document.createElement('div');
+    div.className = 'wiki-item' + (item.proposal_id === reviewSelected ? ' active' : '');
+    div.innerHTML =
+      '<div class="t">' + esc(item.page_title || item.page_slug || '（未命名页面）') + '</div>' +
+      '<div class="m">' +
+        '<span class="badge">' + esc(label(PROPOSAL_LABELS, item.proposal_type)) + '</span>' +
+        esc(item.created_at || '') +
+      '</div>' +
+      (item.rationale ? '<div class="r">' + esc(item.rationale) + '</div>' : '');
+    div.addEventListener('click', () => {
+      reviewSelected = item.proposal_id;
+      document.querySelectorAll('#reviewList .wiki-item').forEach((el) => el.classList.remove('active'));
+      div.classList.add('active');
+      loadProposal(item.proposal_id);
+    });
+    return div;
+  }
+
+  async function loadProposals() {
+    reviewLoaded = true;
+    $('reviewMeta').textContent = '';
+    $('reviewList').innerHTML = '<div class="muted"><span class="spinner"></span>加载中…</div>';
+    try {
+      const d = await apiGet('/api/wiki/proposals?status=pending&limit=50');
+      if (!d.ok) throw new Error(d.error || '加载失败');
+      const items = Array.isArray(d.proposals) ? d.proposals : [];
+      $('reviewList').innerHTML = '';
+      $('reviewMeta').textContent = items.length + ' 个待审核提案';
+      if (!items.length) {
+        $('reviewList').innerHTML = '<div class="muted">没有待审核提案。</div>';
+      } else {
+        items.forEach((item) => $('reviewList').appendChild(proposalItem(item)));
+      }
+      if (reviewSelected && !items.some((item) => item.proposal_id === reviewSelected)) {
+        reviewSelected = '';
+        setProposalEmpty('该提案已不在待审核队列。');
+      }
+      if (!items.length && !reviewSelected) {
+        setProposalEmpty('没有待审核提案。');
+      }
+    } catch (e) {
+      $('reviewMeta').textContent = '';
+      $('reviewList').innerHTML = '<div class="err">加载提案失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  function renderDiff(diff) {
+    return '<pre class="diff">' + String(diff || '').split('\n').map((line) => {
+      let cls = '';
+      if (line.startsWith('+++') || line.startsWith('---')) cls = 'head';
+      else if (line.startsWith('@@')) cls = 'hunk';
+      else if (line.startsWith('+')) cls = 'add';
+      else if (line.startsWith('-')) cls = 'del';
+      return '<span class="' + cls + '">' + esc(line || ' ') + '</span>';
+    }).join('') + '</pre>';
+  }
+
+  function renderProposal(d) {
+    const p = d.proposal || {};
+    const target = d.target_page || {};
+    const title = target.title || p.page_id || '提案';
+    return '<h2>' + esc(title) + '</h2>' +
+      '<div class="meta">' +
+        '<span class="badge">' + esc(label(PROPOSAL_LABELS, p.proposal_type)) + '</span>' +
+        '<span class="badge status-' + esc(p.status) + '">' + esc(label(PROPOSAL_STATUS_LABELS, p.status)) + '</span>' +
+        (target.slug ? esc(target.slug) + ' · ' : '') + esc(p.created_at || '') +
+      '</div>' +
+      '<div class="section"><h3>审核理由</h3><div class="rationale">' +
+        esc(p.rationale || '（无）') + '</div></div>' +
+      '<div class="section"><h3>expected_revision</h3><div class="muted"><code>' +
+        esc(p.expected_revision_id || '（空）') + '</code></div></div>' +
+      '<div class="section"><h3>Diff</h3>' +
+        (d.diff ? renderDiff(d.diff) : '<div class="muted">无 diff（可能是新建页面提案）。</div>') +
+      '</div>' +
+      '<div class="section"><h3>审核备注</h3>' +
+        '<textarea id="reviewNote" class="note" placeholder="可选：记录批准 / 拒绝原因"></textarea>' +
+        '<div class="actions">' +
+          '<button class="approve" id="applyApprove">批准</button>' +
+          '<button class="danger" id="applyReject">拒绝</button>' +
+        '</div>' +
+        '<div id="applyResult" class="result"></div>' +
+      '</div>';
+  }
+
+  async function loadProposal(id) {
+    const box = $('proposalReader');
+    box.className = 'reader-empty';
+    box.innerHTML = '<span class="spinner"></span>加载提案…';
+    try {
+      const d = await apiGet('/api/wiki/proposal?id=' + encodeURIComponent(id));
+      if (!d.ok) throw new Error(d.error || '加载失败');
+      box.className = 'reader';
+      box.innerHTML = renderProposal(d);
+      $('applyApprove').addEventListener('click', () => submitDecision('approve'));
+      $('applyReject').addEventListener('click', () => submitDecision('reject'));
+    } catch (e) {
+      box.className = 'reader-empty';
+      box.innerHTML = '<div class="err">读取提案失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  function showActionResult(text, ok) {
+    const box = $('proposalReader');
+    box.className = 'reader';
+    box.innerHTML = '<div class="result ' + (ok ? 'ok' : 'err') + '">' + esc(text) + '</div>' +
+      '<div class="muted" style="margin-top:6px">可从左侧选择下一条提案。</div>';
+  }
+
+  async function submitDecision(decision) {
+    if (!reviewSelected) return;
+    const noteEl = $('reviewNote');
+    const note = noteEl ? noteEl.value : '';
+    const resultEl = $('applyResult');
+    const approveBtn = $('applyApprove');
+    const rejectBtn = $('applyReject');
+    if (approveBtn) approveBtn.disabled = true;
+    if (rejectBtn) rejectBtn.disabled = true;
+    if (resultEl) {
+      resultEl.className = 'result';
+      resultEl.textContent = decision === 'approve' ? '正在批准…' : '正在拒绝…';
+    }
+    try {
+      const r = await fetch('/api/wiki/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          proposal_id: reviewSelected,
+          decision,
+          review_note: note,
+        }),
+      });
+      let d = null;
+      try { d = await r.json(); } catch (e) { d = null; }
+      if (!r.ok) throw new Error((d && (d.error || d.message)) || ('HTTP ' + r.status));
+      if (!d || d.ok === false) {
+        const msg = '操作未生效：' + ((d && (d.message || d.error)) || '未知原因') +
+          (d && d.status ? '（' + d.status + '）' : '');
+        reviewSelected = '';
+        await loadProposals();
+        showActionResult(msg, false);
+        return;
+      }
+      let msg = decision === 'approve'
+        ? '已批准：' + (d.slug || d.page_id || '页面已更新') + (d.git_commit ? '（已提交 git）' : '')
+        : '已拒绝，页面未修改。';
+      if (Array.isArray(d.warnings) && d.warnings.length) {
+        msg += '\n警告：' + d.warnings.join('；');
+      }
+      reviewSelected = '';
+      await loadProposals();
+      showActionResult(msg, true);
+    } catch (e) {
+      if (resultEl) {
+        resultEl.className = 'result err';
+        resultEl.textContent = '操作失败：' + e.message;
+      }
+      if (approveBtn) approveBtn.disabled = false;
+      if (rejectBtn) rejectBtn.disabled = false;
+    }
+  }
+
+  $('reviewRefresh').addEventListener('click', () => {
+    reviewSelected = '';
+    setProposalEmpty('从左侧选择待审核提案。');
+    loadProposals();
+  });
 
   q.addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
   goBtn.addEventListener('click', search);
