@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -188,7 +189,12 @@ class ProposalService:
             os.makedirs(directory, exist_ok=False)
             atomic_write_text(draft_path, proposed_content)
             atomic_write_text(diff_path, diff_text)
-            with transaction(self.conn):
+            # 调用方（如 submit_extraction）已在事务中时复用，保证提案记录与
+            # 同批业务写入原子提交。
+            context = (
+                nullcontext() if self.conn.in_transaction else transaction(self.conn)
+            )
+            with context:
                 proposals_repo.insert_proposal(self.conn, record)
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
