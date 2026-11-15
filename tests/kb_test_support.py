@@ -41,8 +41,15 @@ def activate_fake_embedding() -> None:
 
 
 def temp_db_env(monkey_target=None) -> str:
-    """创建临时库路径并写入环境变量，返回路径。"""
+    """创建临时库与临时 vault，并写入环境变量，返回临时库路径。
+
+    vault 固定为 ``<临时库>/vault``，确保入库测试绝不会读写真实 Obsidian
+    vault；测试可用 ``os.path.join(db_path, "vault")`` 取到它。
+    """
     db_path = tempfile.mkdtemp(prefix="kb_test_")
+    vault_path = os.path.join(db_path, "vault")
+    os.makedirs(vault_path, exist_ok=True)
     os.environ["LANCEDB_DB_PATH"] = db_path
+    os.environ["LANCEDB_VAULT_ROOT"] = vault_path
     kb_schema.reset_db()
     return db_path

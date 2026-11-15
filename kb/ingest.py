@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""文档入库内核：解析（含 OCR 链）、分块、增删改查。
+"""文档入库内核：vault 来源准备、分块、增删改查。
 
-解析链（2026-10-04 起）：PDF 优先本地 MinerU 转 Markdown（公式 → LaTeX，带缓存，
-见 kb.pdf_convert）→ 失败回退文本层（PyMuPDF → pdfminer → PyPDF2）→ 扫描件走
-OCR 链（云 MinerU → 本地 Tesseract）。
-分块沿用既有参数（800 字符 / 100 overlap）。MinerU 产物含标题结构，走 Markdown 感知
-分块；其余按段落。
+来源策略（2026-11-15 起）：所有外部文件先经 kb.vault_source 落到 Obsidian vault
+内的 Markdown/文本，再以 vault 相对路径作为 source 切片；PDF 走本地 MinerU
+（kb.pdf_convert），docx/pptx/xlsx 走 docling → markitdown。vault 外文件不会被
+直接切片，add_documents 也只接受 vault 内目录。
+extract_content 仍保留旧的 PDF 文本层/OCR 回退链，供直接调用与兼容场景使用；
+add_single_document 等入库入口不再走该回退。
+分块沿用既有参数（800 字符 / 100 overlap）；Markdown 产物走标题感知分块。
 向量在 table.add() 时由 LanceModel 的 VectorField 自动计算（官方模式）。
 """
 
@@ -15,6 +17,7 @@ import fnmatch
 import hashlib
 import os
 import re
+import shutil
 import sys
 import threading
 from collections import Counter
@@ -23,6 +26,7 @@ from typing import Dict, List
 
 from . import config as cfg
 from . import schema as kb_schema
+from . import vault_source
 from .embeddings import embed_texts  # noqa: F401  （供脚本/桌面端复用批量向量化）
 
 
@@ -365,7 +369,11 @@ def extract_content(filepath: str, export_markdown_dir: str = "") -> "tuple[str,
             return pdf_convert.normalize_text(text), False
         if ext in (".md", ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml"):
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read(), ext == ".md"
+                text = f.read()
+            if ext == ".md":
+                # 属性只属于笔记元数据，不进入向量切片。
+                text = vault_source.strip_frontmatter(text)
+            return text, ext == ".md"
         if ext == ".docx":
             from docx import Document
 
@@ -869,67 +877,203 @@ def scan_files(scan_dir: str) -> List[str]:
     return sorted(set(filepaths))
 
 
+def _chunks_for_source(text: str, source: str, is_md: bool) -> List[Dict]:
+    """文本 → 带 doc_id/ingested_at 的切片列表。"""
+    chunks = chunk_text(text, source, is_md)
+    for ch in chunks:
+        ch["doc_id"] = kb_schema.chunk_doc_id(
+            ch["text"], ch["source"], ch["chunk_index"])
+        ch["ingested_at"] = datetime_now_iso()
+    return chunks
+
+
+def _replace_source_chunks(table, source: str,
+                           chunks: List[Dict]) -> "tuple[int, int]":
+    """幂等替换某 source：先写新 doc_id，再清理旧 doc_id（调用方持有写锁）。"""
+    old_doc_ids = _source_doc_ids(table, source)
+    new_doc_ids = {ch["doc_id"] for ch in chunks}
+    pending = [ch for ch in chunks if ch["doc_id"] not in old_doc_ids]
+    added = add_chunks(table, pending)
+    replaced = _delete_stale_source_rows(table, source, old_doc_ids, new_doc_ids)
+    return added, replaced
+
+
+def _export_prepared_copy(prepared: vault_source.PreparedSource,
+                          export_markdown_dir: str) -> None:
+    """把 vault 内转换产物额外复制到指定目录（不改变入库 source）。"""
+    if not export_markdown_dir:
+        return
+    source_path = Path(prepared.md_path)
+    target_dir = Path(export_markdown_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_md = target_dir / source_path.name
+    if vault_source._norm_path(target_md) != vault_source._norm_path(source_path):
+        shutil.copy2(source_path, target_md)
+    source_images = source_path.parent / f"{source_path.stem}_images"
+    if source_images.is_dir():
+        shutil.copytree(
+            source_images,
+            target_dir / f"{source_path.stem}_images",
+            dirs_exist_ok=True,
+        )
+
+
+_VAULT_ONLY_ERROR = (
+    "[ERROR] 只接受 vault 内目录；外部文件请用 add_single_document 或先导入 vault"
+)
+
+
 def add_documents(scan_dir: str, reindex_all: bool = False,
                   progress=None, export_markdown_dir: str = "") -> str:
-    """扫描目录并增量入库。progress: optional callable(done_files, total_files)。
+    """扫描 vault 内目录并增量入库。progress: optional callable(done_files, total_files)。
 
-    export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
+    source 一律取 vault 相对路径（与扫描根无关）。二进制先在 vault 内转成
+    Markdown 并立即入库，其生成的 md 在同一次扫描中跳过，避免重复切片。
+    export_markdown_dir 只做额外导出，不能改变 source。
     「检查已有来源 → 写入新行 → 更新索引」整段持有模块级写锁；reindex_all 的
     drop 也在锁内，避免与 watcher 的更新/删除交错。
     """
     if not os.path.isdir(scan_dir):
         return f"❌ 目录不存在: {scan_dir}"
+    if not vault_source.is_under_vault(scan_dir):
+        return _VAULT_ONLY_ERROR
 
     with _write_lock:
         table = kb_schema.get_or_create_table()
         existing = kb_schema.existing_sources(table) if not reindex_all else set()
+        existing_norm = {_normalized_path(src) for src in existing}
 
         if reindex_all:
             db = kb_schema.get_db()
             db.drop_table(cfg.TABLE_NAME)
             table = kb_schema.get_or_create_table()
+            existing_norm = set()
 
         filepaths = scan_files(scan_dir)
-        new_files = [
+        binary_paths = [
             fp for fp in filepaths
-            if os.path.relpath(fp, scan_dir) not in existing
+            if Path(fp).suffix.lower() in vault_source.BINARY_EXTENSIONS
         ]
-        if not new_files:
+        total_tasks = len(filepaths)
+        generated_md_paths: set[str] = set()
+        skipped: List[str] = []
+        all_chunks: List[Dict] = []
+        chunks_by_source: Dict[str, List[Dict]] = {}
+        source_filepaths: Dict[str, str] = {}
+
+        binary_new = 0
+        binary_added = 0
+        binary_chunks = 0
+        done = 0
+
+        # 预扫描二进制：转换 → 立即入库 → 记录生成 md 供后续跳过。
+        for fp in binary_paths:
+            try:
+                prepared = vault_source.prepare_markdown(
+                    fp, category_hint=guess_category(fp))
+            except Exception as exc:
+                skipped.append(f"{os.path.basename(fp)}（转换失败: {exc}）")
+                done += 1
+                if progress:
+                    progress(done, total_tasks)
+                continue
+
+            generated_md_paths.add(vault_source._norm_path(prepared.md_path))
+            if export_markdown_dir and prepared.converted:
+                try:
+                    _export_prepared_copy(prepared, export_markdown_dir)
+                except Exception as exc:
+                    print(f"[export] 额外导出失败: {exc}", file=sys.stderr)
+
+            if _normalized_path(prepared.source) in existing_norm:
+                done += 1
+                if progress:
+                    progress(done, total_tasks)
+                continue
+
+            binary_new += 1
+            text, is_md = extract_content(prepared.md_path)
+            if not text or len(text) < 20:
+                skipped.append(os.path.basename(fp))
+                done += 1
+                if progress:
+                    progress(done, total_tasks)
+                continue
+            chunks = _chunks_for_source(text, prepared.source, True)
+            if not chunks:
+                skipped.append(os.path.basename(fp))
+                done += 1
+                if progress:
+                    progress(done, total_tasks)
+                continue
+            try:
+                added, _ = _replace_source_chunks(table, prepared.source, chunks)
+            except Exception as exc:
+                skipped.append(f"{os.path.basename(fp)}（写入失败: {exc}）")
+                done += 1
+                if progress:
+                    progress(done, total_tasks)
+                continue
+
+            binary_added += added
+            binary_chunks += len(chunks)
+            existing_norm.add(_normalized_path(prepared.source))
+            source_filepaths[prepared.source] = prepared.md_path
+            chunks_by_source.setdefault(prepared.source, []).extend(chunks)
+            done += 1
+            if progress:
+                progress(done, total_tasks)
+
+        # 再扫描文本：source 相对 vault；跳过二进制生成的 md 与已有来源。
+        new_files: List[tuple[str, str]] = []
+        for fp in filepaths:
+            if vault_source._norm_path(fp) in generated_md_paths:
+                continue
+            if Path(fp).suffix.lower() in vault_source.BINARY_EXTENSIONS:
+                continue
+            rel_path = vault_source.rel_to_vault(fp)
+            if _normalized_path(rel_path) in existing_norm:
+                continue
+            new_files.append((fp, rel_path))
+
+        for fp, rel_path in new_files:
+            text, is_md = extract_content(
+                fp, export_markdown_dir=export_markdown_dir)
+            done += 1
+            if not text or len(text) < 20:
+                skipped.append(os.path.basename(fp))
+                if progress:
+                    progress(done, total_tasks)
+                continue
+            source_filepaths[rel_path] = fp
+            chunks = _chunks_for_source(text, rel_path, is_md)
+            all_chunks.extend(chunks)
+            chunks_by_source.setdefault(rel_path, []).extend(chunks)
+            if progress:
+                progress(done, total_tasks)
+
+        if not all_chunks and binary_chunks == 0:
+            if skipped:
+                return (
+                    "扫描完成，但没有提取到有效文本内容。\n"
+                    f"⚠️ 无法提取文本（已跳过）: {', '.join(skipped[:5])}"
+                    + (f" 等共 {len(skipped)} 个" if len(skipped) > 5 else "")
+                )
             msg = f"扫描「{scan_dir}」，共 {len(filepaths)} 个文件，没有新文件需要添加。"
-            if existing:
+            if existing and not reindex_all:
                 msg += f"（已有 {len(existing)} 个文件在库中）"
             return msg
 
-        all_chunks: List[Dict] = []
-        skipped: List[str] = []
-        source_filepaths: Dict[str, str] = {}
-        for done, fp in enumerate(new_files, 1):
-            text, is_md = extract_content(fp, export_markdown_dir=export_markdown_dir)
-            if not text or len(text) < 20:
-                skipped.append(os.path.basename(fp))
-                continue
-            rel_path = os.path.relpath(fp, scan_dir)
-            source_filepaths[rel_path] = fp
-            chunks = chunk_text(text, rel_path, is_md)
-            for ch in chunks:
-                ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
-                ch["ingested_at"] = datetime_now_iso()
-            all_chunks.extend(chunks)
-            if progress:
-                progress(done, len(new_files))
-
-        if not all_chunks:
-            return "扫描完成，但没有提取到有效文本内容。"
-
-        added = add_chunks(table, all_chunks)
+        added = binary_added
+        if all_chunks:
+            added += add_chunks(table, all_chunks)
         kb_schema.ensure_vector_index(table)
         kb_schema.ensure_fts_index(table)
         kb_schema.fold_new_rows(table)
         kb_schema.update_db_readme()
+        total_chunks = binary_chunks + len(all_chunks)
+        new_count = binary_new + len(new_files)
 
-    chunks_by_source: Dict[str, List[Dict]] = {}
-    for chunk in all_chunks:
-        chunks_by_source.setdefault(str(chunk.get("source", "")), []).append(chunk)
     for batch_source, batch_chunks in chunks_by_source.items():
         if not batch_source:
             continue
@@ -947,8 +1091,8 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
         f"✅ **文档添加完成！**",
         f"{'─' * 40}",
         f"扫描目录: {scan_dir}",
-        f"新扫描文件: {len(new_files)}",
-        f"新提取文本块: {len(all_chunks)}",
+        f"新扫描文件: {new_count}",
+        f"新提取文本块: {total_chunks}",
         f"已向量化入库: {added}",
         f"知识库总块数: {len(table)}",
         extra,
@@ -961,59 +1105,52 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
 
 def add_single_document(filepath: str, scan_dir: str = "",
                         export_markdown_dir: str = "") -> str:
-    """向量化单个文档；先成功写入新行，再清理该 source 的旧行。
+    """向量化单个文档：先准备成 vault 内 Markdown，再按其幂等替换旧切片。
 
-    source 为 scan_dir 下的相对路径时按其幂等替换旧版本。只要最终 source
-    是纯 basename（未传 scan_dir，或文件直接位于 scan_dir 根目录），且库中
-    已有同名 source，就拒绝覆盖：basename 无法唯一确定原文件，静默替换会
-    误伤其他目录下的同名文档。
-
-    export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
+    来源一律取 ``PreparedSource.source``（vault 相对路径）；外部文件会先转成
+    Markdown 落到 vault，再入库。``scan_dir`` 仅为兼容旧调用保留，不参与
+    source 计算；``export_markdown_dir`` 只做额外导出，不改变 source。
     """
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
     ext = Path(filepath).suffix.lower()
+    if ext == ".doc":
+        return (
+            f"[ERROR] 不支持 .doc 格式，请另存为 .docx 后再入库: {filepath}"
+        )
     if ext not in cfg.EXTENSIONS:
         return f"[ERROR] 不支持的文件格式: {ext}"
     if os.path.getsize(filepath) > cfg.MAX_FILE_SIZE:
         return f"[ERROR] 文件过大: {os.path.getsize(filepath) / 1024 / 1024:.1f}MB"
 
-    source = os.path.basename(filepath)
-    if scan_dir and os.path.isdir(scan_dir):
-        rel = os.path.relpath(filepath, scan_dir)
-        if not rel.startswith(".." + os.sep) and rel != "..":
-            source = rel
+    try:
+        prepared = vault_source.prepare_markdown(
+            filepath, category_hint=guess_category(filepath))
+    except Exception as e:
+        return f"[ERROR] 无法准备 vault Markdown 来源: {os.path.basename(filepath)}: {e}"
 
-    text, is_md = extract_content(filepath, export_markdown_dir=export_markdown_dir)
+    export_warning = ""
+    if export_markdown_dir and prepared.converted:
+        try:
+            _export_prepared_copy(prepared, export_markdown_dir)
+        except Exception as e:
+            export_warning = f"\n[WARN] 额外导出失败: {e}"
+
+    text, is_md = extract_content(prepared.md_path)
     if not text or len(text) < 20:
-        return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(filepath)}"
+        return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(prepared.md_path)}"
 
-    chunks = chunk_text(text, source, is_md)
+    source = prepared.source
+    chunks = _chunks_for_source(text, source, is_md)
     if not chunks:
         return f"[ERROR] 分块后无有效内容: {source}"
-    for ch in chunks:
-        ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
-        ch["ingested_at"] = datetime_now_iso()
 
     with _write_lock:
         table = kb_schema.get_or_create_table()
-        if source_is_legacy_basename(source):
-            existing = kb_schema.existing_sources(table)
-            if any(os.path.normcase(src) == os.path.normcase(source) for src in existing):
-                return (
-                    f"[ERROR] 来源「{source}」已存在于知识库，未执行覆盖。"
-                    "basename 来源无法唯一确定对应文件；请把文件放到 scan_dir 的"
-                    "子目录中按相对路径入库，或使用 update_document 更新已有文档。"
-                )
-
-        old_doc_ids = _source_doc_ids(table, source)
-        new_doc_ids = {ch["doc_id"] for ch in chunks}
-        pending = [ch for ch in chunks if ch["doc_id"] not in old_doc_ids]
         try:
-            added = add_chunks(table, pending)
+            added, replaced = _replace_source_chunks(table, source, chunks)
         except Exception as e:
             return f"[ERROR] 写入失败，旧记录未删除: {e}"
-        replaced = _delete_stale_source_rows(table, source, old_doc_ids, new_doc_ids)
         kb_schema.ensure_vector_index(table)
         kb_schema.ensure_fts_index(table)
         kb_schema.fold_new_rows(table)
@@ -1021,38 +1158,52 @@ def add_single_document(filepath: str, scan_dir: str = "",
 
     _register_wiki_safely(
         source,
-        filepath,
+        prepared.md_path,
         chunks,
         str(chunks[0].get("category", "")) if chunks else "",
     )
 
     extra = f"\nMarkdown 导出: {export_markdown_dir}" if export_markdown_dir else ""
-    return (
-        f"✅ 文档已入库!\n"
-        f"文件: {source}\n"
-        f"新增记录: {added}\n"
-        f"替换旧记录: {replaced}\n"
-        f"知识库总块数: {len(table)}{extra}"
-    )
+    lines = [
+        "✅ 文档已入库!",
+        f"文件: {source}",
+    ]
+    if prepared.converted:
+        lines.extend([
+            f"原始文件: {os.path.abspath(filepath)}",
+            f"转换后 md: {prepared.md_path}",
+        ])
+    lines.extend([
+        f"新增记录: {added}",
+        f"替换旧记录: {replaced}",
+        f"知识库总块数: {len(table)}",
+    ])
+    return "\n".join(lines) + extra + export_warning
 
 
 def update_document(filepath: str, source: str = "") -> str:
-    """更新文档：默认按完整路径唯一匹配已有 source，写入新行后再清理旧行。
+    """更新文档：二进制或 vault 外文件委托 add_single_document 转换入库。
 
-    ``source`` 非空时按该来源精确更新（供 watcher 使用已解析出的目标），
-    跳过再次 basename 匹配，避免同名 legacy 来源造成歧义；该 source 必须
-    是 filepath 的完整路径后缀。legacy basename 仍需人工确认，拒绝更新。
-
-    同名 basename 匹配到多个 source 且无法用路径后缀判定唯一时返回
-    [ERROR] 并列出候选，不执行任何删除/写入。
+    vault 内文本沿用按完整路径匹配已有 source 的逻辑（新来源取 vault 相对
+    路径，不再用 basename），写入新行后再清理旧行。``source`` 非空时按该
+    来源精确更新（供 watcher 使用），且必须是 filepath 的路径后缀；legacy
+    basename 仍需人工确认。同名 basename 匹配到多个 source 且无法用路径
+    后缀判定唯一时返回 [ERROR]，不执行任何删除或写入。
     """
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
     ext = Path(filepath).suffix.lower()
+    if ext == ".doc":
+        return add_single_document(filepath)
     if ext not in cfg.EXTENSIONS:
         return f"[ERROR] 不支持的文件格式: {ext}"
 
+    # 二进制必须先转成 vault Markdown；vault 外文本也先复制进 vault。
+    if ext in vault_source.BINARY_EXTENSIONS or not vault_source.is_under_vault(filepath):
+        return add_single_document(filepath)
+
     fname = os.path.basename(filepath)
+    vault_relative = vault_source.rel_to_vault(filepath)
     text, is_md = extract_content(filepath)
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {fname}"
@@ -1077,24 +1228,14 @@ def update_document(filepath: str, source: str = "") -> str:
         if error:
             return error
 
-        source = matched_source or fname
-        chunks = chunk_text(text, source, is_md)
+        source = matched_source or vault_relative
+        chunks = _chunks_for_source(text, source, is_md)
         if not chunks:
             return f"[ERROR] 分块后无有效内容: {source}"
-        for ch in chunks:
-            ch["doc_id"] = kb_schema.chunk_doc_id(
-                ch["text"], ch["source"], ch["chunk_index"])
-            ch["ingested_at"] = datetime_now_iso()
-
-        old_doc_ids = _source_doc_ids(table, source)
-        new_doc_ids = {ch["doc_id"] for ch in chunks}
-        pending = [ch for ch in chunks if ch["doc_id"] not in old_doc_ids]
         try:
-            added = add_chunks(table, pending)
+            added, deleted_rows = _replace_source_chunks(table, source, chunks)
         except Exception as e:
             return f"[ERROR] 写入失败，旧记录未删除: {e}"
-        deleted_rows = _delete_stale_source_rows(
-            table, source, old_doc_ids, new_doc_ids)
         kb_schema.ensure_vector_index(table)
         kb_schema.ensure_fts_index(table)
         kb_schema.fold_new_rows(table)
@@ -1110,6 +1251,7 @@ def update_document(filepath: str, source: str = "") -> str:
     return (
         f"✅ 文档已更新!\n"
         f"文件名: {fname}\n"
+        f"来源: {source}\n"
         f"删除旧记录: {deleted_rows}\n"
         f"新增记录: {added}\n"
         f"知识库总块数: {kb_schema.row_count()}"
