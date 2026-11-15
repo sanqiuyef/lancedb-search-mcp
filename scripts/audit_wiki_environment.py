@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from collections import Counter
 from importlib.metadata import PackageNotFoundError, version
@@ -23,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from kb import config as cfg  # noqa: E402
+from kb.wiki import constants as wiki_constants  # noqa: E402
 
 
 def _pkg_version(name: str) -> str:
@@ -135,6 +137,96 @@ def _vault_info() -> dict:
     }
 
 
+def _wiki_db_stats() -> dict:
+    """只读统计 Wiki SQLite（不创建库、不执行迁移、不写任何表）。"""
+    raw = os.environ.get("WIKI_DB_PATH", "").strip()
+    if raw:
+        db_path = Path(raw)
+    else:
+        vault = Path(
+            os.environ.get("WIKI_VAULT_PATH") or wiki_constants.DEFAULT_VAULT_PATH
+        )
+        db_path = (
+            vault
+            / wiki_constants.DEFAULT_DB_SUBDIR
+            / wiki_constants.DEFAULT_DB_FILENAME
+        )
+
+    info: dict = {"path": str(db_path), "exists": db_path.is_file()}
+    if not info["exists"]:
+        return info
+
+    try:
+        conn = sqlite3.connect(
+            db_path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+    except sqlite3.Error as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return info
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        info["readable"] = True
+        info["migration_versions"] = (
+            [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            ]
+            if "schema_migrations" in tables
+            else []
+        )
+        counts = {}
+        for table in (
+            "documents",
+            "document_revisions",
+            "chunk_refs",
+            "claims",
+            "claim_evidence",
+            "pages",
+            "entities",
+            "relations",
+        ):
+            counts[table] = (
+                int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                if table in tables
+                else 0
+            )
+        info["table_counts"] = counts
+        info["document_statuses"] = (
+            {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) FROM documents GROUP BY status"
+                )
+            }
+            if "documents" in tables
+            else {}
+        )
+        info["revision_statuses"] = (
+            {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) FROM document_revisions GROUP BY status"
+                )
+            }
+            if "document_revisions" in tables
+            else {}
+        )
+    except sqlite3.Error as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        conn.close()
+    return info
+
+
 def collect() -> dict:
     import lancedb
 
@@ -161,6 +253,7 @@ def collect() -> dict:
         else 0,
         "env": {k: v for k, v in os.environ.items() if k.startswith("WIKI_") or k.startswith("LANCEDB_")},
         "vault": _vault_info(),
+        "wiki_db": _wiki_db_stats(),
     }
     if not db_path.is_dir():
         return result
@@ -208,6 +301,47 @@ def render_markdown(data: dict) -> str:
         ]
         for source, count in profile["top_sources"]:
             lines.append(f"| `{source}` | {count} |")
+    wiki_db = data.get("wiki_db")
+    if wiki_db:
+        lines += [
+            "",
+            "## Wiki SQLite",
+            "",
+            f"- 路径: `{wiki_db.get('path', '')}`",
+            f"- 存在: {wiki_db.get('exists', False)}",
+        ]
+        if wiki_db.get("exists"):
+            lines.append(f"- 可读: {wiki_db.get('readable', False)}")
+            if wiki_db.get("error"):
+                lines.append(f"- 读取错误: `{wiki_db['error']}`")
+            versions = wiki_db.get("migration_versions") or []
+            lines.append(f"- 迁移版本: {', '.join(versions) if versions else '无'}")
+            counts = wiki_db.get("table_counts") or {}
+            for table in (
+                "documents",
+                "document_revisions",
+                "chunk_refs",
+                "claims",
+                "claim_evidence",
+                "pages",
+                "entities",
+                "relations",
+            ):
+                lines.append(f"- `{table}`: {counts.get(table, 0)}")
+            doc_statuses = wiki_db.get("document_statuses") or {}
+            if doc_statuses:
+                lines.append(
+                    "- document 状态: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(doc_statuses.items()))
+                )
+            revision_statuses = wiki_db.get("revision_statuses") or {}
+            if revision_statuses:
+                lines.append(
+                    "- revision 状态: "
+                    + ", ".join(
+                        f"{k}={v}" for k, v in sorted(revision_statuses.items())
+                    )
+                )
     lines += ["", "## Vault", "", "```json", json.dumps(data["vault"], ensure_ascii=False, indent=2), "```", ""]
     return "\n".join(lines)
 
