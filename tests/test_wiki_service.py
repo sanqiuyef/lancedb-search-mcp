@@ -474,9 +474,9 @@ class TestCreateAndReview(WikiServiceTestBase):
         self.assertEqual(str(view.page.status), "published")
         self.assertEqual(str(self.store.read_page(page.page_id).page.status), "published")
 
-        index_path = os.path.join(self.vault, "wiki-维基", "index.md")
-        log_path = os.path.join(self.vault, "wiki-维基", "log.md")
-        overview_path = os.path.join(self.vault, "wiki-维基", "overview.md")
+        index_path = os.path.join(self.vault, "wiki-维基", "ai-index.md")
+        log_path = os.path.join(self.vault, "wiki-维基", "ai-log.md")
+        overview_path = os.path.join(self.vault, "wiki-维基", "ai-overview.md")
         self.assertTrue(os.path.isfile(index_path))
         self.assertTrue(os.path.isfile(log_path))
         self.assertTrue(os.path.isfile(overview_path))
@@ -599,7 +599,7 @@ class TestCreateAndReview(WikiServiceTestBase):
         )
         self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head_before)
         self.assertEqual(self.index_mock.call_count, 0)
-        self.assertFalse(os.path.exists(os.path.join(self.vault, "wiki-维基", "log.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.vault, "wiki-维基", "ai-log.md")))
 
     def test_stale_expected_revision_marks_stale(self):
         page = self.make_page(

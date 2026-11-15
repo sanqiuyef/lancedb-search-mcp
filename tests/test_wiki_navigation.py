@@ -15,7 +15,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from kb.wiki import navigation
-from kb.wiki.config import WikiConfig
+from kb.wiki.config import WikiConfig, WikiPathError
 from kb.wiki.db import connect, run_migrations
 from kb.wiki.page_store import PageDraft, PageStore
 from kb.wiki.repositories import pages as pages_repo
@@ -129,8 +129,21 @@ class TestNavPaths(WikiNavigationTestBase):
             self.assertEqual(os.path.basename(paths[key]), filename)
         self.assertEqual(
             paths["purpose"],
-            os.path.join(self.config.page_root, "purpose.md"),
+            os.path.join(self.config.page_root, "ai-purpose.md"),
         )
+        self.assertTrue(
+            all(name.startswith("ai-") for name in navigation.NAV_FILENAMES.values())
+        )
+
+    def test_refuses_to_overwrite_user_file_without_marker(self):
+        path = navigation.nav_paths(self.config)["index"]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("# 用户自己的索引\n")
+        with self.assertRaises(WikiPathError):
+            navigation.rebuild_index(self.conn, self.config)
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "# 用户自己的索引\n")
 
 
 class TestPurpose(WikiNavigationTestBase):
@@ -190,7 +203,8 @@ class TestIndex(WikiNavigationTestBase):
         self.assertEqual(path, navigation.nav_paths(self.config)["index"])
         text = self.read_path(path)
 
-        self.assertTrue(text.startswith("# 知识索引\n"))
+        self.assertTrue(text.startswith(navigation.GENERATED_MARKER))
+        self.assertIn("# 知识索引\n", text)
         self.assertIn("更新时间：", text)
         self.assertIn("## 概念（concept）", text)
         self.assertIn("## 实体（entity）", text)
@@ -352,9 +366,10 @@ class TestOverview(WikiNavigationTestBase):
         self.assertIn("| 概念（concept） | 3 |", text)
         self.assertIn("| 实体（entity） | 2 |", text)
         self.assertIn("| 主题（topic） | 1 |", text)
-        self.assertIn("- [[index]]", text)
-        self.assertIn("- [[log]]", text)
-        self.assertIn("- [[purpose]]", text)
+        self.assertIn("- [[ai-index|知识索引]]", text)
+        self.assertIn("- [[ai-log|操作日志]]", text)
+        self.assertIn("- [[ai-purpose|知识库目标]]", text)
+        self.assertIn("- [[INDEX|用户总索引]]", text)
 
         # updated_at desc：p2 > p3 > p1 > p4 > p5 > p6
         positions = [

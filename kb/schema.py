@@ -3,7 +3,7 @@
 
 Schema 采用官方 SourceField/VectorField 自动向量化模式；新增 doc_id（内容指纹）
 与 ingested_at（入库时间）两列用于去重与诊断。FTS 为原生 BM25 倒排索引，
-jieba 分词词典位于 LANCE_LANGUAGE_MODEL_HOME。
+默认使用 ngram 分词（jieba 在部分中文词上会触发上游 panic）。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import sys
 from datetime import datetime, timezone
 
 import lancedb
+from lancedb.index import FTS
 from lancedb.pydantic import LanceModel, Vector
 
 from . import config as cfg
@@ -128,14 +129,30 @@ def ensure_vector_index(table) -> str:
 
 
 def ensure_fts_index(table, force_rebuild: bool = False) -> str:
-    """确保原生 BM25 FTS 索引存在（jieba 分词）；返回动作说明。"""
+    """确保原生 BM25 FTS 索引存在；默认 ngram 分词。"""
     names = {i.name for i in table.list_indices()}
     if "text_idx" in names:
         if not force_rebuild:
             return "FTS 索引已存在"
         table.drop_index("text_idx")
-    table.create_fts_index("text", base_tokenizer=cfg.FTS_BASE_TOKENIZER, replace=True)
-    return f"FTS 索引已创建（tokenizer={cfg.FTS_BASE_TOKENIZER}）"
+    tokenizer = cfg.FTS_BASE_TOKENIZER
+    if tokenizer == "ngram":
+        table.create_index(
+            "text",
+            config=FTS(
+                base_tokenizer="ngram",
+                ngram_min_length=cfg.FTS_NGRAM_MIN,
+                ngram_max_length=cfg.FTS_NGRAM_MAX,
+            ),
+            name="text_idx",
+            replace=True,
+        )
+        return (
+            "FTS 索引已创建（tokenizer=ngram, "
+            f"{cfg.FTS_NGRAM_MIN}-{cfg.FTS_NGRAM_MAX}gram）"
+        )
+    table.create_fts_index("text", base_tokenizer=tokenizer, replace=True)
+    return f"FTS 索引已创建（tokenizer={tokenizer}）"
 
 
 def fold_new_rows(table) -> None:

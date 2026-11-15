@@ -448,9 +448,59 @@ def duplicate_page_candidates(
 
 
 def unindexed_published_pages(
-    conn: sqlite3.Connection, config: WikiConfig
+    conn: sqlite3.Connection, config: WikiConfig, lance_db_path: str = ""
 ) -> dict[str, Any]:
     table = config.page_index_table
+    if lance_db_path:
+        try:
+            from kb.wiki import page_index
+
+            status = page_index.index_status(
+                conn=conn, config=config, db_path=lance_db_path
+            )
+        except Exception as exc:  # noqa: BLE001 - 报告不因索引不可读而失败
+            return {
+                "status": "index_error",
+                "index_table": table,
+                "message": f"页面索引读取失败: {exc}",
+                "published_count": None,
+                "missing_count": None,
+                "pages": [],
+            }
+        if not status.get("exists"):
+            return {
+                "status": "index_not_built",
+                "index_table": table,
+                "message": f"索引未建立（{table} 表缺失）",
+                "published_count": None,
+                "missing_count": None,
+                "pages": [],
+            }
+        published = [
+            PageRecord.model_validate(dict(row))
+            for row in conn.execute(
+                "SELECT * FROM pages WHERE status = 'published' "
+                "ORDER BY slug COLLATE NOCASE ASC, page_id ASC"
+            )
+        ]
+        missing_ids = set(status.get("missing_page_ids") or [])
+        missing = [
+            {"page_id": page.page_id, "slug": page.slug, "title": page.title}
+            for page in published
+            if page.page_id in missing_ids
+        ]
+        sample, truncated = _limited(missing)
+        return {
+            "status": "ok",
+            "index_table": table,
+            "backend": "lance",
+            "match_key": "page_id",
+            "published_count": int(status.get("published_count") or len(published)),
+            "missing_count": len(missing),
+            "pages": sample,
+            "truncated": truncated,
+        }
+
     if not _table_exists(conn, table):
         return {
             "status": "index_not_built",
@@ -666,6 +716,7 @@ def build_report(
     conn: sqlite3.Connection,
     config: WikiConfig,
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    lance_db_path: str = "",
 ) -> dict[str, Any]:
     if not 0.0 <= float(similarity_threshold) <= 1.0:
         raise ValueError("similarity_threshold 必须在 0..1 之间")
@@ -677,7 +728,9 @@ def build_report(
         "duplicate_page_candidates": duplicate_page_candidates(
             conn, config, similarity_threshold
         ),
-        "unindexed_published_pages": unindexed_published_pages(conn, config),
+        "unindexed_published_pages": unindexed_published_pages(
+            conn, config, lance_db_path=lance_db_path
+        ),
         "unsourced_relations": unsourced_relations(conn),
         "unresolved_aliases": unresolved_aliases(conn),
     }
@@ -987,6 +1040,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="vault 路径（默认 WIKI_VAULT_PATH）",
     )
     parser.add_argument(
+        "--lance-db",
+        default=None,
+        help="LanceDB 目录（默认 LANCEDB_DB_PATH）；提供时按 wiki_pages 表核对索引",
+    )
+    parser.add_argument(
         "--out",
         default=None,
         help="写入文件（默认 stdout）；例如 docs/wiki-v1/quality-report.md",
@@ -1028,7 +1086,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise QualityReportError(
                 f"数据库未执行 Wiki 迁移: {db_path}；先运行迁移"
             )
-        report = build_report(conn, config, args.similarity_threshold)
+        report = build_report(
+            conn,
+            config,
+            args.similarity_threshold,
+            lance_db_path=args.lance_db or os.environ.get("LANCEDB_DB_PATH", ""),
+        )
     except (QualityReportError, WikiConfigError, ValueError, sqlite3.Error) as exc:
         print(f"wiki_quality_report: error: {exc}", file=sys.stderr)
         return 2

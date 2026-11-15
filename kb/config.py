@@ -64,8 +64,11 @@ OCR_DPI = int(os.environ.get("LANCEDB_OCR_DPI", "300"))
 OCR_MAX_PAGES = int(os.environ.get("LANCEDB_OCR_MAX_PAGES", "50"))  # 0 = 不限制
 OCR_MIN_TEXT_CHARS = int(os.environ.get("LANCEDB_OCR_MIN_TEXT_CHARS", "500"))
 
-# ── 原生 FTS：jieba 分词依赖 LANCE_LANGUAGE_MODEL_HOME 下的词典 ──
-FTS_BASE_TOKENIZER = os.environ.get("FTS_BASE_TOKENIZER", "jieba/default")
+# ── 原生 FTS：默认 ngram（jieba 分词器在 lancedb 0.39 对部分中文词会触发
+# Rust 内存分配 panic，见 2026-11-15 复现；如需 jieba 可显式设置环境变量） ──
+FTS_BASE_TOKENIZER = os.environ.get("FTS_BASE_TOKENIZER", "ngram")
+FTS_NGRAM_MIN = int(os.environ.get("FTS_NGRAM_MIN", "2"))
+FTS_NGRAM_MAX = int(os.environ.get("FTS_NGRAM_MAX", "3"))
 LANCE_LANGUAGE_MODEL_HOME = os.environ.get(
     "LANCE_LANGUAGE_MODEL_HOME", r"D:\lance\language_models"
 )

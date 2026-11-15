@@ -1953,7 +1953,7 @@ def apply_proposal(
                 f"proposal={proposal_key} rev={revision.revision_id}",
             )
         except Exception as exc:  # noqa: BLE001 - 页面已提交，日志失败不阻断
-            warnings.append(f"追加 log.md 失败: {exc}")
+            warnings.append(f"追加 ai-log.md 失败: {exc}")
 
         # 3) 提交导航文件（页面已由 ProposalService 提交，允许两个提交）。
         nav_commit = ""

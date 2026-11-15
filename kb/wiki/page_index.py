@@ -28,6 +28,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import lancedb
+from lancedb.index import FTS
 from lancedb.pydantic import LanceModel, Vector
 
 from .. import config as kb_config
@@ -247,21 +248,34 @@ def _index_names(table) -> set[str]:
 
 
 def ensure_text_index(table) -> str:
-    """确保 FTS 索引存在（固定名，jieba/default）；返回动作说明。"""
+    """确保 FTS 索引存在（固定名）；默认 ngram，可用环境变量切 jieba。"""
     if PAGE_TEXT_INDEX in _index_names(table):
         return "FTS 索引已存在"
+    tokenizer = kb_config.FTS_BASE_TOKENIZER
     try:
-        table.create_fts_index(
-            "text",
-            base_tokenizer=kb_config.FTS_BASE_TOKENIZER,
-            replace=True,
-            name=PAGE_TEXT_INDEX,
-        )
+        if tokenizer == "ngram":
+            table.create_index(
+                "text",
+                config=FTS(
+                    base_tokenizer="ngram",
+                    ngram_min_length=kb_config.FTS_NGRAM_MIN,
+                    ngram_max_length=kb_config.FTS_NGRAM_MAX,
+                ),
+                name=PAGE_TEXT_INDEX,
+                replace=True,
+            )
+        else:
+            table.create_fts_index(
+                "text",
+                base_tokenizer=tokenizer,
+                replace=True,
+                name=PAGE_TEXT_INDEX,
+            )
     except Exception as exc:
         raise PageIndexError(
-            f"创建 FTS 索引失败（tokenizer={kb_config.FTS_BASE_TOKENIZER}）: {exc}"
+            f"创建 FTS 索引失败（tokenizer={tokenizer}）: {exc}"
         ) from exc
-    return f"FTS 索引已创建（tokenizer={kb_config.FTS_BASE_TOKENIZER}）"
+    return f"FTS 索引已创建（tokenizer={tokenizer}）"
 
 
 def ensure_vector_index(table) -> str:

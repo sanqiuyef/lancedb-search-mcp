@@ -168,5 +168,43 @@ class TestDedupeByDocId(unittest.TestCase):
                          ["legacy-1", "legacy-2"])
 
 
+class NgramTokenizerRegression(unittest.TestCase):
+    """lancedb 0.39 + jieba 对「不确定性」会触发 Rust panic；默认 ngram 必须可用。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path = temp_db_env()
+        cls._orig = (
+            cfg.FTS_BASE_TOKENIZER,
+            cfg.FTS_NGRAM_MIN,
+            cfg.FTS_NGRAM_MAX,
+        )
+        cfg.FTS_BASE_TOKENIZER = "ngram"
+        cfg.FTS_NGRAM_MIN = 2
+        cfg.FTS_NGRAM_MAX = 3
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(
+            table,
+            [{"text": "城市洪涝的不确定性量化研究", "source": "doc/uq.md",
+              "chunk_index": 0, "category": "paper"}],
+        )
+        table = kb_schema.get_or_create_table()
+        kb_schema.ensure_fts_index(table)
+        cls.table = table
+
+    @classmethod
+    def tearDownClass(cls):
+        cfg.FTS_BASE_TOKENIZER, cfg.FTS_NGRAM_MIN, cfg.FTS_NGRAM_MAX = cls._orig
+
+    def test_ngram_two_and_three_char_queries(self):
+        for query in ("不确定性", "洪涝", "城市洪涝"):
+            result = kb_search.search_structured(query, search_mode="fts", limit=3)
+            self.assertIn(
+                "doc/uq.md",
+                [item["source"] for item in result["results"]],
+                query,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
