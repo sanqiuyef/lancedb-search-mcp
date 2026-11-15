@@ -15,13 +15,15 @@ Phase 6 追加只读 Wiki 浏览与提案审核路由（``/api/wiki/*``），全
 from __future__ import annotations
 
 import datetime
+import hmac
 import json
 import os
+import secrets
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -35,6 +37,11 @@ _search_lock = threading.Lock()  # 串行化检索（模型推理不并发）
 MAX_BODY_BYTES = 64 * 1024
 _WIKI_HINT = "设置 WIKI_ENABLED=1、WIKI_VAULT_PATH 与 WIKI_DB_PATH 后重启服务"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+_LOOPBACK_HOST_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_ALLOWED_SEC_FETCH_SITES = frozenset({"same-origin", "none"})
+_CSRF_HEADER = "X-Wiki-CSRF"
+# 单进程内存 token：启动时一次性生成，只在 /api/wiki/status 返回，不写日志或文件。
+_CSRF_TOKEN = secrets.token_hex(32)
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _WIKI_GET_ROUTES = frozenset(
@@ -59,6 +66,14 @@ class _BadRequest(ValueError):
 
 class _BodyTooLarge(ValueError):
     """请求体超过上限。"""
+
+
+class _Forbidden(ValueError):
+    """跨源或 CSRF 校验失败。"""
+
+
+class _UnsupportedMediaType(ValueError):
+    """写接口的 Content-Type 不是 application/json。"""
 
 
 def _status() -> dict:
@@ -172,7 +187,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -189,6 +203,115 @@ class Handler(BaseHTTPRequestHandler):
     def _client_is_local(self) -> bool:
         address = self.client_address[0] if self.client_address else ""
         return address in _LOCAL_HOSTS
+
+    def _bound_host_port(self) -> tuple[str, int]:
+        """启动时 bind 的地址；server_address 在 socket 绑定后固定，不受请求影响。"""
+        address = self.server.server_address
+        return str(address[0]), int(address[1])
+
+    def _allowed_host_names(self) -> frozenset[str]:
+        host, _ = self._bound_host_port()
+        if host in _LOCAL_HOSTS:
+            return _LOOPBACK_HOST_NAMES
+        return frozenset({host.lower()})
+
+    def _host_header_allowed(self) -> bool:
+        values = self.headers.get_all("Host") or []
+        if len(values) != 1:
+            return False
+        raw = (values[0] or "").strip()
+        if not raw:
+            return False
+        try:
+            parsed = urlsplit("//" + raw)
+            port = parsed.port
+        except ValueError:
+            return False
+        if parsed.scheme or parsed.username or parsed.password:
+            return False
+        if parsed.path or parsed.query or parsed.fragment:
+            return False
+        hostname = parsed.hostname
+        if hostname is None or port is None:
+            return False
+        _, bound_port = self._bound_host_port()
+        return hostname.lower() in self._allowed_host_names() and port == bound_port
+
+    def _origin_allowed(self) -> bool:
+        values = self.headers.get_all("Origin") or []
+        if not values:
+            return True
+        if len(values) != 1:
+            return False
+        raw = (values[0] or "").strip()
+        if not raw:
+            return False
+        try:
+            parsed = urlsplit(raw)
+            port = parsed.port
+        except ValueError:
+            return False
+        if parsed.scheme.lower() != "http":
+            return False
+        if parsed.username or parsed.password:
+            return False
+        if parsed.path or parsed.query or parsed.fragment:
+            return False
+        hostname = parsed.hostname
+        if hostname is None or port is None:
+            return False
+        _, bound_port = self._bound_host_port()
+        return hostname.lower() in self._allowed_host_names() and port == bound_port
+
+    def _sec_fetch_site_allowed(self) -> bool:
+        values = self.headers.get_all("Sec-Fetch-Site") or []
+        if not values:
+            return True
+        if len(values) != 1:
+            return False
+        return (values[0] or "").strip().lower() in _ALLOWED_SEC_FETCH_SITES
+
+    def _csrf_token_allowed(self) -> bool:
+        values = self.headers.get_all(_CSRF_HEADER) or []
+        if len(values) != 1:
+            return False
+        provided = (values[0] or "").strip()
+        return bool(provided) and hmac.compare_digest(provided, _CSRF_TOKEN)
+
+    def _content_type_is_json(self) -> bool:
+        values = self.headers.get_all("Content-Type") or []
+        if len(values) != 1:
+            return False
+        parts = [part.strip() for part in (values[0] or "").split(";")]
+        if not parts or parts[0].lower() != "application/json":
+            return False
+        for part in parts[1:]:
+            name, sep, value = part.partition("=")
+            if sep and name.strip().lower() == "charset":
+                if value.strip().strip('"').lower() != "utf-8":
+                    return False
+        return True
+
+    def _guard_request(self) -> bool:
+        """所有路由共用：Host 必须是启动时绑定的 loopback 地址，且客户端来自本机。"""
+        if not self._host_header_allowed():
+            self._json(421, {"ok": False, "error": "invalid Host header"})
+            return False
+        if not self._client_is_local():
+            self._json(403, {"ok": False, "error": "只允许本机访问"})
+            return False
+        return True
+
+    def _require_write_guards(self) -> None:
+        """写路由的 CSRF 防护：Content-Type、Origin、Sec-Fetch-Site、一次性 token。"""
+        if not self._content_type_is_json():
+            raise _UnsupportedMediaType("Content-Type 必须是 application/json")
+        if not self._origin_allowed():
+            raise _Forbidden("Origin 不是同源地址")
+        if not self._sec_fetch_site_allowed():
+            raise _Forbidden("Sec-Fetch-Site 不允许")
+        if not self._csrf_token_allowed():
+            raise _Forbidden("CSRF token 缺失或无效")
 
     def _read_json_body(self) -> dict:
         raw_length = self.headers.get("Content-Length")
@@ -216,6 +339,12 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(exc, _BodyTooLarge):
             self._json(413, {"ok": False, "error": str(exc)})
             return
+        if isinstance(exc, _UnsupportedMediaType):
+            self._json(415, {"ok": False, "error": str(exc)})
+            return
+        if isinstance(exc, _Forbidden):
+            self._json(403, {"ok": False, "error": str(exc)})
+            return
         if isinstance(exc, _BadRequest):
             self._json(400, {"ok": False, "error": str(exc)})
             return
@@ -238,6 +367,9 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query, keep_blank_values=True)
             if parsed.path == "/api/wiki/status":
                 result = service.status(config=config)
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result["csrf_token"] = _CSRF_TOKEN
             elif parsed.path == "/api/wiki/pages":
                 result = service.list_pages(
                     page_type=_query_value(params, "page_type", ""),
@@ -278,6 +410,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_wiki_apply(self) -> None:
         try:
+            self._require_write_guards()
             config = _wiki_config()
             service = _wiki_service()
             payload = self._read_json_body()
@@ -308,8 +441,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": str(exc)})
 
     def do_GET(self) -> None:  # noqa: N802
-        if not self._client_is_local():
-            self._json(403, {"ok": False, "error": "只允许本机访问"})
+        if not self._guard_request():
             return
         if self.path in ("/", "/index.html"):
             try:
@@ -331,8 +463,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self._client_is_local():
-            self._json(403, {"ok": False, "error": "只允许本机访问"})
+        if not self._guard_request():
             return
         if self.path == "/api/search":
             try:
