@@ -391,6 +391,7 @@
   let wikiReady = null;        // null=未探测，true/false=已探测
   let wikiLoaded = false;
   let reviewLoaded = false;
+  let csrfToken = '';          // 从 /api/wiki/status 获取，写操作回传
 
   function showView(name) {
     tabs.forEach((t) => t.classList.toggle('active', t.dataset.view === name));
@@ -448,6 +449,7 @@
         return false;
       }
       wikiReady = true;
+      csrfToken = typeof d.csrf_token === 'string' ? d.csrf_token : '';
       hideNotice('wikiNotice');
       hideNotice('reviewNotice');
       $('wikiBody').hidden = false;
@@ -825,7 +827,10 @@
     try {
       const r = await fetch('/api/wiki/apply', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wiki-CSRF': csrfToken,
+        },
         body: JSON.stringify({
           proposal_id: reviewSelected,
           decision,

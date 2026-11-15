@@ -164,9 +164,17 @@ class UiWikiApiTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         return result
 
-    def request(self, method, path, body=None):
+    def request(
+        self,
+        method,
+        path,
+        body=None,
+        headers=None,
+        csrf=False,
+        with_headers=False,
+    ):
         data = None
-        headers = {}
+        req_headers = dict(headers or {})
         if body is not None:
             if isinstance(body, (dict, list)):
                 data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -174,20 +182,37 @@ class UiWikiApiTest(unittest.TestCase):
                 data = body.encode("utf-8")
             else:
                 data = body
-            headers["Content-Type"] = "application/json"
+            req_headers.setdefault("Content-Type", "application/json")
+        if csrf:
+            req_headers.setdefault("X-Wiki-CSRF", self.csrf_token())
         req = urllib.request.Request(
-            self.base_url + path, data=data, headers=headers, method=method
+            self.base_url + path, data=data, headers=req_headers, method=method
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as response:
-                return response.status, json.loads(response.read().decode("utf-8"))
+                payload = json.loads(response.read().decode("utf-8"))
+                if with_headers:
+                    return response.status, payload, response.headers
+                return response.status, payload
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8")
             try:
                 payload = json.loads(raw)
             except json.JSONDecodeError:
                 payload = {"raw": raw}
+            if with_headers:
+                return exc.code, payload, exc.headers
             return exc.code, payload
+
+    def csrf_token(self):
+        if not hasattr(self, "_csrf_token"):
+            status, data = self.request("GET", "/api/wiki/status")
+            self.assertEqual(status, 200)
+            token = data.get("csrf_token")
+            self.assertIsInstance(token, str)
+            self.assertEqual(len(token), 64)
+            self._csrf_token = token
+        return self._csrf_token
 
     # ── 用例 ──
     def test_wiki_disabled_returns_503(self):
@@ -338,6 +363,7 @@ class UiWikiApiTest(unittest.TestCase):
                 "decision": "approve",
                 "review_note": "LGTM",
             },
+            csrf=True,
         )
         self.assertEqual(status, 200, data)
         self.assertTrue(data["ok"], data)
@@ -386,6 +412,7 @@ class UiWikiApiTest(unittest.TestCase):
                 "decision": "reject",
                 "review_note": "理由不足",
             },
+            csrf=True,
         )
         self.assertEqual(status, 200, data)
         self.assertTrue(data["ok"])
@@ -409,12 +436,14 @@ class UiWikiApiTest(unittest.TestCase):
         self.assertEqual(self.index_mock.call_count, 0)
 
     def test_invalid_json_and_missing_proposal_id_return_400(self):
-        status, data = self.request("POST", "/api/wiki/apply", "{not-json")
+        status, data = self.request(
+            "POST", "/api/wiki/apply", "{not-json", csrf=True
+        )
         self.assertEqual(status, 400)
         self.assertFalse(data["ok"])
         self.assertIn("bad request", data["error"])
 
-        status, data = self.request("POST", "/api/wiki/apply", {})
+        status, data = self.request("POST", "/api/wiki/apply", {}, csrf=True)
         self.assertEqual(status, 400)
         self.assertFalse(data["ok"])
         self.assertIn("proposal_id", data["error"])
@@ -428,9 +457,150 @@ class UiWikiApiTest(unittest.TestCase):
         self.assertIn("id", data["error"])
 
     def test_request_body_size_limit(self):
-        status, data = self.request("POST", "/api/wiki/apply", "x" * 70000)
+        status, data = self.request(
+            "POST", "/api/wiki/apply", "x" * 70000, csrf=True
+        )
         self.assertEqual(status, 413)
         self.assertFalse(data["ok"])
+
+    def test_host_header_must_match_bind_address(self):
+        port = self.server.server_address[1]
+        for host in (
+            "evil.example",
+            f"evil.example:{port}",
+            f"127.0.0.1:{port + 1}",
+            "127.0.0.1",
+        ):
+            status, data = self.request(
+                "GET", "/api/status", headers={"Host": host}
+            )
+            self.assertIn(status, (403, 421), (host, data))
+            self.assertFalse(data["ok"])
+
+        status, data = self.request(
+            "POST", "/api/search", {"query": "洪涝"}, headers={"Host": "evil.example"}
+        )
+        self.assertIn(status, (403, 421), data)
+        self.assertFalse(data["ok"])
+
+        for host in (
+            f"127.0.0.1:{port}",
+            f"localhost:{port}",
+            f"[::1]:{port}",
+        ):
+            status, data = self.request(
+                "GET", "/api/status", headers={"Host": host}
+            )
+            self.assertEqual(status, 200, (host, data))
+
+    def test_wiki_status_exposes_csrf_token(self):
+        status, data = self.request("GET", "/api/wiki/status")
+        self.assertEqual(status, 200)
+        token = data.get("csrf_token")
+        self.assertIsInstance(token, str)
+        self.assertEqual(len(token), 64)
+
+        status, data = self.request("GET", "/api/wiki/pages")
+        self.assertEqual(status, 200)
+        self.assertNotIn("csrf_token", data)
+
+    def test_responses_do_not_send_wildcard_cors_header(self):
+        for path in ("/api/status", "/api/wiki/status"):
+            status, data, headers = self.request(
+                "GET", path, with_headers=True
+            )
+            self.assertEqual(status, 200, (path, data))
+            self.assertIsNone(
+                headers.get("Access-Control-Allow-Origin"), path
+            )
+
+    def test_apply_rejects_csrf_and_origin_violations(self):
+        page = self.make_page(
+            "防护页", slug="guard-page", body="原内容\n", commit=True
+        )
+        proposal = self.make_proposal(page, "被批准内容\n")
+        body = {
+            "proposal_id": proposal["proposal_id"],
+            "decision": "approve",
+            "review_note": "ok",
+        }
+        token = self.csrf_token()
+        path = "/api/wiki/apply"
+
+        # 无 token
+        status, data = self.request("POST", path, body)
+        self.assertEqual(status, 403, data)
+
+        # 错误 token
+        status, data = self.request(
+            "POST", path, body, headers={"X-Wiki-CSRF": "0" * 64}
+        )
+        self.assertEqual(status, 403, data)
+
+        # Content-Type 不是 JSON（含 text/plain 与错误 charset）
+        for ctype in (
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "application/json; charset=utf-16",
+        ):
+            status, data = self.request(
+                "POST",
+                path,
+                body,
+                headers={"Content-Type": ctype, "X-Wiki-CSRF": token},
+            )
+            self.assertEqual(status, 415, (ctype, data))
+
+        # 跨源 Origin
+        for origin in (
+            "http://evil.example",
+            f"http://127.0.0.1:{self.server.server_address[1] + 1}",
+            "null",
+        ):
+            status, data = self.request(
+                "POST",
+                path,
+                body,
+                headers={"Origin": origin, "X-Wiki-CSRF": token},
+            )
+            self.assertEqual(status, 403, (origin, data))
+
+        # Sec-Fetch-Site 只允许 same-origin / none
+        for site in ("cross-site", "same-site"):
+            status, data = self.request(
+                "POST",
+                path,
+                body,
+                headers={"Sec-Fetch-Site": site, "X-Wiki-CSRF": token},
+            )
+            self.assertEqual(status, 403, (site, data))
+
+        # 以上请求都没有改变提案状态
+        status, queue = self.request("GET", "/api/wiki/proposals?status=pending")
+        self.assertEqual(status, 200)
+        self.assertEqual(queue["count"], 1)
+
+        # 正确 token + 同源 Origin + same-origin 可以成功
+        status, data = self.request(
+            "POST",
+            path,
+            body,
+            headers={
+                "Origin": self.base_url,
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            csrf=True,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["status"], "applied")
+
+        status, page_data = self.request(
+            "GET", f"/api/wiki/page?id={page.page_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page_data["body"], "被批准内容\n")
 
     def test_original_search_endpoint_still_works(self):
         fake = {
