@@ -328,6 +328,8 @@ OCR 链（云 MinerU → Tesseract）。转换产物按 `路径+大小+mtime` �
 任意浏览器内嵌使用，不依赖 MCP 与任何 Obsidian 插件。面板包含「检索 / Wiki / 审核」
 三个标签：Wiki 标签浏览页面、反链与证据，审核标签查看提案 Diff 并批准/拒绝；
 `WIKI_ENABLED=0` 时 Wiki 与审核标签显示启用提示，检索标签不受影响。
+面板需直接打开 `http://127.0.0.1:8002/`（同源）；API 不再发送通配 CORS，
+写接口要求同源 Origin + CSRF token，不再支持其他网页跨域调用。
 
 ```powershell
 run_ui.cmd                     # 启动器（内部设好 HF/env 后拉起 ui_server.py）

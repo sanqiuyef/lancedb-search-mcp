@@ -5,10 +5,10 @@
 | 项目 | 结果 |
 |---|---|
 | 基线（Phase 0 之前） | 40 项 |
-| 当前全量 discover | **495 项，全部通过** |
+| 当前全量 discover | **550 项，全部通过** |
 | 失败/错误/跳过 | 0 / 0 / 0 |
 | 运行环境 | Windows 10.0.19045，Python 3.13.9（`D:\anaconda3\python.exe`） |
-| 全量耗时 | 约 36 秒 |
+| 全量耗时 | 约 47 秒 |
 
 ## 测试演进
 
@@ -24,6 +24,7 @@
 | Phase 5 | 485 | service 门面 + 14 个 MCP 工具 + 抽取契约 |
 | Phase 6 | 494 | Wiki 阅读与提案审核 UI |
 | 发布修复 | 495 | 正文型提案审核通过后自动发布并入索引 |
+| 终审修复 | 550 | UI Host/Origin/CSRF、发布原子化、提案 CAS、链接重建、frontmatter 保留、legacy 源保护 |
 
 新增测试全部使用 `tempfile.TemporaryDirectory()`，不访问真实 vault、真实 Wiki SQLite 或 LanceDB。
 
