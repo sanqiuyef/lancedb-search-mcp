@@ -229,12 +229,14 @@ def _scan_images(scan_dir: str) -> List[str]:
 
 
 def plan_image_ingest(
-    existing: dict[str, int],
+    existing: dict[str, list[int]],
     scanned: list[tuple[str, int]],
 ) -> dict:
     """把扫描结果 (路径, mtime_ns) 分类为 new/changed/skipped/duplicates。
 
-    同批扫描中重复出现的路径只按首次出现分类，后续计入 duplicates。
+    existing 为「路径 → 该路径全部现有行的 mtime_ns 列表」：同一路径出现多行时，
+    无论 mtime 是否等于当前值都强制归为 changed，由 ingest_images 替换掉全部旧行，
+    以清理历史重复行。同批扫描中重复出现的路径只按首次出现分类，后续计入 duplicates。
     """
     plan = {"new": [], "changed": [], "skipped": [], "duplicates": []}
     seen: set[str] = set()
@@ -244,19 +246,59 @@ def plan_image_ingest(
             continue
         seen.add(path)
         previous = existing.get(path)
-        if previous is None:
+        if not previous:
             plan["new"].append(path)
-        elif previous != mtime_ns:
+        elif len(previous) > 1 or previous[0] != mtime_ns:
             plan["changed"].append(path)
         else:
             plan["skipped"].append(path)
     return plan
 
 
+def _load_image_state(
+    table,
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """读取现有图片行：(路径 → [mtime_ns...], 路径 → [_rowid...])。
+
+    _rowid 是 Lance 行地址，供「先插后删」精确定位旧行；当前版本拿不到时第二项
+    返回空 dict，调用方退回按 image_path 删除并报告并发风险。
+    """
+    try:
+        arrow = table.to_lance().to_table(
+            columns=["image_path", "mtime_ns"], with_row_id=True
+        )
+    except Exception as error:  # 旧版 pylance 无 with_row_id 等
+        print(f"[image] 读取 _rowid 失败，回退按 image_path 删除: {error}", file=sys.stderr)
+        arrow = table.to_lance().to_table(columns=["image_path", "mtime_ns"])
+        has_rowid = False
+    else:
+        has_rowid = "_rowid" in arrow.column_names
+
+    paths = arrow.column("image_path").to_pylist()
+    mtimes = arrow.column("mtime_ns").to_pylist()
+    existing: dict[str, list[int]] = {}
+    for path, mtime_ns in zip(paths, mtimes):
+        existing.setdefault(str(path), []).append(int(mtime_ns))
+
+    rowids: dict[str, list[int]] = {}
+    if has_rowid:
+        ids = arrow.column("_rowid").to_pylist()
+        for path, rowid in zip(paths, ids):
+            rowids.setdefault(str(path), []).append(int(rowid))
+    return existing, rowids
+
+
+def _image_paths_where(paths: list[str]) -> str:
+    quoted = ",".join(f"'{_sql_quote(path)}'" for path in sorted(paths))
+    return f"image_path IN ({quoted})"
+
+
 def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | None = None) -> str:
     """扫描目录向量化入库；按 (image_path, mtime_ns) 增量跳过未变更图片。
 
-    mtime 变化的图片先按 image_path 删除旧行再插入，避免同一路径留下新旧两行。
+    changed 图片先成功写入新行，再按改前抓取的 _rowid 一次性删除旧行（同路径多行
+    全部替换）。若拿不到 _rowid，退回旧行为：按 image_path 先删后插，并在结果中
+    报告并发误删风险。
     """
     scan_dir = scan_dir or cfg.IMAGE_SCAN_DIR_DEFAULT
     paths = _scan_images(scan_dir)
@@ -267,11 +309,10 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
     if rebuild:
         table.delete("true")
 
-    existing: dict[str, int] = {}
+    existing: dict[str, list[int]] = {}
+    rowids_by_path: dict[str, list[int]] = {}
     if not rebuild and image_count() > 0:
-        arrow = table.to_lance().to_table(columns=["image_path", "mtime_ns"])
-        existing = dict(zip(arrow.column("image_path").to_pylist(),
-                            arrow.column("mtime_ns").to_pylist()))
+        existing, rowids_by_path = _load_image_state(table)
 
     scanned = [(path, os.stat(path).st_mtime_ns) for path in paths]
     plan = plan_image_ingest(existing, scanned)
@@ -282,8 +323,19 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
 
     mtime_by_path = dict(scanned)
     changed = set(plan["changed"])
+    # 只有 changed 路径都存在可用的旧 _rowid 时才走「先插后删」。
+    use_rowid = bool(changed) and all(rowids_by_path.get(path) for path in changed)
+    fallback = bool(changed) and not use_rowid
+    if fallback:
+        print(
+            "[image] 未能取得全部旧行 _rowid，回退为按 image_path 先删后插；"
+            "并发写入时可能误删同路径新行。",
+            file=sys.stderr,
+        )
+
     bs = batch_size or cfg.IMAGE_BATCH_SIZE
     added = failed = 0
+    added_paths: set[str] = set()
     for start in range(0, len(todo), bs):
         chunk = todo[start : start + bs]
         embedded = embed_images(chunk, bs)
@@ -298,18 +350,39 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
                 "vector": vec.tolist(),
             })
         failed += len(chunk) - len(rows)
-        for row in rows:
-            if row["image_path"] in changed:
-                table.delete(f"image_path = '{_sql_quote(row['image_path'])}'")
         if rows:
+            if fallback:  # 无 _rowid：只能先删旧行，避免新行被一并删掉
+                changed_here = {row["image_path"] for row in rows} & changed
+                if changed_here:
+                    table.delete(_image_paths_where(list(changed_here)))
             table.add(rows)
         added += len(rows)
+        added_paths.update(row["image_path"] for row in rows)
         print(f"[image] 入库进度 {added}/{len(todo)}", file=sys.stderr)
+
+    replaced = 0
+    if use_rowid:
+        old_rowids = sorted({
+            rowid
+            for path in added_paths
+            for rowid in rowids_by_path.get(path, [])
+        })
+        if old_rowids:
+            deleted = table.delete(
+                "_rowid IN (" + ",".join(str(rowid) for rowid in old_rowids) + ")"
+            )
+            replaced = int(getattr(deleted, "num_deleted_rows", 0) or 0)
 
     total = image_count()
     skip_note = f"，损坏跳过 {failed} 张" if failed else ""
     dup_note = f"，批内重复 {len(plan['duplicates'])} 张" if plan["duplicates"] else ""
-    return f"✅ 图像入库完成：新增/更新 {added} 张，未变更跳过 {skipped} 张{dup_note}{skip_note}，表内共 {total} 张（库: {cfg.resolve_db_path()} / 表: {cfg.IMAGE_TABLE_NAME}）"
+    replace_note = f"，替换旧行 {replaced}" if replaced else ""
+    risk_note = "，未取得 _rowid：旧行按路径删除，存在并发误删风险" if fallback else ""
+    return (
+        f"✅ 图像入库完成：新增/更新 {added} 张，未变更跳过 {skipped} 张"
+        f"{dup_note}{skip_note}{replace_note}{risk_note}，表内共 {total} 张"
+        f"（库: {cfg.resolve_db_path()} / 表: {cfg.IMAGE_TABLE_NAME}）"
+    )
 
 
 # =============================================================
@@ -318,6 +391,13 @@ def ingest_images(scan_dir: str = "", rebuild: bool = False, batch_size: int | N
 
 def _sql_quote(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _like_escape(value: str) -> str:
+    """LIKE 模式转义：先转义反斜杠本身，再转义 % 与 _，最后处理单引号。"""
+    escaped = value.replace("\\", "\\\\")
+    escaped = escaped.replace("%", "\\%").replace("_", "\\_")
+    return escaped.replace("'", "''")
 
 
 def search_images_structured(
@@ -330,8 +410,11 @@ def search_images_structured(
     vec = embed_query_text(query)
     q = get_image_table().search(vec, vector_column_name="vector").metric("cosine").limit(limit * 4)
     if source_filter:
-        sf = _sql_quote(source_filter).replace("%", "")
-        q = q.where(f"image_path LIKE '%{sf}%' OR source_doc LIKE '%{sf}%'")
+        pattern = _like_escape(source_filter)
+        q = q.where(
+            f"image_path LIKE '%{pattern}%' ESCAPE '\\' OR "
+            f"source_doc LIKE '%{pattern}%' ESCAPE '\\'"
+        )
     rows = q.to_list()
 
     results = []
