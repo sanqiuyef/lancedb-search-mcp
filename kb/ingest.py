@@ -15,6 +15,7 @@ import fnmatch
 import os
 import re
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List
@@ -448,47 +449,155 @@ def add_chunks(table, chunks: List[Dict], batch_size: int = 32,
 # 增删改查
 # =============================================================
 
-def _delete_source_exact(table, source: str) -> int:
-    """按 source 精确删除并返回删除行数（不做子串匹配）。"""
-    where = "source = '" + source.replace("'", "''") + "'"
-    removed = table.count_rows(where)
-    if removed:
-        table.delete(where)
-    return removed
+# 模块级写锁：watcher 线程与 MCP 线程都会执行「读旧状态 → 写新行 → 清理旧行」，
+# 多步流程必须串行，避免交错删除对方刚写入的行。
+_write_lock = threading.RLock()
+
+_DOC_ID_DELETE_BATCH = 500  # IN 列表分批上限，控制单条 SQL 规模
 
 
-def _match_existing_source(all_sources: set[str], basename: str) -> str:
-    """在 distinct source 中按 basename 精确匹配（大小写不敏感）。
+def _basename_of(value: str) -> str:
+    """跨平台取 basename（同时接受 / 与 \\ 分隔符）。"""
+    return os.path.basename((value or "").replace("\\", "/"))
 
-    优先整值相等（含大小写变体），其次比较 source 的 basename；
-    避免旧实现的子串匹配把 a.pdf 误判成 data.pdf。
+
+def _normalized_path(value: str) -> str:
+    """路径后缀比较用归一：normcase 后统一为 / 分隔。"""
+    return os.path.normcase(value or "").replace("\\", "/")
+
+
+def _path_is_suffix(filepath: str, source: str) -> bool:
+    """source 是否是 filepath 的完整路径后缀（按目录边界，不是子串）。"""
+    fp = _normalized_path(filepath).rstrip("/")
+    sp = _normalized_path(source).rstrip("/")
+    if not sp or sp in (".", ".."):
+        return False
+    return fp == sp or fp.endswith("/" + sp)
+
+
+def _ambiguity_message(filepath: str, candidates: "list[str]") -> str:
+    listed = "、".join(f"「{src}」" for src in sorted(candidates))
+    return (
+        f"[ERROR] 文件「{_basename_of(filepath)}」匹配到多个知识库来源，"
+        f"无法唯一确定更新目标，未执行任何删除或写入：{listed}\n"
+        "请先用 delete_documents 清理重名来源，或把文件放到可唯一判定路径后缀的位置。"
+    )
+
+
+def _match_existing_source(all_sources: set[str], filepath: str) -> "tuple[str, str]":
+    """按完整 filepath 为更新操作确定唯一 source，返回 (source, error)。
+
+    优先级：整值精确 → 整值 normcase → 整值大小写不敏感 → basename
+    （原样/normcase/大小写不敏感，每级用路径后缀消歧）。同层出现多个候选
+    且后缀无法判定唯一时返回错误信息，调用方不得删除或写入任何行。
     """
     candidates = sorted(all_sources)
-    lower = basename.lower()
-    for src in candidates:
-        if src == basename:
-            return src
-    for src in candidates:
-        if src.lower() == lower:
-            return src
-    for src in candidates:
-        if os.path.basename(src.replace("\\", "/")) == basename:
-            return src
-    for src in candidates:
-        if os.path.basename(src.replace("\\", "/")).lower() == lower:
-            return src
-    return ""
+    if not candidates:
+        return "", ""
+
+    exact = [src for src in candidates if src == filepath]
+    if len(exact) == 1:
+        return exact[0], ""
+
+    target_norm = os.path.normcase(filepath)
+    exact_norm = [src for src in candidates if os.path.normcase(src) == target_norm]
+    if len(exact_norm) == 1:
+        return exact_norm[0], ""
+    if len(exact_norm) > 1:
+        return "", _ambiguity_message(filepath, exact_norm)
+
+    target_fold = target_norm.casefold()
+    exact_fold = [
+        src for src in candidates
+        if os.path.normcase(src).casefold() == target_fold
+    ]
+    if len(exact_fold) == 1:
+        return exact_fold[0], ""
+    if len(exact_fold) > 1:
+        return "", _ambiguity_message(filepath, exact_fold)
+
+    fname = _basename_of(filepath)
+    base_norm = os.path.normcase(fname)
+    base_fold = base_norm.casefold()
+    tiers = (
+        [src for src in candidates if _basename_of(src) == fname],
+        [src for src in candidates
+         if os.path.normcase(_basename_of(src)) == base_norm],
+        [src for src in candidates
+         if os.path.normcase(_basename_of(src)).casefold() == base_fold],
+    )
+    for group in tiers:
+        if not group:
+            continue
+        if len(group) == 1:
+            return group[0], ""
+        suffix_hits = [src for src in group if _path_is_suffix(filepath, src)]
+        if len(suffix_hits) == 1:
+            return suffix_hits[0], ""
+        return "", _ambiguity_message(filepath, group)
+
+    return "", ""
 
 
 def _match_sources_for_delete(all_sources: set[str], pattern: str) -> set[str]:
-    """删除用来源匹配：先精确相等，未命中且含通配符时走 fnmatch。
+    """删除用来源匹配：先 normcase 精确相等，未命中且含通配符时走 fnmatch。
 
     不使用子串匹配；pattern 无 * ? [ 且不精确相等时不删除任何行。
+    fnmatch 保持原有平台语义（Windows 下不区分大小写）。
     """
-    matched = {src for src in all_sources if src == pattern}
+    target = os.path.normcase(pattern)
+    matched = {src for src in all_sources if os.path.normcase(src) == target}
     if not matched and any(ch in pattern for ch in "*?["):
         matched = {src for src in all_sources if fnmatch.fnmatch(src, pattern)}
     return matched
+
+
+def _source_doc_ids(table, source: str) -> set[str]:
+    """写入前记录某 source 的旧 doc_id 集合（空 doc_id 原样保留）。"""
+    where = "source = '" + source.replace("'", "''") + "'"
+    arrow = table.to_lance().scanner(
+        columns=["doc_id"], filter=where).to_table()
+    return {
+        value if isinstance(value, str) else str(value or "")
+        for value in arrow.column("doc_id").to_pylist()
+    }
+
+
+def _delete_source_rows(table, source: str, doc_ids: "list[str]") -> int:
+    """按 source + doc_id 批量删除，返回 DeleteResult.num_deleted_rows 合计。"""
+    safe_source = source.replace("'", "''")
+    removed = 0
+    for i in range(0, len(doc_ids), _DOC_ID_DELETE_BATCH):
+        batch = doc_ids[i:i + _DOC_ID_DELETE_BATCH]
+        where = (
+            "source = '" + safe_source + "' AND doc_id IN ("
+            + ",".join("'" + d.replace("'", "''") + "'" for d in batch)
+            + ")"
+        )
+        removed += int(table.delete(where).num_deleted_rows)
+    return removed
+
+
+def _delete_stale_source_rows(table, source: str, old_doc_ids: set[str],
+                              new_doc_ids: set[str]) -> int:
+    """新行写入成功后清理旧版本：删除旧 doc_id 中不在新集合里的行。
+
+    doc_id 仍在新集合中的旧行内容未变，保留不重复写；空 doc_id 的历史行
+    无法判断内容，一并清理。
+    """
+    stale = sorted(doc_id for doc_id in old_doc_ids
+                   if doc_id and doc_id not in new_doc_ids)
+    removed = _delete_source_rows(table, source, stale) if stale else 0
+    if "" in old_doc_ids:
+        where = "source = '" + source.replace("'", "''") + "' AND doc_id = ''"
+        removed += int(table.delete(where).num_deleted_rows)
+    return removed
+
+
+def _delete_source_exact(table, source: str) -> int:
+    """按 source 精确删除并返回删除行数（单次 delete，不做 count 预扫）。"""
+    where = "source = '" + source.replace("'", "''") + "'"
+    return int(table.delete(where).num_deleted_rows)
 
 
 def scan_files(scan_dir: str) -> List[str]:
@@ -583,7 +692,11 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
 
 def add_single_document(filepath: str, scan_dir: str = "",
                         export_markdown_dir: str = "") -> str:
-    """向量化单个文档（避免大批量超时），按最终 source 幂等替换旧版本。
+    """向量化单个文档；先成功写入新行，再清理该 source 的旧行。
+
+    source 为 scan_dir 下的相对路径时按其幂等替换旧版本；未传 scan_dir
+    （或文件不在其中）时 source 退化为 basename，若库中已有同名 source
+    则拒绝覆盖，避免两个目录下的同名文件静默互相替换。
 
     export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
     """
@@ -595,15 +708,17 @@ def add_single_document(filepath: str, scan_dir: str = "",
     if os.path.getsize(filepath) > cfg.MAX_FILE_SIZE:
         return f"[ERROR] 文件过大: {os.path.getsize(filepath) / 1024 / 1024:.1f}MB"
 
-    text, is_md = extract_content(filepath, export_markdown_dir=export_markdown_dir)
-    if not text or len(text) < 20:
-        return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(filepath)}"
-
     source = os.path.basename(filepath)
+    source_is_relative = False
     if scan_dir and os.path.isdir(scan_dir):
         rel = os.path.relpath(filepath, scan_dir)
         if not rel.startswith(".." + os.sep) and rel != "..":
             source = rel
+            source_is_relative = True
+
+    text, is_md = extract_content(filepath, export_markdown_dir=export_markdown_dir)
+    if not text or len(text) < 20:
+        return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(filepath)}"
 
     chunks = chunk_text(text, source, is_md)
     if not chunks:
@@ -612,13 +727,30 @@ def add_single_document(filepath: str, scan_dir: str = "",
         ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
         ch["ingested_at"] = datetime_now_iso()
 
-    table = kb_schema.get_or_create_table()
-    replaced = _delete_source_exact(table, source)
-    added = add_chunks(table, chunks)
-    kb_schema.ensure_vector_index(table)
-    kb_schema.ensure_fts_index(table)
-    kb_schema.fold_new_rows(table)
-    kb_schema.update_db_readme()
+    with _write_lock:
+        table = kb_schema.get_or_create_table()
+        if not source_is_relative:
+            existing = kb_schema.existing_sources(table)
+            if any(os.path.normcase(src) == os.path.normcase(source) for src in existing):
+                return (
+                    f"[ERROR] 来源「{source}」已存在于知识库，未执行覆盖。"
+                    "请传入包含该文件的 scan_dir（以相对路径区分同名文件），"
+                    "或使用 update_document 更新已有文档。"
+                )
+
+        old_doc_ids = _source_doc_ids(table, source)
+        new_doc_ids = {ch["doc_id"] for ch in chunks}
+        pending = [ch for ch in chunks if ch["doc_id"] not in old_doc_ids]
+        try:
+            added = add_chunks(table, pending)
+        except Exception as e:
+            return f"[ERROR] 写入失败，旧记录未删除: {e}"
+        replaced = _delete_stale_source_rows(table, source, old_doc_ids, new_doc_ids)
+        kb_schema.ensure_vector_index(table)
+        kb_schema.ensure_fts_index(table)
+        kb_schema.fold_new_rows(table)
+        kb_schema.update_db_readme()
+
     extra = f"\nMarkdown 导出: {export_markdown_dir}" if export_markdown_dir else ""
     return (
         f"✅ 文档已入库!\n"
@@ -630,7 +762,11 @@ def add_single_document(filepath: str, scan_dir: str = "",
 
 
 def update_document(filepath: str) -> str:
-    """更新文档：按 basename 精确匹配已有 source，沿用原 source 重新入库。"""
+    """更新文档：按完整路径唯一匹配已有 source，写入新行后再清理旧行。
+
+    同名 basename 匹配到多个 source 且无法用路径后缀判定唯一时返回
+    [ERROR] 并列出候选，不执行任何删除/写入。
+    """
     if not os.path.isfile(filepath):
         return f"[ERROR] 文件不存在: {filepath}"
     ext = Path(filepath).suffix.lower()
@@ -638,31 +774,40 @@ def update_document(filepath: str) -> str:
         return f"[ERROR] 不支持的文件格式: {ext}"
 
     fname = os.path.basename(filepath)
-    table = kb_schema.get_or_create_table()
-
-    matched_source = ""
-    if kb_schema.table_exists():
-        all_sources = kb_schema.existing_sources(table)
-        matched_source = _match_existing_source(all_sources, fname)
-
     text, is_md = extract_content(filepath)
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {fname}"
 
-    source = matched_source or fname
-    chunks = chunk_text(text, source, is_md)
-    if not chunks:
-        return f"[ERROR] 分块后无有效内容: {source}"
-    for ch in chunks:
-        ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
-        ch["ingested_at"] = datetime_now_iso()
+    with _write_lock:
+        table = kb_schema.get_or_create_table()
+        matched_source, error = _match_existing_source(
+            kb_schema.existing_sources(table), filepath)
+        if error:
+            return error
 
-    deleted_rows = _delete_source_exact(table, source)
-    added = add_chunks(table, chunks)
-    kb_schema.ensure_vector_index(table)
-    kb_schema.ensure_fts_index(table)
-    kb_schema.fold_new_rows(table)
-    kb_schema.update_db_readme()
+        source = matched_source or fname
+        chunks = chunk_text(text, source, is_md)
+        if not chunks:
+            return f"[ERROR] 分块后无有效内容: {source}"
+        for ch in chunks:
+            ch["doc_id"] = kb_schema.chunk_doc_id(
+                ch["text"], ch["source"], ch["chunk_index"])
+            ch["ingested_at"] = datetime_now_iso()
+
+        old_doc_ids = _source_doc_ids(table, source)
+        new_doc_ids = {ch["doc_id"] for ch in chunks}
+        pending = [ch for ch in chunks if ch["doc_id"] not in old_doc_ids]
+        try:
+            added = add_chunks(table, pending)
+        except Exception as e:
+            return f"[ERROR] 写入失败，旧记录未删除: {e}"
+        deleted_rows = _delete_stale_source_rows(
+            table, source, old_doc_ids, new_doc_ids)
+        kb_schema.ensure_vector_index(table)
+        kb_schema.ensure_fts_index(table)
+        kb_schema.fold_new_rows(table)
+        kb_schema.update_db_readme()
+
     return (
         f"✅ 文档已更新!\n"
         f"文件名: {fname}\n"
@@ -674,50 +819,57 @@ def update_document(filepath: str) -> str:
 
 def delete_documents(source_pattern: str = "",
                      confirm_all: bool = False) -> str:
-    """按来源精确匹配删除（支持 * ? [ 通配），或 confirm_all=True 清空整个知识库。"""
-    if not kb_schema.table_exists():
-        return "知识库为空，无需删除。"
-    table = kb_schema.get_or_create_table()
-    total_before = len(table)
+    """按来源精确匹配删除（支持 * ? [ 通配），或 confirm_all=True 清空整个知识库。
 
-    def _delete_where(where: str) -> int:
-        before = len(table)
-        table.delete(where)
-        return before - len(table)
+    匹配集合若覆盖全部 distinct source，必须显式 confirm_all=True，
+    避免用 "*" 等通配绕过清空确认。
+    """
+    with _write_lock:
+        if not kb_schema.table_exists():
+            return "知识库为空，无需删除。"
+        table = kb_schema.get_or_create_table()
+        total_before = len(table)
 
-    if confirm_all:
-        db = kb_schema.get_db()
-        db.drop_table(cfg.TABLE_NAME)
-        kb_schema.update_db_readme()
-        return f"🗑️ **知识库已清空**\n{'─' * 40}\n删除记录数: {total_before}"
+        if confirm_all:
+            db = kb_schema.get_db()
+            db.drop_table(cfg.TABLE_NAME)
+            kb_schema.update_db_readme()
+            return f"🗑️ **知识库已清空**\n{'─' * 40}\n删除记录数: {total_before}"
 
-    if source_pattern:
-        all_sources = kb_schema.existing_sources(table)
-        matched = _match_sources_for_delete(all_sources, source_pattern)
-        if not matched:
-            return f"未找到匹配「{source_pattern}」的文档。知识库中共有 {total_before} 条记录。"
-        deleted = 0
-        for src in matched:
-            safe_src = src.replace("'", "''")
-            deleted += _delete_where(f"source = '{safe_src}'")
-        kb_schema.fold_new_rows(table)
-        kb_schema.update_db_readme()
-        remaining = kb_schema.row_count()
+        if source_pattern:
+            all_sources = kb_schema.existing_sources(table)
+            matched = _match_sources_for_delete(all_sources, source_pattern)
+            if not matched:
+                return f"未找到匹配「{source_pattern}」的文档。知识库中共有 {total_before} 条记录。"
+
+            if matched == all_sources:
+                return (
+                    f"[ERROR] 模式「{source_pattern}」匹配全部 {len(all_sources)} 个来源，"
+                    "已拒绝执行。\n"
+                    "如确认清空整个知识库，请设置 confirm_all=True。"
+                )
+
+            deleted = 0
+            for src in sorted(matched):
+                deleted += _delete_source_exact(table, src)
+            kb_schema.fold_new_rows(table)
+            kb_schema.update_db_readme()
+            remaining = kb_schema.row_count()
+            return (
+                f"🗑️ **文档删除完成**\n"
+                f"{'─' * 40}\n"
+                f"匹配模式: {source_pattern}\n"
+                f"匹配到的来源: {len(matched)} 个\n"
+                f"删除记录数: {deleted}\n"
+                f"剩余记录数: {remaining}\n"
+                f"匹配文件: {', '.join(sorted(matched)[:10])}"
+                + (f"\n... 等共 {len(matched)} 个" if len(matched) > 10 else "")
+            )
+
         return (
-            f"🗑️ **文档删除完成**\n"
-            f"{'─' * 40}\n"
-            f"匹配模式: {source_pattern}\n"
-            f"匹配到的来源: {len(matched)} 个\n"
-            f"删除记录数: {deleted}\n"
-            f"剩余记录数: {remaining}\n"
-            f"匹配文件: {', '.join(sorted(matched)[:10])}"
-            + (f"\n... 等共 {len(matched)} 个" if len(matched) > 10 else "")
+            f"⚠️ 请指定 source_pattern 进行选择性删除，或设置 confirm_all=True 清空。\n"
+            f"知识库共 {total_before} 条记录。"
         )
-
-    return (
-        f"⚠️ 请指定 source_pattern 进行选择性删除，或设置 confirm_all=True 清空。\n"
-        f"知识库共 {total_before} 条记录。"
-    )
 
 
 def list_documents(category_filter: str = "", limit: int = 50) -> str:

@@ -203,7 +203,9 @@ def add_documents(
     name="add_single_document",
     description="向量化单个文档到知识库（一次只处理一个文件，避免大批量超时）。"
                 "支持 .md/.pdf/.docx/.txt 等格式；PDF 自动走本地 MinerU 转 Markdown"
-                "（公式 → LaTeX），可用 export_markdown_dir 导出留档。",
+                "（公式 → LaTeX），可用 export_markdown_dir 导出留档。"
+                "不传 scan_dir 时 source 为文件名；若库中已有同名 source 会报错而不会覆盖，"
+                "请传 scan_dir（按相对路径入库）或改用 update_document。",
 )
 def add_single_document(
     filepath: Annotated[str, "文件路径"],
@@ -217,9 +219,9 @@ def add_single_document(
 
 @mcp.tool(
     name="update_document",
-    description="更新知识库中的文档（删除旧版本后重新索引）。按文件名（basename，"
-                "大小写不敏感）精确匹配库中已有 source；匹配到则沿用其原始 source 值"
-                "重新入库，未匹配到才以 basename 作为新 source。仅删除精确匹配的旧行。",
+    description="更新知识库中的文档：按完整文件路径确定唯一已有 source，先成功写入新行"
+                "再清理旧行（写入失败不会删除旧数据）。同名文件匹配到多个 source 且路径"
+                "后缀无法唯一判定时返回错误并列出候选，不执行任何写入或删除。",
 )
 def update_document(
     filepath: Annotated[str, "文件路径"],
@@ -229,9 +231,10 @@ def update_document(
 
 @mcp.tool(
     name="delete_documents",
-    description="删除知识库中的文档。source_pattern 先按完整 source 精确匹配；"
-                "未命中且含 * ? [ 通配符时按 fnmatch 通配匹配（如 '*.pdf'、"
-                "'docs/*'）。不再使用子串匹配；留空需 confirm_all。",
+    description="删除知识库中的文档。source_pattern 先按完整 source 精确匹配"
+                "（normcase，Windows 下不区分大小写）；未命中且含 * ? [ 通配符时按 "
+                "fnmatch 通配匹配（如 '*.pdf'、'docs/*'）。不再使用子串匹配；"
+                "匹配集合覆盖全部来源时会被拒绝并需 confirm_all=True；留空也需 confirm_all。",
 )
 def delete_documents(
     source_pattern: Annotated[str, "来源（精确值或含 * ? [ 的通配模式，如 'paper.pdf'、'docs/*'、'*.pdf'），留空则需 confirm_all"] = "",
