@@ -12,8 +12,8 @@
   `(cid:2)`、字母打散、上下标丢失的坏结果（见「PDF 解析」一节）；
 - **混合检索 + 精排**：向量 + BM25 融合，CrossEncoder 精排；`ask_knowledge` 检索并打包
   编号证据块，作答由调用方模型完成；
-- **15 个 MCP 工具**：检索 / 证据打包 / 增删改查 / 网页抓取入库 / 目录监听自动重索引 /
-  图像检索；
+- **15 个 MCP 工具（启用 Wiki 层后 29 个）**：检索 / 证据打包 / 增删改查 / 网页抓取入库 /
+  目录监听自动重索引 / 图像检索；Wiki 层另提供 14 个页面、证据与提案工具；
 - **零插件检索面板**：可选的本地面板（`ui_server.py`，127.0.0.1:8002），供人直接查询。
 
 ## 主要能力
@@ -86,7 +86,10 @@ mineru-models-download -s modelscope -m pipeline      # 首次下载模型（约
 | `TESSERACT_CMD` / `LANCEDB_OCR_LANG` | 见 `kb/config.py` | Tesseract 路径与语言包 |
 | `MINERU_API_KEY` | 空 | 云 MinerU API（可选，仅扫描件回退链用） |
 
-## MCP 工具（15 个）
+## MCP 工具（15 个；启用 Wiki 后 29 个）
+
+`WIKI_ENABLED=1` 时额外注册 14 个 Wiki 工具（见「Wiki 知识层」）；默认关闭，原 15 个
+工具与启动方式不变。
 
 | 类别 | 工具 |
 |---|---|
@@ -153,6 +156,100 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
   历史遗留的重复行可通过 `ingest_images(rebuild=True)` 清空重建，或再次入库收敛。
 - 检索：`search_images(query, limit, source_filter)`，cosine 距离转相似度输出。
 
+## Wiki 知识层（默认关闭）
+
+在原始切片检索之上增加一层可审阅的 Wiki：SQLite 保存文档/修订/切片引用/断言与证据/
+实体/关系/提案/写入日志，页面正文写在 Obsidian vault 的 Markdown 文件，Git 作为版本库。
+服务端不内置 LLM、不调用外部 API；抽取与写作由宿主 Agent 完成后提交。
+
+### 启用与配置
+
+设置 `WIKI_ENABLED=1` 并重启服务后追加 14 个 MCP 工具；默认 `0` 时原 15 个工具与启动
+方式完全不变。环境变量不会热加载。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `WIKI_ENABLED` | `0` | Wiki 总开关（`1/true/yes/on` 启用） |
+| `WIKI_VAULT_PATH` | `D:\cherry-workplace\knowledge-hub\vault` | Obsidian vault 绝对路径 |
+| `WIKI_DB_PATH` | `<vault>/.wiki/wiki.sqlite3` | Wiki SQLite 路径 |
+| `WIKI_PAGE_ROOT` | `wiki-维基` | 页面根目录（相对 vault） |
+| `WIKI_PAGE_INDEX_TABLE` | `wiki_pages` | 页面向量索引表名 |
+| `WIKI_AUTO_PUBLISH` | `0` | 是否自动发布页面 |
+| `WIKI_REQUIRE_EVIDENCE` | `1` | fact claim 缺证据是否按 error 处理 |
+| `WIKI_MIN_ENTITY_CONFIDENCE` | `0.90` | 实体置信度阈值 |
+| `WIKI_MIN_RELATION_CONFIDENCE` | `0.90` | 关系置信度阈值 |
+| `WIKI_DB_BUSY_TIMEOUT_MS` | `5000` | SQLite busy timeout |
+| `WIKI_GIT_COMMIT` | `1` | 页面写入后是否在 vault 中 git commit |
+
+完整配置与运维流程见 `docs/wiki-v1/operations.md`。
+
+### MCP 工具（14 个）
+
+| 工具 | 类型 | 说明 |
+|---|---|---|
+| `wiki_status` | 只读 | 配置（脱敏）、DB 版本、表计数、页面/提案/任务统计、索引状态与未收敛 journal |
+| `wiki_search` | 只读 | 统一检索：page / evidence / hybrid / related |
+| `wiki_get_page` | 只读 | 页面全文、当前修订、出链/反链与证据摘要 |
+| `wiki_list_pages` | 只读 | 分页列出页面（默认 `published`） |
+| `wiki_get_related` | 只读 | 页面或实体的 1-2 跳链接与关系邻域 |
+| `wiki_get_evidence` | 只读 | 按 claim_id 查看证据链，或按 chunk_id 查看证据包 |
+| `wiki_search_evidence` | 只读 | 直接检索原始切片证据（`score_source=rag`） |
+| `wiki_create_page` | 写入 | 创建 `draft` 页面，不发布 |
+| `wiki_propose_update` | 写入 | 为已有页面创建 `update_page` 提案（写 draft/diff） |
+| `wiki_submit_extraction` | 写入 | 提交 Agent 抽取的实体/断言/关系/页面建议，校验后落库 |
+| `wiki_get_proposal` | 只读 | 提案全文、diff、payload 与目标页当前修订 |
+| `wiki_review_queue` | 只读 | 按状态列出提案审核队列（默认 `pending`） |
+| `wiki_apply_proposal` | 写入 | `approve` 写入页面并刷新导航/索引；`reject` 不改页面 |
+| `wiki_validate` | 只读 | 一致性校验（pages/links/claims/documents/entities/relations/journal） |
+
+页面写入默认只产生 Draft 或 Proposal；`wiki_submit_extraction` 只落库实体/断言/关系，
+不直接发布页面；只有 `wiki_apply_proposal(decision="approve")` 才会发布或更新页面。
+
+### 页面布局与 frontmatter
+
+```
+<vault>/wiki-维基/
+├── index.md / log.md / purpose.md / overview.md
+├── concepts-概念/
+├── entities-实体/
+└── topics-主题/
+```
+
+- `index.md`、`overview.md` 是生成物，重建时覆盖；`purpose.md` 只在不存在时生成模板，
+  之后由人维护；`log.md` 只追加。
+- 页面 frontmatter = vault 五字段 `title/tags/created/type/summary` +
+  `page_id/slug/page_type/status/aliases/revision_id/updated`，可选 `sources`；
+  `type` 固定 `permanent`，`page_type` 为 `concept/entity/topic`，
+  `status` 为 `draft/review/published/archived`。
+
+### 证据链
+
+`claim → claim_evidence → chunk_refs → document_revisions → documents`。引文写入前先做
+空白归一化，必须能在切片原文中定位（`evidence.verify_quote()`）；切片正文不存 SQLite，
+默认按 `chunk_refs` 的 `source_value/chunk_index/legacy_doc_id` 回查 LanceDB。
+
+### 工具链
+
+| 脚本 | 说明 |
+|---|---|
+| `scripts/migrate_wiki_v1.py` | 把 `my_docs` 既有切片登记进 Wiki SQLite（`--apply` 写入，`--limit` 限量） |
+| `scripts/audit_wiki_environment.py` | 只读审计运行环境、LanceDB 表与 source 形态 |
+| `scripts/validate_wiki.py` | 一致性校验 CLI（`--strict` / `--json`，只读） |
+| `scripts/backup_wiki.py` | SQLite + proposals 备份，生成 manifest |
+| `scripts/wiki_quality_report.py` | 质量报告：证据覆盖、断链、孤儿页、重复候选等 |
+| `scripts/rebuild_wiki_metadata.py` | 从 vault frontmatter 补齐 `pages/page_revisions` |
+| `scripts/rebuild_wiki_page_index.py` | 重建/增量更新 `wiki_pages` 页面索引 |
+
+迁移状态：脚本已提供，默认 dry-run，尚未对真实库执行；`--apply` 才写 SQLite，重复执行
+幂等。
+
+### 许可边界
+
+本仓库代码 MIT。Wiki 设计参考 Andrej Karpathy 的 LLM Wiki 方法论与
+[nashsu/llm_wiki](https://github.com/nashsu/llm_wiki)（GPL-3.0），仅借鉴公开设计，
+未复制或改写其代码；模型权重遵循各自许可。设计记录见
+`docs/wiki-v1/llm-wiki-inspired-design.md`。
+
 ## 自建模块清单（待后期单独优化）
 
 以下模块为自建实现，文件头部有 `[自建模块 · 待后期单独优化]` 标记：
@@ -166,7 +263,7 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 ## 架构
 
 ```
-server.py                MCP 薄入口（15 工具）
+server.py                MCP 薄入口（15 工具；启用 Wiki 后 29 个）
 kb/                      知识库核心包
   config.py              环境变量 + 单库路径解析（无分区）
   embeddings.py          本地 embedding（bge-m3，官方注册表 + LRU 缓存）
@@ -178,11 +275,13 @@ kb/                      知识库核心包
   search.py              官方 hybrid + 本地 CrossEncoder 精排（失败回退 RRF）
   ask.py                 检索证据打包（[n] 编号证据块，不调用生成模型）
   web.py / watcher.py    [自建模块] 网页入库 / 目录监听（watchdog 6.0）
-  wiki/                  Wiki V1 元数据底座（Phase 1：配置、SQLite 迁移、稳定 ID、
-                         frontmatter；repositories 为 Phase 2 规划中）
+  wiki/                  Wiki V1 知识层：SQLite 元数据/证据/提案 + vault 页面 + Git
+                         （config/db/ids/markdown/models 基础设施；document_registry/
+                         evidence/entity_resolver/page_store/link_index/proposals/
+                         navigation/page_index/search/service/validator）
 scripts/                 rebuild_from_sources.py（批量重建）+ mineru_to_markdown.py（批量 PDF→md）
                          + pdf_to_markdown.py（docling 备选）+ 冒烟脚本 + mineru_pdf_splitter.py
-                         + audit_wiki_environment.py（只读环境/库表审计）
+                         + Wiki 工具链（migrate/audit/validate/backup/quality/rebuild）
 ui_server.py / ui/       检索面板（零插件版，HTTP 8002，复用 kb.search）+ run_ui.cmd 启动器
 ```
 
@@ -226,7 +325,8 @@ OCR 链（云 MinerU → Tesseract）。转换产物按 `路径+大小+mtime` �
 
 `ui_server.py` + `ui/index.html`：只绑 `127.0.0.1:8002` 的本地检索面板，检索内核复用
 `kb.search.search_structured`（混合检索 + 本地精排），供 Obsidian（核心 Web Viewer）或
-任意浏览器内嵌使用，不依赖 MCP 与任何 Obsidian 插件。
+任意浏览器内嵌使用，不依赖 MCP 与任何 Obsidian 插件。Wiki 页面浏览与提案审核标签
+随 Wiki 层提供；当前面板尚未合并这些标签，仍只做原始切片检索。
 
 ```powershell
 run_ui.cmd                     # 启动器（内部设好 HF/env 后拉起 ui_server.py）
@@ -244,13 +344,18 @@ run_ui.cmd                     # 启动器（内部设好 HF/env 后拉起 ui_se
 python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-离线测试（假 embedding、mock HTTP），覆盖配置、分块、schema/检索端到端、reranker 回退、
-证据打包、网页 canonical/幂等、目录监听（防抖/删除/多目录）、图像入库计划与替换、
-Wiki 元数据（配置/ID/frontmatter/SQLite 迁移）。
+当前全量基线 485 项（2026-11-15 实测 `unittest discover`）。离线测试（假 embedding、
+mock HTTP）覆盖配置、分块、schema/检索端到端、reranker 回退、证据打包、网页
+canonical/幂等、目录监听（防抖/删除/多目录）、图像入库计划与替换，以及 Wiki 层
+（配置/ID/frontmatter/迁移、文档登记、证据链、实体关系、页面存储、双链、提案、
+检索、服务门面、MCP 注册、页面索引、恢复与运维脚本）。
 
 ## License
 
 代码 [MIT](LICENSE) © 2026 sanqiuyef。
+
+Wiki 层的设计参考 Andrej Karpathy 的 LLM Wiki 方法论与 `nashsu/llm_wiki`（GPL-3.0），
+仅借鉴设计，未复制其代码（见 `docs/wiki-v1/llm-wiki-inspired-design.md`）。
 
 模型权重遵循各自许可，与代码许可相互独立：
 
