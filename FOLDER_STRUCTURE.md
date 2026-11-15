@@ -60,6 +60,7 @@ lancedb-search/
 │   ├── pdf_to_markdown.py          PDF→Markdown 备选转换器（docling 公式增强 + CUDA）
 │   ├── audit_wiki_environment.py   Wiki 只读审计：运行环境、LanceDB 表与 source 形态
 │   ├── migrate_wiki_v1.py          Wiki V1 迁移入口（默认 dry-run，--apply 写 SQLite）
+│   ├── migrate_sources_to_relative.py  my_docs 的 basename source → vault 相对路径（不重算向量）
 │   ├── validate_wiki.py            Wiki 一致性校验 CLI（--strict/--json，只读）
 │   ├── backup_wiki.py              Wiki SQLite + proposals 备份与 manifest
 │   ├── wiki_quality_report.py      Wiki 质量报告（证据覆盖/断链/孤儿页/重复候选等）
@@ -127,12 +128,12 @@ LanceDB 库、Obsidian vault 与 Wiki SQLite 都在仓库外，仓库只保留�
   - `web_figure_chunks`：95 行，2026-10-29 遗留实验表；当前代码不引用，
     **勿删勿迁移**，后续单独评估
 - `D:\cherry-workplace\knowledge-hub\vault` — Obsidian vault（**不在仓库内**）：
-  - `wiki-维基/`：Wiki 页面正文与 `index.md`、`log.md`、`purpose.md`、`overview.md`
+  - `wiki-维基/`：Wiki 页面正文与 `ai-index.md`、`ai-log.md`、`ai-purpose.md`、`ai-overview.md`
   - `.wiki/wiki.sqlite3`：Wiki 元数据（默认 `WIKI_DB_PATH`），同级有 `proposals/`、`backups/`
 - `D:\huggingface\hub` — bge-m3 / bge-reranker-v2-m3 / jina 模型缓存（HF_HOME）
 - `D:\huggingface\local-models\` — jina-clip-v2 与 jina-embeddings-v3 **自包含目录**
   （权重+内联实现代码+auto_map 本地化，transformers v5 离线兼容，重建步骤见 README 图像检索节）
-- `D:\lance\language_models\jieba` — jieba 分词词典（LANCE_LANGUAGE_MODEL_HOME）
+- `D:\lance\language_models\jieba` — jieba 分词词典（仅在 `FTS_BASE_TOKENIZER=jieba/default` 时需要；默认使用 ngram）
 
 ## 已删除的历史功能（2026-10 整改期间）
 

@@ -5,10 +5,10 @@
 | 项目 | 结果 |
 |---|---|
 | 基线（Phase 0 之前） | 40 项 |
-| 当前全量 discover | **550 项，全部通过** |
+| 当前全量 discover | **552 项，全部通过** |
 | 失败/错误/跳过 | 0 / 0 / 0 |
 | 运行环境 | Windows 10.0.19045，Python 3.13.9（`D:\anaconda3\python.exe`） |
-| 全量耗时 | 约 47 秒 |
+| 全量耗时 | 约 49 秒 |
 
 ## 测试演进
 
@@ -25,6 +25,7 @@
 | Phase 6 | 494 | Wiki 阅读与提案审核 UI |
 | 发布修复 | 495 | 正文型提案审核通过后自动发布并入索引 |
 | 终审修复 | 550 | UI Host/Origin/CSRF、发布原子化、提案 CAS、链接重建、frontmatter 保留、legacy 源保护 |
+| 收尾 | 552 | source 相对路径改写、FTS ngram 回归、导航文件 `ai-*` 与防覆盖标记 |
 
 新增测试全部使用 `tempfile.TemporaryDirectory()`，不访问真实 vault、真实 Wiki SQLite 或 LanceDB。
 
@@ -41,6 +42,18 @@
 | 导航 | index/log/purpose/overview 均生成，Git 提交 `wiki: refresh navigation` |
 | 页面索引 | 真实 bge-m3 索引成功，`index_error=""` |
 | 检索 | `wiki_search(mode=page)` 命中 1 条 |
+| 校验 | 0 error / 0 warning |
+
+真实库收尾（同日）：
+
+| 项目 | 结果 |
+|---|---|
+| source 改写 | 216/218 改为 vault 相对路径，2 个无文件保持 basename；26,583 行不变 |
+| FTS | 默认 ngram 2–3，索引重建；「不确定性 / 洪涝 / CNN-LSTM / flood」正常 |
+| Wiki DB | 218 documents / 218 revisions / 26,583 chunk_refs |
+| 种子页 | 3 个 published（证据 1/2/3 条），6 claims / 6 evidence / 3 entities |
+| 页面索引 | `wiki_pages` 3 行，missing 0 |
+| 质量指标 | Evidence Coverage 100%、Quote Validity 100%（结构校验）、断链 0 |
 | 校验 | 0 error / 0 warning |
 
 ## 运行命令

@@ -2,7 +2,7 @@
 
 面向 AI 工作流的**本地优先**文档知识库检索服务（MCP Server）。内核基于
 [lancedb](https://github.com/lancedb/lancedb) 官方 SDK：LanceModel schema、官方 embedding
-注册表、原生 BM25 全文检索（jieba 中文分词）、官方 hybrid 混合检索与 Reranker 接口。
+注册表、原生 BM25 全文检索（默认 ngram 中文分词，可切 jieba）、官方 hybrid 混合检索与 Reranker 接口。
 
 - **嵌入/精排全本地**：嵌入（bge-m3）与精排（bge-reranker-v2-m3）都在本机 GPU 跑，用时挂载、
   闲置自动卸载显存，不调用云端推理 API；仅扫描件 OCR 可选启用云 MinerU 回退
@@ -24,7 +24,7 @@
 - **全本地模型**：BAAI/bge-m3 嵌入 + bge-reranker-v2-m3 精排，模型缓存目录由 `HF_HOME`
   指定；**用时挂载、闲置自动卸载显存**（`LOCAL_MODEL_IDLE_UNLOAD`，默认 300s，0=常驻，
   对齐 Ollama keep-alive）；
-- **原生 FTS**：Lance 原生 BM25 倒排索引，jieba 分词（词典在 `LANCE_LANGUAGE_MODEL_HOME`）；
+- **原生 FTS**：Lance 原生 BM25 倒排索引，默认 ngram 2–3 分词（避免 lancedb 0.39 的 jieba 中文查询 panic）；
 - **证据打包（非生成式问答）**：`ask_knowledge` 检索并打包 `[n]` 编号证据块（来源 + 全文
   chunk），不调用任何生成模型；作答与引用标注由 MCP 宿主模型基于证据完成；
 - **PDF → Markdown（含 LaTeX 公式）**：本地 MinerU pipeline 优先，失败回退
@@ -79,7 +79,9 @@ mineru-models-download -s modelscope -m pipeline      # 首次下载模型（约
 | `LOCAL_MODEL_DEVICE` | `auto` | `cuda` / `cpu` / `auto` |
 | `LOCAL_MODEL_IDLE_UNLOAD` | `300` | 闲置卸载显存秒数，0=常驻 |
 | `HF_HOME` / `HF_HUB_CACHE` | 系统默认 | 模型缓存目录 |
-| `LANCE_LANGUAGE_MODEL_HOME` | `D:\lance\language_models` | jieba 分词词典目录（FTS 用） |
+| `LANCE_LANGUAGE_MODEL_HOME` | `D:\lance\language_models` | 仅 `FTS_BASE_TOKENIZER=jieba/default` 时需要 |
+| `FTS_BASE_TOKENIZER` | `ngram` | 全文分词器；可显式设为 `jieba/default` |
+| `FTS_NGRAM_MIN` / `FTS_NGRAM_MAX` | `2` / `3` | ngram 分词长度范围 |
 | `LANCEDB_MINERU` | `1` | 是否启用本地 MinerU 转换（0 关闭） |
 | `LANCEDB_MINERU_BIN` / `_CACHE` / `_STAGING` / `_TIMEOUT` | 见 `kb/config.py` | MinerU 可执行文件 / 缓存目录 / 短路径暂存 / 超时 |
 | `LANCEDB_OCR` | `0` | 是否启用扫描件 OCR 回退链 |
@@ -209,14 +211,14 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 
 ```
 <vault>/wiki-维基/
-├── index.md / log.md / purpose.md / overview.md
+├── ai-index.md / ai-log.md / ai-purpose.md / ai-overview.md
 ├── concepts-概念/
 ├── entities-实体/
 └── topics-主题/
 ```
 
-- `index.md`、`overview.md` 是生成物，重建时覆盖；`purpose.md` 只在不存在时生成模板，
-  之后由人维护；`log.md` 只追加。
+- `ai-index.md`、`ai-overview.md` 是生成物，重建时覆盖；`ai-purpose.md` 只在不存在时生成模板，
+  之后由人维护；`ai-log.md` 只追加。`ai-` 前缀用于避开用户自己的 `INDEX.md` / `log.md`。
 - 页面 frontmatter = vault 五字段 `title/tags/created/type/summary` +
   `page_id/slug/page_type/status/aliases/revision_id/updated`，可选 `sources`；
   `type` 固定 `permanent`，`page_type` 为 `concept/entity/topic`，
@@ -240,8 +242,7 @@ PDF 转换出的 Markdown + 图片导出到指定目录留档（标准布局 `<�
 | `scripts/rebuild_wiki_metadata.py` | 从 vault frontmatter 补齐 `pages/page_revisions` |
 | `scripts/rebuild_wiki_page_index.py` | 重建/增量更新 `wiki_pages` 页面索引 |
 
-迁移状态：脚本已提供，默认 dry-run，尚未对真实库执行；`--apply` 才写 SQLite，重复执行
-幂等。
+迁移状态：2026-11-15 已对真实库执行（218 documents / 218 revisions / 26,583 chunk_refs）；`--apply` 才写 SQLite，重复执行幂等。迁移报告见 `docs/wiki-v1/migration-report.md`。
 
 ### 许可边界
 

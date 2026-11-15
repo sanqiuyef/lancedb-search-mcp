@@ -200,17 +200,19 @@ D:/anaconda3/python.exe -X utf8 scripts/validate_wiki.py \
 ```bash
 # stdout（Markdown）
 D:/anaconda3/python.exe -X utf8 scripts/wiki_quality_report.py \
-  --db "<db>" --vault "<vault>"
+  --db "<db>" --vault "<vault>" --lance-db "<lancedb>"
 
 # 写入文件
 D:/anaconda3/python.exe -X utf8 scripts/wiki_quality_report.py \
-  --db "<db>" --vault "<vault>" \
+  --db "<db>" --vault "<vault>" --lance-db "<lancedb>" \
   --out docs/wiki-v1/quality-report.md
 
 # JSON
 D:/anaconda3/python.exe -X utf8 scripts/wiki_quality_report.py \
-  --db "<db>" --vault "<vault>" --json
+  --db "<db>" --vault "<vault>" --lance-db "<lancedb>" --json
 ```
+
+`--lance-db` 提供时按真实 `wiki_pages` 表核对索引缺失；不提供则退回旧的 SQLite 检查逻辑（仅兼容测试）。
 
 指标口径：
 

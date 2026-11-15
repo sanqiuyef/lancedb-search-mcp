@@ -11,11 +11,11 @@
 
 | llm_wiki 中的做法 | 我们的落地 | 说明 |
 |---|---|---|
-| 三层结构：原始资料 / Wiki / Schema | `my_docs`（原始切片，只读）；vault `wiki-维基/`（页面）；vault `AGENTS.md` + `SCHEMA.md` + `wiki-维基/purpose.md`（规则与意图） | 原始资料不因 Wiki 改写 |
-| `index.md` 作为导航入口 | `wiki-维基/index.md`，发布页面后重建，按页面类型列出链接 | 纯生成物，可重建 |
-| `log.md` 作为时序操作日志 | `wiki-维基/log.md`，每次创建/提案/发布/拒绝追加一行 | 追加写，不回溯修改 |
-| `purpose.md` 定义知识库目标与范围 | `wiki-维基/purpose.md`，首次生成模板，之后由人编辑 | AI 不覆盖人的修改 |
-| `overview.md` 全局概要 | `wiki-维基/overview.md`，发布后按页面/证据统计重建 | 只放统计与入口，不替代页面 |
+| 三层结构：原始资料 / Wiki / Schema | `my_docs`（原始切片，只读）；vault `wiki-维基/`（页面）；vault `AGENTS.md` + `SCHEMA.md` + `wiki-维基/ai-purpose.md`（规则与意图） | 原始资料不因 Wiki 改写 |
+| `index.md` 作为导航入口 | `wiki-维基/ai-index.md`，发布页面后重建，按页面类型列出链接 | 纯生成物，可重建；`ai-` 前缀避免覆盖用户的 `INDEX.md` |
+| `log.md` 作为时序操作日志 | `wiki-维基/ai-log.md`，每次创建/提案/发布/拒绝追加一行 | 追加写，不回溯修改 |
+| `purpose.md` 定义知识库目标与范围 | `wiki-维基/ai-purpose.md`，首次生成模板，之后由人编辑 | AI 不覆盖人的修改 |
+| `overview.md` 全局概要 | `wiki-维基/ai-overview.md`，发布后按页面/证据统计重建 | 只放统计与入口，不替代页面 |
 | `[[wikilink]]` + YAML frontmatter | 已有 `page_links` 与 vault frontmatter；页面级新增 `sources: []` | 页面级来源与引文级证据并存 |
 | 两步摄入：先分析、再生成 | Agent 侧契约：`wiki_submit_extraction` 接收 analysis 与候选对象，再另行生成页面 | 服务端不内置 LLM，不产生 API 费用 |
 | SHA256 增量缓存 | `document_revisions.processing_fingerprint` + `chunk_refs` | 同一指纹重复登记幂等 |
@@ -34,7 +34,7 @@
 ## 我们的差异点
 
 1. **引文级证据**：`claims → claim_evidence → chunk_refs → document_revisions → documents`，可定位到具体切片与原文摘句；llm_wiki 是页面级 `sources: []`。
-2. **本地检索栈**：bge-m3 + jieba BM25 + MinerU + 图像检索，离线运行、零 token 成本。
+2. **本地检索栈**：bge-m3 + BM25（默认 ngram 2–3，可切 jieba）+ MinerU + 图像检索，离线运行、零 token 成本。
 3. **Obsidian 作为正文权威**：页面在 vault 内，Git 即版本库；SQLite 只存身份、关系、证据与提案。
 4. **可关闭**：`WIKI_ENABLED=0` 时原 15 个 MCP 工具与启动路径完全不变。
 

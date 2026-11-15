@@ -65,12 +65,51 @@ WIKI_DB_PATH="D:\cherry-workplace\knowledge-hub\wiki\wiki.sqlite3" \
 - 未对 LanceDB 执行 add/delete/update/create_index/optimize/drop。
 - 重复执行 idempotent：dry-run 的 `documents_existing` / `revisions_existing` 会随已登记数量增加，不会重复插入。
 
+## 后续修正（2026-11-15 当天）
+
+### source 改为相对路径
+
+- 用 `scripts/migrate_sources_to_relative.py` 原地更新 `source` 列，不重算向量。
+- 216/218 个 source 在 vault 中唯一匹配并改写为相对路径；2 个无文件保持 basename：
+  - `Sharifian 等 - 2023 - LISFLOOD-FP 8.1 ... .pdf`
+  - `SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty.md`
+- `my_docs` 行数 26,583 不变；`text_idx` / `vector_idx` 重建后仍覆盖 26,583 行。
+- 备份：`D:\cherry-workplace\knowledge-hub\backups\my_docs.lance-20261115-src-rewrite`。
+
+### FTS 分词器改为 ngram
+
+- lancedb 0.39 + jieba 对查询「不确定性」会触发 Rust `memory allocation ... failed` 并退出进程；临时 2 行表可复现。
+- 默认改为 `FTS_BASE_TOKENIZER=ngram`（2–3 gram），真实 `text_idx` 已重建；「不确定性 / 洪涝 / CNN-LSTM / flood」均可正常检索。
+- 如需恢复 jieba：`FTS_BASE_TOKENIZER=jieba/default`，但该查询风险仍在。
+
+### Wiki DB 重建与种子页
+
+Wiki SQLite 已按新的路径级 source 重建：
+
+| 表 | 行数 |
+|---|---:|
+| `documents` / `document_revisions` | 218 / 218 |
+| `chunk_refs` | 26,583 |
+| `pages` | 3（published） |
+| `claims` / `claim_evidence` | 6 / 6 |
+| `entities` / `page_entities` | 3 / 3 |
+| `page_links` | 6 |
+| `proposals` | 3（全部 applied） |
+
+3 个证据种子页（真实切片逐条摘录，未做推断）：
+
+- `urban-flood-evidence` — 城市洪涝（1 条证据）
+- `cnn-lstm-evidence` — CNN-LSTM（2 条证据）
+- `flood-uncertainty-evidence` — 洪水建模不确定性（3 条证据）
+
+质量报告：Evidence Coverage 100%（6/6）、Quote Validity 100%（6/6 结构校验）、断链 0、未索引 published 页面 0、校验 0 error / 0 warning。
+
 ## 已知限制
 
-- 218 个 source 都是 basename，历史文件在不同目录下同名时无法区分；统一登记为 `legacy_unverified`，不伪造原始路径、raw hash 或解析器版本。
+- 2 个未匹配 source 仍是 basename，watcher 会跳过其自动更新/删除，需人工确认。
 - 3,654 组重复位置的行全部保留为不同文本切片的证据；`chunk_refs` 的唯一键是 `(document_revision_id, chunk_index, text_sha256)`，不使用 `(revision, index)`。
-- 迁移没有重建页面、没有生成 Claim/Entity/Relation；这些由 Agent 侧抽取后通过 `wiki_submit_extraction` 写入。
-- 真实 vault 的 `wiki-维基/` 目前没有页面；`index.md` / `log.md` / `purpose.md` / `overview.md` 会在第一次发布后生成。
+- 种子页只做证据摘录，不是完整综述；Claim/Entity/Relation 的进一步抽取由 Agent 侧按 `wiki_submit_extraction` 契约写入。
+- vault 导航文件使用 `ai-` 前缀；用户自己的 `INDEX.md` 已从 git 历史恢复，后续生成不会覆盖无生成标记的同名文件。
 
 ## 回滚
 

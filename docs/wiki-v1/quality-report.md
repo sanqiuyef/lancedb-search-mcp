@@ -1,6 +1,6 @@
 # Wiki 质量报告
 
-- 生成时间: 2026-11-15T11:13:19.044Z
+- 生成时间: 2026-11-15T12:45:56.589Z
 - 数据库: `D:\cherry-workplace\knowledge-hub\wiki\wiki.sqlite3`
 - vault: `D:\cherry-workplace\knowledge-hub\vault`
 - 页面索引表: `wiki_pages`
@@ -9,12 +9,12 @@
 
 | 指标 | 数值 | 口径/说明 |
 |---|---|---|
-| Evidence Coverage | N/A (0/0) | factual/definition/result 类 claim 中有 supporting evidence 的比例 |
-| Quote Validity | N/A (0/0) | 结构校验（quote_sha256 与位置字段），非内容级复核 |
-| Broken Link Rate | N/A (0/0) | target_page_id 为空的链接 / 总链接 |
-| Orphan Pages | 0/0 | published 页面中无入链且无出链 |
+| Evidence Coverage | 100.0% (6/6) | factual/definition/result 类 claim 中有 supporting evidence 的比例 |
+| Quote Validity | 100.0% (6/6) | 结构校验（quote_sha256 与位置字段），非内容级复核 |
+| Broken Link Rate | 0.0% (0/6) | target_page_id 为空的链接 / 总链接 |
+| Orphan Pages | 0/3 | published 页面中无入链且无出链 |
 | Duplicate Page Candidates | 0 组 / 0 对 | 标题别名重复 + 摘要高相似 |
-| Unindexed Published Pages | 索引未建立 | published 页面在页面索引中的缺失数 |
+| Unindexed Published Pages | 0 | published 页面在页面索引中的缺失数 |
 | Unsourced Relations | 0 | 无 evidence 且无 source_page_id 的 proposed/verified 关系 |
 | Unresolved Aliases | 0 | redirect 目标缺失 / inactive 实体别名 / active 实体别名冲突 |
 
@@ -22,25 +22,25 @@
 
 ### Evidence Coverage
 
-- 适用 claim（claim_type ∈ fact, factual, definition, result，状态属于 proposed, accepted, disputed）: 0
-- 已有证据: 0
-- 覆盖率: N/A
+- 适用 claim（claim_type ∈ fact, factual, definition, result，状态属于 proposed, accepted, disputed）: 6
+- 已有证据: 6
+- 覆盖率: 100.0%
 
 ### Quote Validity
 
-- 证据总数: 0
-- 结构校验通过: 0
-- 通过率: N/A
+- 证据总数: 6
+- 结构校验通过: 6
+- 通过率: 100.0%
 - 校验方法: `structural_fingerprint`（claim_evidence 无 verification 列，切片原文不在 SQLite；内容级校验需回查 LanceDB）
 
 ### Broken Link Rate
 
-- 断链: 0 / 总链接 0
-- 断链率: N/A
+- 断链: 0 / 总链接 6
+- 断链率: 0.0%
 
 ### Orphan Pages
 
-- published 页面: 0
+- published 页面: 3
 - 孤儿页面: 0
 
 ### Duplicate Page Candidates
@@ -51,8 +51,8 @@
 
 ### Unindexed Published Pages
 
-- 状态: `index_not_built`
-- 说明: 索引未建立（wiki_pages 表缺失）
+- 状态: `ok`
+- 缺失页面: 0
 
 ### Unsourced Relations
 
