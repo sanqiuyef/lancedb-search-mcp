@@ -48,7 +48,6 @@ TABLE_NAME = "my_docs"
 # LANCEDB_VAULT_ROOT > WIKI_VAULT_PATH > DEFAULT_VAULT_ROOT。
 DEFAULT_VAULT_ROOT = r"D:\cherry-workplace\knowledge-hub\vault"
 VAULT_CONVERT_DIR = "raw-素材/converted-转换"
-VAULT_SOURCE_ENFORCE = os.environ.get("VAULT_SOURCE_ENFORCE", "1") == "1"
 
 
 def resolve_vault_root() -> str:

@@ -4,8 +4,10 @@
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -44,9 +46,30 @@ def fake_convert_pdf(pdf_path, use_cache=True, export_dir=None):
     }
 
 
+def fake_convert_pdf_with_markdown(markdown: str):
+    """模拟 MinerU：转换产物正文固定为指定 Markdown。"""
+    def convert(pdf_path, use_cache=True, export_dir=None):
+        pdf = Path(pdf_path)
+        out_dir = Path(export_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        md_path = out_dir / f"{pdf.stem}.md"
+        md_path.write_text(markdown, encoding="utf-8")
+        return {
+            "md_path": str(md_path),
+            "exported_md": str(md_path),
+            "chars": len(markdown),
+            "images": 0,
+            "formulas": 0,
+            "cached": False,
+            "method": "auto",
+            "lang": "ch",
+        }
+    return convert
+
+
 class VaultSourceTestBase(unittest.TestCase):
     def setUp(self):
-        self.db_path = temp_db_env()
+        self.db_path = temp_db_env(self)
         self.vault = Path(self.db_path) / "vault"
         self.external = Path(tempfile.mkdtemp(prefix="kb_vault_src_ext_"))
         self.addCleanup(shutil.rmtree, str(self.external), True)
@@ -90,9 +113,28 @@ class TestVaultPaths(VaultSourceTestBase):
         self.assertTrue(vault_source.is_under_vault(inside))
         self.assertTrue(vault_source.is_under_vault(self.vault))
         self.assertFalse(vault_source.is_under_vault(outside))
-        self.assertEqual(vault_source.rel_to_vault(inside), "notes/a.md")
+        self.assertEqual(
+            vault_source.rel_to_vault(inside), os.path.normpath("notes/a.md"))
         with self.assertRaises(ValueError):
             vault_source.rel_to_vault(outside)
+
+    def test_symlink_target_outside_vault_is_not_under_vault(self):
+        outside = self.write_external("outside.md", "库外内容。")
+        link = self.vault / "link.md"
+        try:
+            os.symlink(outside, link)
+        except (OSError, NotImplementedError):
+            link_dir = self.vault / "linked-dir"
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link_dir), str(self.external)],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                self.skipTest("当前环境不允许创建符号链接或 junction")
+            link = link_dir / "outside.md"
+        self.assertFalse(vault_source.is_under_vault(link))
+        with self.assertRaises(ValueError):
+            vault_source.rel_to_vault(link)
 
     def test_target_dir_for(self):
         self.assertEqual(
@@ -122,15 +164,17 @@ class TestPreparePdf(VaultSourceTestBase):
         md_path = Path(prepared.md_path)
         self.assertTrue(prepared.converted)
         self.assertEqual(prepared.converter, "MinerU")
+        self.assertEqual(prepared.category, "paper")
         self.assertEqual(md_path.parent, self.vault / "08-literature-文献" / "papers-论文全文")
         self.assertEqual(
             prepared.source,
-            "08-literature-文献/papers-论文全文/论文A.md",
+            os.path.normpath("08-literature-文献/papers-论文全文/论文A.md"),
         )
         self.assertNotIn(".pdf", prepared.source.lower())
         self.assertTrue((md_path.parent / "论文A_images" / "img-001.png").is_file())
 
         text = md_path.read_text(encoding="utf-8")
+        self.assertIn("generator: lancedb-search", text)
         self.assertIn("tags: [literature]", text)
         self.assertIn("type: literature", text)
         self.assertIn("status: unread", text)
@@ -147,7 +191,10 @@ class TestPreparePdf(VaultSourceTestBase):
 
         md_path = Path(prepared.md_path)
         self.assertEqual(md_path.parent, self.vault / "raw-素材" / "converted-转换")
-        self.assertEqual(prepared.source, "raw-素材/converted-转换/manual.md")
+        self.assertEqual(
+            prepared.source,
+            os.path.normpath("raw-素材/converted-转换/manual.md"),
+        )
         text = md_path.read_text(encoding="utf-8")
         self.assertIn("tags: [converted]", text)
         self.assertIn("type: fleeting", text)
@@ -211,6 +258,57 @@ class TestPreparePdf(VaultSourceTestBase):
                 vault_source.prepare_markdown(str(pdf))
         self.assertIn("mineru down", str(ctx.exception))
 
+    def test_regenerated_pdf_backs_up_previous_generated_markdown(self):
+        pdf = self.write_external("paper.pdf", b"%PDF-1.4 fake")
+        with mock.patch.object(
+            pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            first = vault_source.prepare_markdown(str(pdf))
+        target = Path(first.md_path)
+        old_body = vault_source.strip_frontmatter(
+            target.read_text(encoding="utf-8"))
+
+        future = time.time() + 30
+        os.utime(pdf, (future, future))
+        with mock.patch.object(
+            pdf_convert, "convert_pdf",
+            side_effect=fake_convert_pdf_with_markdown(
+                "# paper\n\n新版正文 " + ("更新后" * 30)),
+        ):
+            second = vault_source.prepare_markdown(str(pdf))
+
+        self.assertEqual(second.md_path, first.md_path)
+        self.assertTrue(second.regenerated)
+        self.assertIn(
+            "新版正文",
+            target.read_text(encoding="utf-8"),
+        )
+        backups = sorted(target.parent.glob(f"{target.stem}.bak-*.md"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(
+            vault_source.strip_frontmatter(
+                backups[0].read_text(encoding="utf-8")),
+            old_body,
+        )
+
+    def test_same_source_without_generator_is_treated_as_user_file(self):
+        target = self.vault / "raw-素材" / "converted-转换" / "same.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pdf = self.write_external("same.pdf", b"%PDF-1.4 fake")
+        user_text = (
+            f"---\nsource: '{pdf.resolve()}'\n---\n\n"
+            "用户手写笔记（没有 generator 标记）\n"
+        )
+        target.write_text(user_text, encoding="utf-8")
+
+        with self.patch_pdf():
+            prepared = vault_source.prepare_markdown(str(pdf))
+
+        final = Path(prepared.md_path)
+        self.assertNotEqual(final, target)
+        self.assertTrue(final.name.startswith("same-"))
+        self.assertEqual(target.read_text(encoding="utf-8"), user_text)
+
 
 class TestPrepareText(VaultSourceTestBase):
     def test_external_markdown_is_copied_into_vault(self):
@@ -220,14 +318,84 @@ class TestPrepareText(VaultSourceTestBase):
         copied = Path(prepared.md_path)
         self.assertFalse(prepared.converted)
         self.assertEqual(prepared.converter, "")
+        self.assertTrue(prepared.regenerated)
         self.assertEqual(copied.parent, self.vault / "raw-素材" / "converted-转换")
-        self.assertEqual(prepared.source, "raw-素材/converted-转换/notes.md")
-        self.assertEqual(copied.read_text(encoding="utf-8"),
-                         source.read_text(encoding="utf-8"))
+        digest = vault_source._path_digest(source)
+        expected = os.path.normpath(
+            f"raw-素材/converted-转换/notes-{digest}.md")
+        self.assertEqual(prepared.source, expected)
+        self.assertEqual(copied.name, f"notes-{digest}.md")
+
+        text = copied.read_text(encoding="utf-8")
+        self.assertIn("generator: lancedb-search", text)
+        self.assertIn(f"source: '{source.resolve()}'", text)
+        self.assertEqual(
+            vault_source.strip_frontmatter(text),
+            source.read_text(encoding="utf-8"),
+        )
         self.assertTrue(source.is_file())
 
         again = vault_source.prepare_markdown(str(source))
         self.assertEqual(again.md_path, prepared.md_path)
+        self.assertEqual(again.source, prepared.source)
+        self.assertFalse(again.regenerated)
+
+    def test_external_text_update_keeps_one_fixed_target_and_backs_up(self):
+        source = self.write_external("paper.txt", "第一版内容。" * 30)
+        first = vault_source.prepare_markdown(str(source))
+        target = Path(first.md_path)
+        first_body = vault_source.strip_frontmatter(
+            target.read_text(encoding="utf-8"))
+        expected = os.path.normpath(
+            f"raw-素材/converted-转换/paper-{vault_source._path_digest(source)}.md")
+        self.assertEqual(first.source, expected)
+
+        source.write_text("第二版内容。" * 30, encoding="utf-8")
+        second = vault_source.prepare_markdown(str(source))
+
+        self.assertEqual(second.md_path, first.md_path)
+        self.assertEqual(second.source, first.source)
+        self.assertTrue(second.regenerated)
+        self.assertEqual(
+            vault_source.strip_frontmatter(
+                target.read_text(encoding="utf-8")),
+            "第二版内容。" * 30,
+        )
+        backups = sorted(target.parent.glob(f"{target.stem}.bak-*.md"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(
+            vault_source.strip_frontmatter(
+                backups[0].read_text(encoding="utf-8")),
+            first_body,
+        )
+
+    def test_user_modified_fixed_target_is_not_overwritten(self):
+        source = self.write_external("fixed.md", "可更新内容。" * 30)
+        first = vault_source.prepare_markdown(str(source))
+        target = Path(first.md_path)
+        target.write_text("# 用户改过的笔记\n\n不要覆盖。", encoding="utf-8")
+
+        source.write_text("又一段新内容。" * 30, encoding="utf-8")
+        with self.assertRaises(vault_source.VaultSourceError):
+            vault_source.prepare_markdown(str(source))
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            "# 用户改过的笔记\n\n不要覆盖。",
+        )
+
+    def test_category_hint_is_carried_on_prepared_source(self):
+        source = self.write_external("topic.md", "论文内容。" * 30)
+        prepared = vault_source.prepare_markdown(
+            str(source), category_hint="paper")
+        self.assertEqual(prepared.category, "paper")
+        self.assertEqual(
+            Path(prepared.md_path).parent,
+            self.vault / "08-literature-文献" / "papers-论文全文",
+        )
+        self.assertIn(
+            "type: literature",
+            Path(prepared.md_path).read_text(encoding="utf-8"),
+        )
 
     def test_vault_markdown_is_used_in_place(self):
         path = self.vault / "notes" / "inside.md"
@@ -237,8 +405,10 @@ class TestPrepareText(VaultSourceTestBase):
         prepared = vault_source.prepare_markdown(str(path))
 
         self.assertEqual(prepared.md_path, str(path.resolve()))
-        self.assertEqual(prepared.source, "notes/inside.md")
+        self.assertEqual(
+            prepared.source, os.path.normpath("notes/inside.md"))
         self.assertFalse(prepared.converted)
+        self.assertFalse(prepared.regenerated)
         self.assertEqual(prepared.original_path, str(path.resolve()))
 
     def test_doc_is_rejected_with_docx_hint(self):
@@ -281,6 +451,34 @@ class TestPrepareOffice(VaultSourceTestBase):
         self.assertIn("summary: 由 pptx 经 markitdown 转换", text)
         self.assertIn("Markitdown body", text)
 
+    def test_suffixed_office_target_is_reused_before_conversion(self):
+        target = self.vault / "raw-素材" / "converted-转换" / "report.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("用户自己的 report 笔记。", encoding="utf-8")
+        docx = self.write_external("report.docx", b"fake-docx")
+
+        with mock.patch.object(
+            vault_source, "_docling_markdown",
+            return_value="# Report\n\nDocling body",
+        ):
+            first = vault_source.prepare_markdown(str(docx))
+
+        with mock.patch.object(
+            vault_source, "_docling_markdown",
+            side_effect=AssertionError("不应重新转换"),
+        ) as docling, mock.patch.object(
+            vault_source, "_markitdown_text",
+            side_effect=AssertionError("不应重新转换"),
+        ):
+            second = vault_source.prepare_markdown(str(docx))
+
+        docling.assert_not_called()
+        self.assertEqual(second.md_path, first.md_path)
+        self.assertEqual(second.source, first.source)
+        self.assertFalse(second.regenerated)
+        self.assertEqual(target.read_text(encoding="utf-8"),
+                         "用户自己的 report 笔记。")
+
     def test_both_converters_failing_raises(self):
         xlsx = self.write_external("table.xlsx", b"fake-xlsx")
         with mock.patch.object(
@@ -311,11 +509,19 @@ class TestFrontmatter(VaultSourceTestBase):
         unclosed = "---\ntitle: x\n正文"
         self.assertEqual(vault_source.strip_frontmatter(unclosed), unclosed)
 
+    def test_strip_frontmatter_keeps_non_yaml_horizontal_rule(self):
+        # 章节标题不是 YAML 键值：分隔线属于正文，不能把“第一章”删掉。
+        text = "---\n第一章\n---\n正文"
+        self.assertEqual(vault_source.strip_frontmatter(text), text)
+        text = "---\n第一章\n第二章\n---\n正文"
+        self.assertEqual(vault_source.strip_frontmatter(text), text)
+
     def test_frontmatter_source_round_trip(self):
         original = r"D:\资料\O'Brien\论文.pdf"
         front = vault_source._render_frontmatter(
             "paper", original, ".pdf", "MinerU", created="2026-11-15")
         self.assertIn("source: 'D:\\资料\\O''Brien\\论文.pdf'", front)
+        self.assertIn("generator: lancedb-search", front)
         text = front + "\n正文"
         self.assertEqual(vault_source._frontmatter_source(text), original)
 

@@ -190,6 +190,7 @@ def get_knowledge_status() -> str:
                 "PDF/Word/PPT/Excel 会先转成 Markdown 落到 vault（PDF 走 MinerU，"
                 "Office 走 docling → markitdown），再按转换后的 md 切片。"
                 "vault 外目录会被拒绝，外部文件请用 add_single_document。"
+                "reindex_all 只在扫描目录等于 vault 根且扫描到可入库文件时清库重建。"
                 "export_markdown_dir 仅作额外导出，不改变 source。",
 )
 def add_documents(

@@ -11,9 +11,10 @@
 - 所有事件先经 _is_indexable 过滤扩展名与排除目录；目录事件直接忽略
   （限制：整目录移入/移出不会递归迁移其中文件的索引，依赖 watchdog
   对目录内文件产生的独立事件兜底）。
-- 只自动改写含目录分隔符的相对 source。库中只有 basename 的旧来源
-  （无法反推绝对路径）一律跳过并写 stderr，要求人工确认，避免按
-  basename 误替换/误删同名文档。
+- 只自动改写可反推绝对路径的相对 source。vault 根下的顶层文件（source
+  无分隔符但 ``vault_root/source`` 正是事件文件）同样可自动更新；库中
+  只有无法反推绝对路径的旧 basename 来源一律跳过并写 stderr，要求人工
+  确认，避免按 basename 误替换/误删同名文档。
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Callable
 
 from . import config as cfg
 from . import ingest as kb_ingest
+from . import vault_source as kb_vault_source
 
 if TYPE_CHECKING:
     from watchdog.observers import Observer
@@ -77,17 +79,6 @@ def _is_indexable(path: str) -> bool:
     return not any(segment.lower() in excluded for segment in segments[:-1])
 
 
-def _relative_source(root: str, filepath: str) -> str:
-    """事件路径 → 监听根下的相对 source；根外/空路径退回 basename。"""
-    try:
-        rel = os.path.relpath(filepath, root)
-    except (TypeError, ValueError):
-        rel = ""
-    if not rel or rel == os.pardir or rel.startswith(os.pardir + os.sep):
-        return os.path.basename(filepath or "")
-    return rel
-
-
 def _source_matches_path(filepath: str, source: str) -> bool:
     """source 是否是该文件路径的完整后缀（按目录边界，不区分大小写/分隔符）。"""
     file_norm = os.path.normcase(os.path.abspath(filepath)).replace("\\", "/").rstrip("/")
@@ -95,6 +86,17 @@ def _source_matches_path(filepath: str, source: str) -> bool:
     if not source_norm or source_norm in (".", ".."):
         return False
     return file_norm == source_norm or file_norm.endswith("/" + source_norm)
+
+
+def _legacy_source_matches_file(source: str, filepath: str) -> bool:
+    """纯 basename source 是否正好是 vault 根下的该文件（顶层文件合法）。"""
+    if not kb_ingest.source_is_legacy_basename(source):
+        return True
+    try:
+        expected = os.path.join(kb_vault_source.vault_root(), source)
+    except (TypeError, ValueError):
+        return False
+    return _normalize_path(expected) == _normalize_path(filepath)
 
 
 def _observer_alive(observer) -> bool:
@@ -218,7 +220,7 @@ class _AutoIndexHandler(_FileSystemEventHandler):
             return "", f"解析来源失败: {exc}"
         if error:
             return "", error
-        if source and kb_ingest.source_is_legacy_basename(source):
+        if source and not _legacy_source_matches_file(source, filepath):
             return "", (
                 f"legacy basename source，需人工确认: {source}（{filepath}）"
             )
@@ -229,13 +231,24 @@ class _AutoIndexHandler(_FileSystemEventHandler):
         return source, ""
 
     def _legacy_new_source_reason(self, filepath: str) -> str:
-        """新文件按监听根相对路径算出的 source 若是纯 basename，返回跳过原因。"""
-        planned = _relative_source(self._watch_root_path, filepath)
-        if kb_ingest.source_is_legacy_basename(planned):
-            return (
-                f"legacy basename source，需人工确认: {planned}（{filepath}）"
-            )
-        return ""
+        """新文件按 vault 相对路径算出的 source 若是悬空 basename，返回跳过原因。
+
+        改用 ``rel_to_vault``：只有 ``vault_root/source`` 与事件路径不是同一
+        文件时才是真正的 legacy basename。vault 根下的顶层文件（source 无
+        分隔符）是合法的，必须能正常入库；vault 外文件会复制进 vault，也不
+        存在 legacy 歧义。
+        """
+        try:
+            planned = kb_vault_source.rel_to_vault(filepath)
+        except (TypeError, ValueError):
+            return ""
+        if not kb_ingest.source_is_legacy_basename(planned):
+            return ""
+        if _legacy_source_matches_file(planned, filepath):
+            return ""
+        return (
+            f"legacy basename source，需人工确认: {planned}（{filepath}）"
+        )
 
     def _reindex(self, filepath: str, existing_source: "str | None" = None) -> None:
         """更新已有相对路径来源，或把监听根下的新文件按相对路径入库。

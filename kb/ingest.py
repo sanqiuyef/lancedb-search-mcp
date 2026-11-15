@@ -490,9 +490,9 @@ def _chunk_by_paragraph(text: str, source: str, category: str = "",
     return chunks
 
 
-def _chunk_markdown(text: str, source: str) -> List[Dict]:
+def _chunk_markdown(text: str, source: str, category: str = "") -> List[Dict]:
     """Markdown 感知分块：按 #/##/### 标题分割保持语义完整。"""
-    cat = guess_category(source)
+    cat = category or guess_category(source)
     lines = text.split("\n")
     headings = []
     for i, line in enumerate(lines):
@@ -525,16 +525,18 @@ def _chunk_markdown(text: str, source: str) -> List[Dict]:
     return chunks
 
 
-def chunk_text(text: str, source: str, is_markdown: "bool | None" = None) -> List[Dict]:
+def chunk_text(text: str, source: str, is_markdown: "bool | None" = None,
+               category: str = "") -> List[Dict]:
     """分块入口：Markdown（含 MinerU 转换的 PDF）走标题感知分块，其余按段落。
 
-    is_markdown=None 时按 source 扩展名推断（向后兼容）。
+    is_markdown=None 时按 source 扩展名推断（向后兼容）；``category`` 非空时
+    显式使用（转换后的 md 不再按 vault 路径推断，避免丢失 paper 等类别）。
     """
     if is_markdown is None:
         is_markdown = source.lower().endswith(".md")
     if is_markdown:
-        return _chunk_markdown(text, source)
-    return _chunk_by_paragraph(text, source, guess_category(source))
+        return _chunk_markdown(text, source, category)
+    return _chunk_by_paragraph(text, source, category or guess_category(source))
 
 
 # =============================================================
@@ -645,6 +647,46 @@ def _normalized_path(value: str) -> str:
     return os.path.normcase(value or "").replace("\\", "/")
 
 
+def _norm_source(value: str) -> str:
+    """source 等价比较：normcase(normpath)，兼容 / 与 \\ 以及大小写差异。"""
+    return os.path.normcase(os.path.normpath(value or ""))
+
+
+def _find_equivalent_source(sources: "set[str] | list[str]",
+                            planned: str) -> str:
+    """在库中查找与 planned 等价的原始 source 字符串；找不到返回空。"""
+    target = _norm_source(planned)
+    if not target:
+        return ""
+    matches = sorted(src for src in sources if _norm_source(src) == target)
+    return matches[0] if matches else ""
+
+
+def _original_rel_source(filepath: str) -> str:
+    """原文件在 vault 内的相对 source；vault 外返回空。"""
+    if not filepath:
+        return ""
+    try:
+        return vault_source.rel_to_vault(filepath)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _old_sources_after_conversion(prepared: vault_source.PreparedSource,
+                                  sources: "set[str]") -> "list[str]":
+    """转换后需要清理的旧来源（如曾直接向量化的 ``.pdf`` 来源）。
+
+    只返回库中真实存在的原始字符串，调用方在写入成功后按它精确删除。
+    """
+    original_rel = _original_rel_source(prepared.original_path)
+    if not original_rel:
+        return []
+    if _norm_source(original_rel) == _norm_source(prepared.source):
+        return []
+    target = _norm_source(original_rel)
+    return sorted(src for src in sources if _norm_source(src) == target)
+
+
 def _path_is_suffix(filepath: str, source: str) -> bool:
     """source 是否是 filepath 的完整路径后缀（按目录边界，不是子串）。"""
     fp = _normalized_path(filepath).rstrip("/")
@@ -718,19 +760,35 @@ def _match_existing_source(all_sources: set[str], filepath: str) -> "tuple[str, 
     return "", ""
 
 
+def _legacy_source_is_real_path(source: str, filepath: str) -> bool:
+    """纯 basename source 是否正好对应 vault 根下的该文件（顶层文件是合法的）。"""
+    if not source_is_legacy_basename(source):
+        return False
+    try:
+        candidate = os.path.join(vault_source.vault_root(), source)
+        return (
+            os.path.normcase(os.path.realpath(candidate))
+            == os.path.normcase(os.path.realpath(filepath))
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def resolve_writable_source(filepath: str) -> "tuple[str, str]":
     """只读解析 watcher 可安全自动改写的库中 source，返回 ``(source, reason)``。
 
     与 update_document 的 basename 匹配不同：不含分隔符的 legacy basename
-    不参与路径后缀匹配，避免被当成任意同名文件的可更新来源。
+    不参与路径后缀匹配，避免被当成任意同名文件的可更新来源；例外是
+    vault 根目录下的顶层文件——``vault_root/source`` 正是事件文件时它是
+    合法来源，可以正常自动更新。
 
     优先级：
-    1. 整值精确匹配 → 非 legacy 时直接返回；
+    0. ``rel_to_vault(filepath)`` 与库中某来源等价 → 直接返回该原始字符串；
+    1. 整值精确匹配 → 非 legacy（或是顶层真实文件）时直接返回；
     2. 唯一「含分隔符且是 filepath 路径后缀」的来源 → 返回它
        （即使库中还有同名 legacy basename，也能安全更新相对来源）；
     3. 仅有同名 legacy basename → 返回空 source 与人工确认提示；
-    4. 无匹配 → ``("", "")``（调用方按新文件处理）；
-       多个可写来源无法唯一判定 → 返回空 source 与歧义错误。
+    4. 无匹配 → ``("", "")``（调用方按新文件处理）。
     """
     if not filepath or not kb_schema.table_exists():
         return "", ""
@@ -739,10 +797,25 @@ def resolve_writable_source(filepath: str) -> "tuple[str, str]":
     if not sources:
         return "", ""
 
+    planned = _original_rel_source(filepath)
+    if planned:
+        equivalent = sorted(
+            src for src in sources if _norm_source(src) == _norm_source(planned)
+        )
+        if len(equivalent) == 1:
+            source = equivalent[0]
+            if (source_is_legacy_basename(source)
+                    and not _legacy_source_is_real_path(source, filepath)):
+                return "", _legacy_source_message(source, filepath)
+            return source, ""
+        if len(equivalent) > 1:
+            return "", _ambiguity_message(filepath, equivalent)
+
     target_norm = os.path.normcase(filepath)
     exact = [src for src in sources if os.path.normcase(src) == target_norm]
     if len(exact) == 1:
-        if source_is_legacy_basename(exact[0]):
+        if (source_is_legacy_basename(exact[0])
+                and not _legacy_source_is_real_path(exact[0], filepath)):
             return "", _legacy_source_message(exact[0], filepath)
         return exact[0], ""
     if len(exact) > 1:
@@ -763,6 +836,13 @@ def resolve_writable_source(filepath: str) -> "tuple[str, str]":
         if source_is_legacy_basename(src)
         and os.path.normcase(_basename_of(src)) == os.path.normcase(fname)
     ]
+    real_hits = [
+        src for src in legacy_same if _legacy_source_is_real_path(src, filepath)
+    ]
+    if len(real_hits) == 1:
+        return real_hits[0], ""
+    if len(real_hits) > 1:
+        return "", _ambiguity_message(filepath, real_hits)
     if legacy_same:
         return "", _legacy_source_message(
             "、".join(sorted(legacy_same)), filepath)
@@ -859,15 +939,32 @@ def delete_source_exact(source: str, allow_last: bool = True) -> int:
         return deleted
 
 
+def _is_link_path(path: str) -> bool:
+    """路径本身是否为符号链接/junction（os.walk 默认可能跟随 junction）。"""
+    try:
+        if os.path.islink(path):
+            return True
+        is_junction = getattr(os.path, "isjunction", None)
+        return bool(is_junction and is_junction(path))
+    except OSError:
+        return False
+
+
 def scan_files(scan_dir: str) -> List[str]:
-    """按扩展名扫描目录（跳过排除目录与超限文件）。"""
+    """按扩展名扫描目录（跳过排除目录、符号链接与超限文件）。"""
     filepaths = []
     for root, dirs, files in os.walk(scan_dir):
-        dirs[:] = [d for d in dirs if d not in cfg.EXCLUDE_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if d not in cfg.EXCLUDE_DIRS
+            and not _is_link_path(os.path.join(root, d))
+        ]
         for f in files:
             if Path(f).suffix.lower() not in cfg.EXTENSIONS:
                 continue
             fp = os.path.join(root, f)
+            if _is_link_path(fp):
+                continue
             try:
                 if os.path.getsize(fp) > cfg.MAX_FILE_SIZE:
                     continue
@@ -877,9 +974,10 @@ def scan_files(scan_dir: str) -> List[str]:
     return sorted(set(filepaths))
 
 
-def _chunks_for_source(text: str, source: str, is_md: bool) -> List[Dict]:
-    """文本 → 带 doc_id/ingested_at 的切片列表。"""
-    chunks = chunk_text(text, source, is_md)
+def _chunks_for_source(text: str, source: str, is_md: bool,
+                       category: str = "") -> List[Dict]:
+    """文本 → 带 doc_id/ingested_at 的切片列表（category 显式传入）。"""
+    chunks = chunk_text(text, source, is_md, category)
     for ch in chunks:
         ch["doc_id"] = kb_schema.chunk_doc_id(
             ch["text"], ch["source"], ch["chunk_index"])
@@ -931,32 +1029,58 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     Markdown 并立即入库，其生成的 md 在同一次扫描中跳过，避免重复切片。
     export_markdown_dir 只做额外导出，不能改变 source。
     「检查已有来源 → 写入新行 → 更新索引」整段持有模块级写锁；reindex_all 的
-    drop 也在锁内，避免与 watcher 的更新/删除交错。
+    drop 也在锁内，且必须先确认扫描根是 vault 根、扫描结果非空，避免误清库。
     """
     if not os.path.isdir(scan_dir):
         return f"❌ 目录不存在: {scan_dir}"
     if not vault_source.is_under_vault(scan_dir):
         return _VAULT_ONLY_ERROR
+    if reindex_all:
+        vault_norm = vault_source._norm_path(vault_source.vault_root())
+        scan_norm = vault_source._norm_path(scan_dir)
+        if scan_norm != vault_norm:
+            return (
+                "[ERROR] reindex_all 只允许扫描 vault 根目录，已拒绝清空知识库。\n"
+                f"扫描目录: {scan_dir}\n"
+                f"vault 根: {vault_source.vault_root()}"
+            )
 
     with _write_lock:
+        filepaths = scan_files(scan_dir)
+        if reindex_all and not filepaths:
+            return (
+                "[ERROR] 扫描目录没有任何可入库文件，已拒绝清空知识库。\n"
+                f"扫描目录: {scan_dir}"
+            )
+
         table = kb_schema.get_or_create_table()
         existing = kb_schema.existing_sources(table) if not reindex_all else set()
-        existing_norm = {_normalized_path(src) for src in existing}
+        existing_by_norm: Dict[str, str] = {}
+        for src in existing:
+            existing_by_norm.setdefault(_norm_source(src), src)
 
-        if reindex_all:
+        # reindex_all 的 drop 延迟到「转换/扫描校验」确认已有可写内容之后：
+        # 全部转换失败或全部文件无有效文本时保留原知识库，不清空。
+        reindex_dropped = not reindex_all
+
+        def _ensure_reindex_dropped() -> None:
+            nonlocal table, reindex_dropped
+            if reindex_dropped:
+                return
             db = kb_schema.get_db()
             db.drop_table(cfg.TABLE_NAME)
             table = kb_schema.get_or_create_table()
-            existing_norm = set()
+            reindex_dropped = True
 
-        filepaths = scan_files(scan_dir)
         binary_paths = [
             fp for fp in filepaths
             if Path(fp).suffix.lower() in vault_source.BINARY_EXTENSIONS
         ]
         total_tasks = len(filepaths)
         generated_md_paths: set[str] = set()
+        failed_md_paths: set[str] = set()
         skipped: List[str] = []
+        failed: List[str] = []
         all_chunks: List[Dict] = []
         chunks_by_source: Dict[str, List[Dict]] = {}
         source_filepaths: Dict[str, str] = {}
@@ -968,11 +1092,17 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
 
         # 预扫描二进制：转换 → 立即入库 → 记录生成 md 供后续跳过。
         for fp in binary_paths:
+            category_hint = guess_category(fp)
             try:
                 prepared = vault_source.prepare_markdown(
-                    fp, category_hint=guess_category(fp))
+                    fp, category_hint=category_hint)
             except Exception as exc:
-                skipped.append(f"{os.path.basename(fp)}（转换失败: {exc}）")
+                failed.append(f"{os.path.basename(fp)}（转换失败: {exc}）")
+                # 转换失败时旧产物仍是同一原文件的生成物：同一次扫描中
+                # 不得把它当普通文本重新入库。
+                for old_md in vault_source.generated_markdown_candidates(
+                        fp, category_hint):
+                    failed_md_paths.add(vault_source._norm_path(old_md))
                 done += 1
                 if progress:
                     progress(done, total_tasks)
@@ -985,7 +1115,11 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
                 except Exception as exc:
                     print(f"[export] 额外导出失败: {exc}", file=sys.stderr)
 
-            if _normalized_path(prepared.source) in existing_norm:
+            existing_source = existing_by_norm.get(
+                _norm_source(prepared.source), "")
+            # 复用旧产物且来源已在库中时跳过；本次实际重转/重写的文件
+            # 即使 source 已存在也要按新内容重新入库。
+            if existing_source and not prepared.regenerated:
                 done += 1
                 if progress:
                     progress(done, total_tasks)
@@ -999,7 +1133,9 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
                 if progress:
                     progress(done, total_tasks)
                 continue
-            chunks = _chunks_for_source(text, prepared.source, True)
+            source = existing_source or prepared.source
+            chunks = _chunks_for_source(
+                text, source, True, prepared.category)
             if not chunks:
                 skipped.append(os.path.basename(fp))
                 done += 1
@@ -1007,32 +1143,50 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
                     progress(done, total_tasks)
                 continue
             try:
-                added, _ = _replace_source_chunks(table, prepared.source, chunks)
+                _ensure_reindex_dropped()
+                added, _ = _replace_source_chunks(table, source, chunks)
             except Exception as exc:
-                skipped.append(f"{os.path.basename(fp)}（写入失败: {exc}）")
+                failed.append(f"{os.path.basename(fp)}（写入失败: {exc}）")
                 done += 1
                 if progress:
                     progress(done, total_tasks)
                 continue
 
+            # 转换导致 source 从 .pdf/.docx 变为 .md 时，写成功后按旧
+            # source 精确删除旧来源行（例如历史上直接向量化的 PDF）。
+            for old_source in _old_sources_after_conversion(
+                    prepared, set(existing_by_norm.values())):
+                if _norm_source(old_source) == _norm_source(source):
+                    continue
+                try:
+                    _delete_source_exact(table, old_source)
+                except Exception as exc:
+                    print(
+                        f"[ingest] 旧来源清理失败 {old_source}: {exc}",
+                        file=sys.stderr,
+                    )
+                existing_by_norm.pop(_norm_source(old_source), None)
+
             binary_added += added
             binary_chunks += len(chunks)
-            existing_norm.add(_normalized_path(prepared.source))
-            source_filepaths[prepared.source] = prepared.md_path
-            chunks_by_source.setdefault(prepared.source, []).extend(chunks)
+            existing_by_norm[_norm_source(source)] = source
+            source_filepaths[source] = prepared.md_path
+            chunks_by_source.setdefault(source, []).extend(chunks)
             done += 1
             if progress:
                 progress(done, total_tasks)
 
-        # 再扫描文本：source 相对 vault；跳过二进制生成的 md 与已有来源。
+        # 再扫描文本：source 相对 vault；跳过二进制生成的 md、转换失败
+        # 原文件对应的旧 md，以及库中已存在的等价来源。
         new_files: List[tuple[str, str]] = []
         for fp in filepaths:
-            if vault_source._norm_path(fp) in generated_md_paths:
+            norm_fp = vault_source._norm_path(fp)
+            if norm_fp in generated_md_paths or norm_fp in failed_md_paths:
                 continue
             if Path(fp).suffix.lower() in vault_source.BINARY_EXTENSIONS:
                 continue
             rel_path = vault_source.rel_to_vault(fp)
-            if _normalized_path(rel_path) in existing_norm:
+            if _norm_source(rel_path) in existing_by_norm:
                 continue
             new_files.append((fp, rel_path))
 
@@ -1045,20 +1199,28 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
                 if progress:
                     progress(done, total_tasks)
                 continue
-            source_filepaths[rel_path] = fp
-            chunks = _chunks_for_source(text, rel_path, is_md)
+            source = existing_by_norm.get(_norm_source(rel_path), rel_path)
+            source_filepaths[source] = fp
+            chunks = _chunks_for_source(
+                text, source, is_md, guess_category(fp))
             all_chunks.extend(chunks)
-            chunks_by_source.setdefault(rel_path, []).extend(chunks)
+            chunks_by_source.setdefault(source, []).extend(chunks)
             if progress:
                 progress(done, total_tasks)
 
         if not all_chunks and binary_chunks == 0:
-            if skipped:
-                return (
-                    "扫描完成，但没有提取到有效文本内容。\n"
-                    f"⚠️ 无法提取文本（已跳过）: {', '.join(skipped[:5])}"
-                    + (f" 等共 {len(skipped)} 个" if len(skipped) > 5 else "")
-                )
+            if failed or skipped:
+                lines = ["扫描完成，但没有成功入库任何文本内容。"]
+                if failed:
+                    lines.append(
+                        f"❌ 转换/写入失败: {len(failed)} 个文件；"
+                        f"{', '.join(failed[:5])}"
+                        + (f" 等共 {len(failed)} 个" if len(failed) > 5 else ""))
+                if skipped:
+                    lines.append(
+                        f"⚠️ 无法提取文本（已跳过）: {', '.join(skipped[:5])}"
+                        + (f" 等共 {len(skipped)} 个" if len(skipped) > 5 else ""))
+                return "\n".join(lines)
             msg = f"扫描「{scan_dir}」，共 {len(filepaths)} 个文件，没有新文件需要添加。"
             if existing and not reindex_all:
                 msg += f"（已有 {len(existing)} 个文件在库中）"
@@ -1066,6 +1228,7 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
 
         added = binary_added
         if all_chunks:
+            _ensure_reindex_dropped()
             added += add_chunks(table, all_chunks)
         kb_schema.ensure_vector_index(table)
         kb_schema.ensure_fts_index(table)
@@ -1087,8 +1250,12 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     extra = f"（跳过 {len(existing)} 个已有文件）" if existing and not reindex_all else ""
     if export_markdown_dir:
         extra += "\nMarkdown 导出目录: " + export_markdown_dir
+    header = (
+        "⚠️ **文档添加完成（部分失败）**"
+        if failed else "✅ **文档添加完成！**"
+    )
     lines = [
-        f"✅ **文档添加完成！**",
+        header,
         f"{'─' * 40}",
         f"扫描目录: {scan_dir}",
         f"新扫描文件: {new_count}",
@@ -1097,6 +1264,12 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
         f"知识库总块数: {len(table)}",
         extra,
     ]
+    if failed:
+        lines.append(
+            f"❌ 转换/写入失败: {len(failed)} 个文件；"
+            f"{', '.join(failed[:5])}"
+            + (f" 等共 {len(failed)} 个" if len(failed) > 5 else "")
+        )
     if skipped:
         lines.append(f"⚠️ 无法提取文本（已跳过）: {', '.join(skipped[:5])}"
                      + (f" 等共 {len(skipped)} 个" if len(skipped) > 5 else ""))
@@ -1140,17 +1313,29 @@ def add_single_document(filepath: str, scan_dir: str = "",
     if not text or len(text) < 20:
         return f"[ERROR] 无法从文件中提取有效文本: {os.path.basename(prepared.md_path)}"
 
-    source = prepared.source
-    chunks = _chunks_for_source(text, source, is_md)
-    if not chunks:
-        return f"[ERROR] 分块后无有效内容: {source}"
-
     with _write_lock:
         table = kb_schema.get_or_create_table()
+        existing = kb_schema.existing_sources(table)
+        # 复用库中已有等价 source 的原始字符串（/ 与 \、大小写差异），
+        # 保证 old_doc_ids 能命中旧行而不是写出第二份重复来源。
+        source = _find_equivalent_source(existing, prepared.source) or prepared.source
+        chunks = _chunks_for_source(text, source, is_md, prepared.category)
+        if not chunks:
+            return f"[ERROR] 分块后无有效内容: {source}"
+        old_sources = [
+            src for src in _old_sources_after_conversion(prepared, existing)
+            if _norm_source(src) != _norm_source(source)
+        ]
         try:
             added, replaced = _replace_source_chunks(table, source, chunks)
         except Exception as e:
             return f"[ERROR] 写入失败，旧记录未删除: {e}"
+        removed_old = 0
+        for old_source in old_sources:
+            try:
+                removed_old += _delete_source_exact(table, old_source)
+            except Exception as e:
+                print(f"[ingest] 旧来源清理失败 {old_source}: {e}", file=sys.stderr)
         kb_schema.ensure_vector_index(table)
         kb_schema.ensure_fts_index(table)
         kb_schema.fold_new_rows(table)
@@ -1178,6 +1363,8 @@ def add_single_document(filepath: str, scan_dir: str = "",
         f"替换旧记录: {replaced}",
         f"知识库总块数: {len(table)}",
     ])
+    if removed_old:
+        lines.append(f"清理旧来源: {removed_old} 行")
     return "\n".join(lines) + extra + export_warning
 
 
@@ -1210,8 +1397,10 @@ def update_document(filepath: str, source: str = "") -> str:
 
     with _write_lock:
         table = kb_schema.get_or_create_table()
+        all_sources = kb_schema.existing_sources(table)
         if source:
-            if source_is_legacy_basename(source):
+            if (source_is_legacy_basename(source)
+                    and not _legacy_source_is_real_path(source, filepath)):
                 return (
                     f"[ERROR] legacy basename source，需人工确认: {source}"
                     f"（{filepath}）"
@@ -1221,15 +1410,23 @@ def update_document(filepath: str, source: str = "") -> str:
                     f"[ERROR] source「{source}」不是文件「{filepath}」的路径后缀，"
                     "未执行更新。"
                 )
-            matched_source, error = source, ""
+            # watcher 可能传入与库中仅分隔符/大小写不同的等价 source；
+            # 复用库中原始字符串，才能命中 old_doc_ids 并清理旧行。
+            matched_source = (
+                _find_equivalent_source(all_sources, source) or source)
+            error = ""
         else:
             matched_source, error = _match_existing_source(
-                kb_schema.existing_sources(table), filepath)
+                all_sources, filepath)
+            if not error and not matched_source:
+                matched_source = _find_equivalent_source(
+                    all_sources, vault_relative)
         if error:
             return error
 
         source = matched_source or vault_relative
-        chunks = _chunks_for_source(text, source, is_md)
+        chunks = _chunks_for_source(
+            text, source, is_md, guess_category(filepath))
         if not chunks:
             return f"[ERROR] 分块后无有效内容: {source}"
         try:
