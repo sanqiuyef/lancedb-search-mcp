@@ -64,12 +64,12 @@ DOCUMENT_REVISION_STATUSES = (
 )
 PAGE_TYPES = tuple(PAGE_TYPE_SUBDIRS)  # ("concept", "entity", "topic")
 PAGE_STATUSES = ("draft", "review", "published", "archived")
-ENTITY_STATUSES = ("proposed", "accepted", "rejected", "archived")
-RELATION_STATUSES = ("proposed", "accepted", "rejected", "archived")
+ENTITY_STATUSES = ("active", "merged", "deprecated")
+RELATION_STATUSES = ("proposed", "verified", "rejected", "deprecated")
 ALIAS_TYPES = ("alias", "redirect", "abbreviation", "translation", "synonym")
 CLAIM_TYPES = ("fact", "hypothesis")
 CLAIM_STATUSES = ("proposed", "accepted", "rejected", "disputed")
-PROPOSAL_STATUSES = ("pending", "rejected", "stale", "approved", "applied")
+PROPOSAL_STATUSES = ("pending", "rejected", "stale", "approved", "applied", "cancelled")
 JOB_STATUSES = ("pending", "running", "succeeded", "failed", "cancelled")
 JOURNAL_STATES = (
     "prepared",

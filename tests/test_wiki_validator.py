@@ -261,12 +261,77 @@ class TestValidatorIssues(WikiValidatorTestBase):
                 "(relation_id, subject_entity_id, predicate, object_entity_id) "
                 "VALUES ('rel-self', 'entity-1', 'uses', 'entity-1')"
             )
+            self.conn.execute(
+                "INSERT INTO relations "
+                "(relation_id, subject_entity_id, predicate, object_entity_id, status) "
+                "VALUES ('rel-status', 'entity-1', 'part_of', 'entity-2', 'archived')"
+            )
         finally:
             self.conn.execute("PRAGMA ignore_check_constraints = OFF")
 
         codes = self.codes(validate(self.conn, self.config))
         self.assertIn(("error", "relation_invalid_predicate"), codes)
         self.assertIn(("error", "relation_self_loop"), codes)
+        self.assertIn(("error", "relation_invalid_status"), codes)
+
+    def test_entity_merged_without_target(self):
+        self.insert_entity("entity-1", "Alpha")
+        self.conn.execute(
+            "UPDATE entities SET status = 'merged' WHERE entity_id = 'entity-1'"
+        )
+        codes = self.codes(validate(self.conn, self.config))
+        self.assertIn(("error", "entity_merged_without_target"), codes)
+
+    def test_entity_merge_target_missing(self):
+        self.insert_entity("entity-1", "Alpha")
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.conn.execute(
+                "UPDATE entities SET status = 'merged', "
+                "merged_into_entity_id = 'missing' WHERE entity_id = 'entity-1'"
+            )
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+        codes = self.codes(validate(self.conn, self.config))
+        self.assertIn(("error", "entity_merge_target_missing"), codes)
+
+    def test_entity_merge_cycle_reported_once(self):
+        self.insert_entity("entity-1", "Alpha")
+        self.insert_entity("entity-2", "Beta")
+        self.conn.execute(
+            "UPDATE entities SET status = 'merged', "
+            "merged_into_entity_id = 'entity-2' WHERE entity_id = 'entity-1'"
+        )
+        self.conn.execute(
+            "UPDATE entities SET status = 'merged', "
+            "merged_into_entity_id = 'entity-1' WHERE entity_id = 'entity-2'"
+        )
+        issues = validate(self.conn, self.config)
+        cycles = [item for item in issues if item["code"] == "entity_merge_cycle"]
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0]["level"], "error")
+
+    def test_entity_merge_status_mismatch(self):
+        self.insert_entity("entity-1", "Alpha")
+        self.insert_entity("entity-2", "Beta")
+        self.conn.execute(
+            "UPDATE entities SET merged_into_entity_id = 'entity-2' "
+            "WHERE entity_id = 'entity-1'"
+        )
+        codes = self.codes(validate(self.conn, self.config))
+        self.assertIn(("error", "entity_merge_status_mismatch"), codes)
+
+    def test_entity_valid_merge_is_clean(self):
+        self.insert_entity("entity-1", "Alpha")
+        self.insert_entity("entity-2", "Beta")
+        self.conn.execute(
+            "UPDATE entities SET status = 'merged', "
+            "merged_into_entity_id = 'entity-2' WHERE entity_id = 'entity-1'"
+        )
+        codes = self.codes(validate(self.conn, self.config))
+        self.assertFalse(
+            {code for _level, code in codes if code.startswith("entity_")}
+        )
 
     def test_page_file_missing_and_orphan_file(self):
         page = self.create_page()

@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """``proposals`` 表的 SQL 读写。
 
-Phase 1 schema 的 status CHECK 为 pending/rejected/stale/approved/applied；
-服务层状态机额外记录了 cancelled，但当前 schema 无法持久化该值，详见
-``kb.wiki.proposals`` 中的说明。
+status CHECK 为 pending/rejected/stale/approved/applied/cancelled，
+与 ``constants.PROPOSAL_STATUSES`` 及服务层状态机保持一致。
 """
 
 from __future__ import annotations

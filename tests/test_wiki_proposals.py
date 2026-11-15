@@ -189,8 +189,58 @@ class TestCreateAndReadProposal(WikiProposalTestBase):
                 [],
                 "agent",
             )
+        self.assertEqual(self.service.review_queue(status="cancelled"), [])
         with self.assertRaises(ValueError):
-            self.service.review_queue(status="cancelled")
+            self.service.review_queue(status="bogus")
+
+
+class TestCancelProposal(WikiProposalTestBase):
+    def test_cancel_pending_proposal_persists_cancelled(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(
+            page, self.full_document(page, "不应写入\n")
+        )
+
+        decision = self.service.cancel_proposal(
+            proposal.proposal_id, actor="human", reason="不再需要"
+        )
+
+        self.assertTrue(decision.ok)
+        self.assertEqual(decision.status, "cancelled")
+        self.assertEqual(str(decision.proposal.status), "cancelled")
+        self.assertEqual(decision.proposal.reviewed_by, "human")
+        self.assertIsNotNone(decision.proposal.reviewed_at)
+        self.assertEqual(decision.proposal.error_message, "")
+        detail = self.service.get_proposal(proposal.proposal_id)
+        self.assertEqual(detail.payload["cancel_reason"], "不再需要")
+        self.assertEqual(self.service.review_queue(), [])
+        self.assertEqual(
+            [item.proposal_id for item in self.service.review_queue("cancelled")],
+            [proposal.proposal_id],
+        )
+
+        # 取消后的提案不能再审核，页面保持不变。
+        applied = self.service.apply_proposal(
+            proposal.proposal_id, approve=True, actor="human"
+        )
+        self.assertFalse(applied.ok)
+        self.assertEqual(applied.status, "cancelled")
+        self.assertEqual(self.store.read_page(page.page_id).body, "旧内容\n")
+        self.assertEqual(self.revision_count(), 1)
+
+    def test_cancel_non_pending_or_missing_rejected(self):
+        page = self.create_page()
+        proposal = self.create_update_proposal(
+            page, self.full_document(page, "新内容\n")
+        )
+        self.service.apply_proposal(
+            proposal.proposal_id, approve=False, actor="human"
+        )
+        decision = self.service.cancel_proposal(proposal.proposal_id, actor="human")
+        self.assertFalse(decision.ok)
+        self.assertEqual(decision.status, "rejected")
+        with self.assertRaises(ProposalNotFoundError):
+            self.service.cancel_proposal("missing", actor="human")
 
 
 class TestApplyProposal(WikiProposalTestBase):

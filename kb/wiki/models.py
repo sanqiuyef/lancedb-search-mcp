@@ -44,17 +44,16 @@ class PageStatus(StrEnum):
 
 
 class EntityStatus(StrEnum):
-    PROPOSED = "proposed"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-    ARCHIVED = "archived"
+    ACTIVE = "active"
+    MERGED = "merged"
+    DEPRECATED = "deprecated"
 
 
 class RelationStatus(StrEnum):
     PROPOSED = "proposed"
-    ACCEPTED = "accepted"
+    VERIFIED = "verified"
     REJECTED = "rejected"
-    ARCHIVED = "archived"
+    DEPRECATED = "deprecated"
 
 
 class AliasType(StrEnum):
@@ -83,6 +82,7 @@ class ProposalStatus(StrEnum):
     STALE = "stale"
     APPROVED = "approved"
     APPLIED = "applied"
+    CANCELLED = "cancelled"
 
 
 class JobStatus(StrEnum):
@@ -172,10 +172,11 @@ class EntityRecord(WikiRecord):
     entity_type: str = ""
     description: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    status: EntityStatus = EntityStatus.PROPOSED
+    status: EntityStatus = EntityStatus.ACTIVE
     created_by: str = ""
     created_at: str
     updated_at: str
+    merged_into_entity_id: str | None = None
 
 
 class EntityAliasRecord(WikiRecord):

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """``relations`` 表读写、谓词白名单与实体邻域 BFS。
 
-关系身份按 ``(subject_entity_id, predicate, object_entity_id)`` 去重：Phase 1
-schema 未声明相应 UNIQUE 约束，因此这里在插入前显式查询，冲突时返回已有记录。
+关系身份由 ``UNIQUE (subject_entity_id, predicate, object_entity_id)`` 保证；
+插入冲突时返回已有记录。状态默认 proposed，verified 只用于显式校验之后。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ PREDICATES = (
 )
 
 RELATION_STATUSES = C.RELATION_STATUSES
-_ACTIVE_STATUSES = ("proposed", "accepted")
+_ACTIVE_STATUSES = ("proposed", "verified")
 
 
 def utc_now() -> str:
@@ -77,13 +77,26 @@ def find_relation(
 def insert_relation(
     conn: sqlite3.Connection, record: RelationRecord
 ) -> RelationRecord:
+    """插入关系；subject/predicate/object 已存在时返回已有记录。"""
     data = record.model_dump(mode="json")
     columns = list(RelationRecord.model_fields)
-    conn.execute(
+    cursor = conn.execute(
         f"INSERT INTO relations ({', '.join(columns)}) "
-        f"VALUES ({', '.join('?' for _ in columns)})",
+        f"VALUES ({', '.join('?' for _ in columns)}) "
+        "ON CONFLICT (subject_entity_id, predicate, object_entity_id) "
+        "DO NOTHING",
         tuple(data[column] for column in columns),
     )
+    if cursor.rowcount == 0:
+        existing = find_relation(
+            conn,
+            record.subject_entity_id,
+            record.predicate,
+            record.object_entity_id,
+        )
+        if existing is None:  # pragma: no cover - 冲突行必然可查回
+            raise sqlite3.IntegrityError("关系插入冲突但未找到已有记录")
+        return existing
     return record
 
 
@@ -106,12 +119,6 @@ def create_relation(
         raise ValueError("关系不能指向自身（自环）")
     if status not in RELATION_STATUSES:
         raise ValueError(f"未知 relation status: {status!r}")
-
-    existing = find_relation(
-        conn, subject_entity_id, predicate, object_entity_id
-    )
-    if existing is not None:
-        return existing
 
     now = utc_now()
     record = RelationRecord(
@@ -235,7 +242,7 @@ def get_related(
 ) -> list[RelatedEntity]:
     """从页面关联实体或指定实体出发，BFS 返回 1-2 跳邻域实体。
 
-    只沿 proposed/accepted 的关系扩展；archived/rejected 实体不进入结果。
+    只沿 proposed/verified 的关系扩展；merged/deprecated 实体不进入结果。
     """
     if page_id is None and entity_id is None:
         raise ValueError("page_id 与 entity_id 至少提供一个")
@@ -279,7 +286,7 @@ def get_related(
                 continue
 
             neighbour = entities_repo.get_entity(conn, neighbour_id)
-            if neighbour is None or neighbour.status in ("rejected", "archived"):
+            if neighbour is None or str(neighbour.status) != "active":
                 continue
             visited.add(neighbour_id)
             next_frontier.append(neighbour_id)

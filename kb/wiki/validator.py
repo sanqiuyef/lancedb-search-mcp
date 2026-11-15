@@ -7,7 +7,8 @@
 - 当前 revision 的 content_sha256 与磁盘文件 hash；
 - 断链（page_links.target_page_id IS NULL）；
 - fact claim 缺证据（只读 claims / claim_evidence）；
-- relation 自环与谓词白名单；
+- entity 合并目标缺失与合并链成环；
+- relation 自环、状态合法性与谓词白名单；
 - documents.status='missing' 的来源；
 - 页面文件缺失与页面目录中的孤儿 Markdown。
 """
@@ -19,6 +20,7 @@ import os
 import sqlite3
 from typing import Any
 
+from . import constants as C
 from .config import WikiConfig, WikiPathError, ensure_within
 from .link_index import broken_links
 from .markdown import (
@@ -258,11 +260,79 @@ def _check_documents(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return issues
 
 
+def _check_entities(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT entity_id, status, merged_into_entity_id FROM entities "
+        "ORDER BY entity_id ASC"
+    ).fetchall()
+    known = {row["entity_id"] for row in rows}
+    merge_targets = {
+        row["entity_id"]: row["merged_into_entity_id"] for row in rows
+    }
+    reported_cycles: set[frozenset[str]] = set()
+    for row in rows:
+        entity_id = row["entity_id"]
+        status = row["status"]
+        target = row["merged_into_entity_id"]
+        if status == "merged" and not target:
+            issues.append(
+                _issue(
+                    "error",
+                    "entity_merged_without_target",
+                    f"merged 实体 {entity_id} 缺少 merged_into_entity_id",
+                )
+            )
+            continue
+        if not target:
+            continue
+        if target not in known:
+            issues.append(
+                _issue(
+                    "error",
+                    "entity_merge_target_missing",
+                    f"实体 {entity_id} 的合并目标 {target} 不存在",
+                )
+            )
+            continue
+        if status != "merged":
+            issues.append(
+                _issue(
+                    "error",
+                    "entity_merge_status_mismatch",
+                    f"实体 {entity_id} 有合并目标 {target} 但 status={status}",
+                )
+            )
+        chain = [entity_id]
+        cursor = target
+        while True:
+            if cursor in chain:
+                start = chain.index(cursor)
+                members = frozenset(chain[start:])
+                if members not in reported_cycles:
+                    reported_cycles.add(members)
+                    loop = chain[start:] + [cursor]
+                    issues.append(
+                        _issue(
+                            "error",
+                            "entity_merge_cycle",
+                            "实体合并链存在环: " + " -> ".join(loop),
+                        )
+                    )
+                break
+            chain.append(cursor)
+            next_target = merge_targets.get(cursor)
+            if not next_target:
+                break
+            cursor = next_target
+    return issues
+
+
 def _check_relations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     rows = conn.execute(
-        "SELECT relation_id, subject_entity_id, predicate, object_entity_id "
-        "FROM relations ORDER BY relation_id ASC"
+        "SELECT relation_id, subject_entity_id, predicate, object_entity_id, "
+        "status FROM relations ORDER BY relation_id ASC"
     ).fetchall()
     for row in rows:
         if row["subject_entity_id"] == row["object_entity_id"]:
@@ -273,6 +343,15 @@ def _check_relations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                     f"relation {row['relation_id']} 是自环: "
                     f"{row['subject_entity_id']} -{row['predicate']}-> "
                     f"{row['object_entity_id']}",
+                )
+            )
+        if row["status"] not in C.RELATION_STATUSES:
+            issues.append(
+                _issue(
+                    "error",
+                    "relation_invalid_status",
+                    f"relation {row['relation_id']} 状态非法: "
+                    f"{row['status']!r}",
                 )
             )
         if row["predicate"] not in PREDICATES:
@@ -325,6 +404,7 @@ def validate(
     issues.extend(_check_links(conn))
     issues.extend(_check_claims(conn, config))
     issues.extend(_check_documents(conn))
+    issues.extend(_check_entities(conn))
     issues.extend(_check_relations(conn))
     issues.extend(_check_orphans(config, known_paths))
     issues.sort(
