@@ -186,9 +186,12 @@ def get_knowledge_status() -> str:
 
 @mcp.tool(
     name="add_documents",
-    description="扫描指定目录，将文档（.md/.pdf/.docx/.txt 等）向量化后存入知识库。"
-                "PDF 自动走本地 MinerU 转换（公式 → LaTeX），可用 export_markdown_dir "
-                "把转换出的 Markdown（含图片）同步导出留档。",
+    description="扫描 vault 内目录并增量入库。source 一律为 vault 相对路径；"
+                "PDF/Word/PPT/Excel 会先转成 Markdown 落到 vault（PDF 走 MinerU，"
+                "Office 走 docling → markitdown），再按转换后的 md 切片。"
+                "vault 外目录会被拒绝，外部文件请用 add_single_document。"
+                "reindex_all 只在扫描目录等于 vault 根且扫描到可入库文件时清库重建。"
+                "export_markdown_dir 仅作额外导出，不改变 source。",
 )
 def add_documents(
     scan_dir: Annotated[str, "要扫描的目录路径"],
@@ -203,10 +206,11 @@ def add_documents(
 @mcp.tool(
     name="add_single_document",
     description="向量化单个文档到知识库（一次只处理一个文件，避免大批量超时）。"
-                "支持 .md/.pdf/.docx/.txt 等格式；PDF 自动走本地 MinerU 转 Markdown"
-                "（公式 → LaTeX），可用 export_markdown_dir 导出留档。"
-                "不传 scan_dir 时 source 为文件名；若库中已有同名 source 会报错而不会覆盖，"
-                "请传 scan_dir（按相对路径入库）或改用 update_document。",
+                "外部文件会先转成 Markdown 落到 vault（PDF 走 MinerU，"
+                "docx/pptx/xlsx 走 docling → markitdown，.doc 需另存为 .docx），"
+                "再以 vault 相对路径作为 source 入库。"
+                "scan_dir 仅为旧调用兼容保留，不参与 source 计算；"
+                "export_markdown_dir 仅作额外导出，不改变 source。",
 )
 def add_single_document(
     filepath: Annotated[str, "文件路径"],
@@ -220,9 +224,10 @@ def add_single_document(
 
 @mcp.tool(
     name="update_document",
-    description="更新知识库中的文档：按完整文件路径确定唯一已有 source，先成功写入新行"
-                "再清理旧行（写入失败不会删除旧数据）。同名文件匹配到多个 source 且路径"
-                "后缀无法唯一判定时返回错误并列出候选，不执行任何写入或删除。",
+    description="更新知识库中的文档：二进制或 vault 外文件先转换为 vault Markdown 再"
+                "幂等替换（PDF 走 MinerU，Office 走 docling → markitdown）。vault 内"
+                "文本按完整路径匹配唯一 source（新来源取 vault 相对路径），先成功写入"
+                "新行再清理旧行；同名 source 无法唯一判定时返回错误，不写入也不删除。",
 )
 def update_document(
     filepath: Annotated[str, "文件路径"],

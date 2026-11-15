@@ -384,22 +384,37 @@ class TestSourceResolutionBehavior(unittest.TestCase):
         update.assert_not_called()
         add.assert_called_once_with(path, scan_dir=self.handler._watch_root_path)
 
-    def test_new_root_level_file_is_skipped_as_legacy_basename(self):
+    def test_new_root_level_vault_file_is_added(self):
         path = os.path.join(self.dir, "new.md")
         _write(path)
         _patch_resolver(self, lambda p: ("", ""))
-        with mock.patch.object(
+        with mock.patch.dict(
+            os.environ, {"LANCEDB_VAULT_ROOT": self.dir}
+        ), mock.patch.object(
             kb_watcher.kb_ingest, "update_document", return_value="ok"
         ) as update, mock.patch.object(
             kb_watcher.kb_ingest, "add_single_document", return_value="ok"
         ) as add:
             self.handler.on_created(_file_event(src_path=path))
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                self.handler.flush_pending()
-        add.assert_not_called()
+            self.handler.flush_pending()
+        add.assert_called_once_with(path, scan_dir=self.handler._watch_root_path)
         update.assert_not_called()
-        self.assertIn("legacy basename source", stderr.getvalue())
+
+    def test_top_level_vault_source_is_updated_not_skipped(self):
+        path = os.path.join(self.dir, "top.md")
+        _write(path)
+        _patch_resolver(self, lambda p: ("top.md", ""))
+        with mock.patch.dict(
+            os.environ, {"LANCEDB_VAULT_ROOT": self.dir}
+        ), mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
+            self.handler.on_modified(_file_event(src_path=path))
+            self.handler.flush_pending()
+        update.assert_called_once_with(path, source="top.md")
+        add.assert_not_called()
 
     def test_relative_delete_uses_exact_source_not_glob(self):
         path = os.path.join(self.dir, "notes", "gone.md")

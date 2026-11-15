@@ -43,9 +43,29 @@ IMAGE_SCAN_DIR_DEFAULT = os.environ.get(
 DEFAULT_DB_PATH = r"D:\cherry-workplace\knowledge-hub\lancedb"  # 全局知识库内的向量库子目录
 TABLE_NAME = "my_docs"
 
+# ── Obsidian vault：所有向量化数据的唯一来源（2026-11-15 起） ──
+# vault 根按调用时环境变量解析，不在 import 时固化（测试会临时改写环境变量）：
+# LANCEDB_VAULT_ROOT > WIKI_VAULT_PATH > DEFAULT_VAULT_ROOT。
+DEFAULT_VAULT_ROOT = r"D:\cherry-workplace\knowledge-hub\vault"
+VAULT_CONVERT_DIR = "raw-素材/converted-转换"
+
+
+def resolve_vault_root() -> str:
+    """解析 vault 根：LANCEDB_VAULT_ROOT > WIKI_VAULT_PATH > 默认路径。"""
+    for name in ("LANCEDB_VAULT_ROOT", "WIKI_VAULT_PATH"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return DEFAULT_VAULT_ROOT
+
+
+# 函数式别名：调用方写 cfg.VAULT_ROOT() / cfg.vault_root() 均可在运行时拿到最新路径。
+VAULT_ROOT = resolve_vault_root
+vault_root = resolve_vault_root
+
 # ── 文档扫描 ──
-EXTENSIONS = {".md", ".txt", ".docx", ".pdf", ".py", ".js", ".ts", ".json",
-              ".yaml", ".yml", ".toml", ".html", ".htm"}
+EXTENSIONS = {".md", ".txt", ".docx", ".pptx", ".xlsx", ".pdf", ".py", ".js",
+              ".ts", ".json", ".yaml", ".yml", ".toml", ".html", ".htm"}
 EXCLUDE_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "truncated-results"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 

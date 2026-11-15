@@ -4,8 +4,10 @@
 import fnmatch
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -13,8 +15,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from kb import config as cfg  # noqa: E402
 from kb import ingest as kb_ingest  # noqa: E402
+from kb import pdf_convert as kb_pdf_convert  # noqa: E402
 from kb import schema as kb_schema  # noqa: E402
+from kb import vault_source  # noqa: E402
 from tests.kb_test_support import activate_fake_embedding, temp_db_env  # noqa: E402
+from tests.test_vault_source import (  # noqa: E402
+    fake_convert_pdf,
+    fake_convert_pdf_with_markdown,
+)
 
 
 class TestPreSplit(unittest.TestCase):
@@ -115,7 +123,8 @@ class IngestDbTestBase(unittest.TestCase):
     def setUp(self):
         activate_fake_embedding()
         cfg.FTS_BASE_TOKENIZER = "simple"  # 测试环境不依赖 jieba 词典
-        self.db_path = temp_db_env()
+        self.db_path = temp_db_env(self)
+        self.vault = os.path.join(self.db_path, "vault")
         self.tmpdir = tempfile.mkdtemp(prefix="kb_ingest_docs_")
         self.addCleanup(shutil.rmtree, self.tmpdir, True)
 
@@ -126,21 +135,47 @@ class IngestDbTestBase(unittest.TestCase):
             f.write(content)
         return path
 
+    def write_vault_doc(self, relpath: str, content: str) -> str:
+        path = os.path.join(self.vault, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def write_vault_binary(self, relpath: str, content: bytes = b"%PDF-1.4 fake") -> str:
+        path = os.path.join(self.vault, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
 
 class TestAddSingleDocumentIdentity(IngestDbTestBase):
-    def test_add_same_path_without_scan_dir_refuses_overwrite(self):
+    def test_add_same_path_is_idempotent_vault_copy(self):
         path = self.write_doc("doc.txt", "幂等入库测试内容。" * 20)
         first = kb_ingest.add_single_document(path)
         self.assertNotIn("[ERROR]", first)
+        expected = os.path.normpath(
+            "raw-素材/converted-转换/doc-"
+            f"{vault_source._path_digest(path)}.md")
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected},
+        )
         count = kb_schema.row_count()
         self.assertGreater(count, 0)
 
         second = kb_ingest.add_single_document(path)
-        self.assertIn("[ERROR]", second)
-        self.assertIn("scan_dir", second)
+        self.assertNotIn("[ERROR]", second)
+        self.assertIn("新增记录: 0", second)
+        self.assertIn("替换旧记录: 0", second)
         self.assertEqual(kb_schema.row_count(), count)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected},
+        )
 
-    def test_same_basename_in_two_dirs_refused_without_scan_dir(self):
+    def test_same_basename_in_two_dirs_get_distinct_vault_copies(self):
         first = self.write_doc(os.path.join("dir1", "report.md"),
                                "第一份报告。" * 20)
         second = self.write_doc(os.path.join("dir2", "report.md"),
@@ -148,28 +183,41 @@ class TestAddSingleDocumentIdentity(IngestDbTestBase):
         self.assertNotIn("[ERROR]", kb_ingest.add_single_document(first))
 
         result = kb_ingest.add_single_document(second)
-        self.assertIn("[ERROR]", result)
-        self.assertIn("update_document", result)
+        self.assertNotIn("[ERROR]", result)
 
-        table = kb_schema.get_or_create_table()
-        self.assertEqual(kb_schema.existing_sources(table), {"report.md"})
-        texts = table.to_lance().to_table(
-            columns=["text"]).column("text").to_pylist()
-        self.assertTrue(any("第一份报告" in text for text in texts))
-        self.assertFalse(any("第二份报告" in text for text in texts))
+        fresh = kb_schema.get_or_create_table()
+        sources = kb_schema.existing_sources(fresh)
+        self.assertEqual(len(sources), 2)
+        first_source = os.path.normpath(
+            "raw-素材/converted-转换/report-"
+            f"{vault_source._path_digest(first)}.md")
+        second_source = os.path.normpath(
+            "raw-素材/converted-转换/report-"
+            f"{vault_source._path_digest(second)}.md")
+        self.assertEqual(sources, {first_source, second_source})
 
-    def test_scan_dir_source_stays_stable(self):
+        arrow = fresh.to_lance().to_table(columns=["source", "text"])
+        by_source: dict[str, list[str]] = {}
+        for src, text in zip(arrow.column("source").to_pylist(),
+                             arrow.column("text").to_pylist()):
+            by_source.setdefault(src, []).append(text)
+        self.assertTrue(any("第一份报告" in text
+                            for text in by_source[first_source]))
+        self.assertTrue(any("第二份报告" in text
+                            for text in by_source[second_source]))
+
+    def test_scan_dir_does_not_change_vault_source(self):
         path = self.write_doc(os.path.join("sub", "nested.txt"),
                               "相对路径来源测试。" * 16)
-        expected = os.path.relpath(path, self.tmpdir)
+        expected = os.path.normpath(
+            "raw-素材/converted-转换/nested-"
+            f"{vault_source._path_digest(path)}.md")
         kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
-        self.assertEqual(
-            kb_schema.existing_sources(kb_schema.get_or_create_table()),
-            {expected},
-        )
+        sources = kb_schema.existing_sources(kb_schema.get_or_create_table())
+        self.assertEqual(sources, {expected})
+        self.assertNotIn(os.path.normpath("sub/nested.txt"), sources)
         count = kb_schema.row_count()
 
-        # 相对 source 的重复入库保持幂等：内容未变的块复用旧行，不重复写。
         second = kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
         self.assertNotIn("[ERROR]", second)
         self.assertIn("新增记录: 0", second)
@@ -180,30 +228,27 @@ class TestAddSingleDocumentIdentity(IngestDbTestBase):
             {expected},
         )
 
-    def test_same_basename_at_scan_dir_root_refused(self):
-        path = self.write_doc("rootreport.txt", "scan_dir 根目录新内容。" * 20)
-        table = kb_schema.get_or_create_table()
-        kb_ingest.add_chunks(table, [{
-            "text": "旧 legacy 根目录内容。" * 20,
-            "source": "rootreport.txt",
-            "chunk_index": 0,
-            "doc_id": "legacy-root",
-        }])
-        before = kb_schema.row_count()
+    def test_vault_root_file_is_idempotent_even_if_source_has_no_separator(self):
+        path = self.write_vault_doc("rootreport.txt", "vault 根目录内容。" * 20)
+        first = kb_ingest.add_single_document(path)
+        self.assertNotIn("[ERROR]", first)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {"rootreport.txt"},
+        )
+        count = kb_schema.row_count()
 
-        # 文件直接位于 scan_dir 根目录，最终 source 仍是 basename；
-        # 即使传了 scan_dir 也必须拒绝覆盖已有同名来源。
-        result = kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
+        second = kb_ingest.add_single_document(path)
+        self.assertNotIn("[ERROR]", second)
+        self.assertIn("新增记录: 0", second)
+        self.assertIn("替换旧记录: 0", second)
+        self.assertEqual(kb_schema.row_count(), count)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {"rootreport.txt"},
+        )
 
-        self.assertIn("[ERROR]", result)
-        self.assertIn("已存在", result)
-        self.assertEqual(kb_schema.row_count(), before)
-        texts = kb_schema.get_or_create_table().to_lance().to_table(
-            columns=["text"]).column("text").to_pylist()
-        self.assertTrue(any("旧 legacy 根目录内容" in text for text in texts))
-        self.assertFalse(any("scan_dir 根目录新内容" in text for text in texts))
-
-    def test_relative_source_writes_new_source_without_touching_legacy(self):
+    def test_external_source_does_not_touch_legacy_basename_source(self):
         path = self.write_doc(os.path.join("sub", "report.txt"),
                               "子目录新内容。" * 20)
         table = kb_schema.get_or_create_table()
@@ -219,8 +264,11 @@ class TestAddSingleDocumentIdentity(IngestDbTestBase):
 
         fresh = kb_schema.get_or_create_table()
         sources = kb_schema.existing_sources(fresh)
+        copied_source = os.path.normpath(
+            "raw-素材/converted-转换/report-"
+            f"{vault_source._path_digest(path)}.md")
         self.assertIn("report.txt", sources)
-        self.assertIn(os.path.join("sub", "report.txt"), sources)
+        self.assertIn(copied_source, sources)
         arrow = fresh.to_lance().to_table(columns=["source", "text"])
         by_source: dict[str, list[str]] = {}
         for src, text in zip(arrow.column("source").to_pylist(),
@@ -228,14 +276,15 @@ class TestAddSingleDocumentIdentity(IngestDbTestBase):
             by_source.setdefault(src, []).append(text)
         self.assertTrue(any("旧 legacy 内容" in t for t in by_source["report.txt"]))
         self.assertTrue(any(
-            "子目录新内容" in t for t in by_source[os.path.join("sub", "report.txt")]
+            "子目录新内容" in t
+            for t in by_source[copied_source]
         ))
 
 
 class TestUpdateDocumentSource(IngestDbTestBase):
     def test_update_preserves_original_source(self):
-        path = self.write_doc(os.path.join("notes", "alpha.txt"),
-                              "更新后的内容。" * 20)
+        path = self.write_vault_doc(os.path.join("notes", "alpha.txt"),
+                                    "更新后的内容。" * 20)
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [{
             "text": "旧版本文档内容。" * 20,
@@ -263,8 +312,8 @@ class TestUpdateDocumentSource(IngestDbTestBase):
             {"text": "B 目录旧内容。" * 20, "source": "b/report.md",
              "chunk_index": 0},
         ])
-        path = self.write_doc(os.path.join("b", "report.md"),
-                              "B 目录新内容。" * 20)
+        path = self.write_vault_doc(os.path.join("b", "report.md"),
+                                    "B 目录新内容。" * 20)
 
         result = kb_ingest.update_document(path)
         self.assertNotIn("[ERROR]", result)
@@ -290,8 +339,8 @@ class TestUpdateDocumentSource(IngestDbTestBase):
              "chunk_index": 0},
         ])
         before = kb_schema.row_count()
-        path = self.write_doc(os.path.join("other", "report.md"),
-                              "无法消歧的新内容。" * 20)
+        path = self.write_vault_doc(os.path.join("other", "report.md"),
+                                    "无法消歧的新内容。" * 20)
 
         result = kb_ingest.update_document(path)
         self.assertIn("[ERROR]", result)
@@ -307,8 +356,8 @@ class TestUpdateDocumentSource(IngestDbTestBase):
 
 class TestUpdateDocumentExplicitSource(IngestDbTestBase):
     def test_explicit_relative_source_updates_it_and_keeps_legacy(self):
-        path = self.write_doc(os.path.join("notes", "note.md"),
-                              "新的相对来源内容。" * 20)
+        path = self.write_vault_doc(os.path.join("notes", "note.md"),
+                                    "新的相对来源内容。" * 20)
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [
             {"text": "旧 legacy 内容。" * 20, "source": "note.md",
@@ -332,8 +381,8 @@ class TestUpdateDocumentExplicitSource(IngestDbTestBase):
         self.assertTrue(any("新的相对来源内容" in t for t in by_source["notes/note.md"]))
 
     def test_explicit_legacy_source_is_refused(self):
-        path = self.write_doc(os.path.join("notes", "note.md"),
-                              "不应写入的内容。" * 20)
+        path = self.write_vault_doc(os.path.join("notes", "note.md"),
+                                    "不应写入的内容。" * 20)
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [{
             "text": "旧 legacy 内容。" * 20, "source": "note.md",
@@ -347,9 +396,57 @@ class TestUpdateDocumentExplicitSource(IngestDbTestBase):
         self.assertIn("legacy basename source", result)
         self.assertEqual(kb_schema.row_count(), before)
 
+    def test_explicit_source_reuses_equivalent_db_string(self):
+        path = self.write_vault_doc(os.path.join("notes", "note.md"),
+                                    "分隔符归一后的新内容。" * 20)
+        db_source = os.path.normpath("notes/note.md")
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "旧内容必须被替换。" * 20,
+            "source": db_source,
+            "chunk_index": 0,
+            "doc_id": "old-note",
+        }])
+
+        result = kb_ingest.update_document(
+            path, source="notes/note.md")
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {db_source},
+        )
+        texts = kb_schema.get_or_create_table().to_lance().to_table(
+            columns=["text"]).column("text").to_pylist()
+        self.assertTrue(any("分隔符归一后的新内容" in t for t in texts))
+        self.assertFalse(any("旧内容必须被替换" in t for t in texts))
+
+    def test_explicit_top_level_vault_source_is_allowed(self):
+        path = self.write_vault_doc("root-note.md", "顶层新内容。" * 20)
+        source = "root-note.md"
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "顶层旧内容。" * 20,
+            "source": source,
+            "chunk_index": 0,
+            "doc_id": "old-root",
+        }])
+
+        result = kb_ingest.update_document(path, source=source)
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {source},
+        )
+        texts = kb_schema.get_or_create_table().to_lance().to_table(
+            columns=["text"]).column("text").to_pylist()
+        self.assertTrue(any("顶层新内容" in t for t in texts))
+        self.assertFalse(any("顶层旧内容" in t for t in texts))
+
     def test_explicit_source_must_be_path_suffix(self):
-        path = self.write_doc(os.path.join("notes", "note.md"),
-                              "不应写入的内容。" * 20)
+        path = self.write_vault_doc(os.path.join("notes", "note.md"),
+                                    "不应写入的内容。" * 20)
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [{
             "text": "其他来源旧内容。" * 20, "source": "other/note.md",
@@ -365,11 +462,11 @@ class TestUpdateDocumentExplicitSource(IngestDbTestBase):
 
 class TestWriteThenCleanup(IngestDbTestBase):
     def test_stale_doc_ids_removed_and_all_new_ids_kept(self):
-        path = self.write_doc(
+        path = self.write_vault_doc(
             os.path.join("notes", "report.txt"),
             ("甲" * 500) + "\n\n" + ("乙" * 500),
         )
-        source = os.path.relpath(path, self.tmpdir)
+        source = "notes/report.txt"
         text, is_md = kb_ingest.extract_content(path)
         chunks = kb_ingest.chunk_text(text, source, is_md)
         self.assertEqual(len(chunks), 2)
@@ -389,7 +486,7 @@ class TestWriteThenCleanup(IngestDbTestBase):
         ])
         self.assertEqual(kb_schema.row_count(), 3)
 
-        result = kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
+        result = kb_ingest.add_single_document(path)
         self.assertNotIn("[ERROR]", result)
         self.assertIn("替换旧记录: 2", result)
 
@@ -403,9 +500,9 @@ class TestWriteThenCleanup(IngestDbTestBase):
 
 class TestWriteFailureKeepsOldRows(IngestDbTestBase):
     def test_add_single_failure_keeps_old_rows(self):
-        path = self.write_doc(os.path.join("notes", "alpha.txt"),
-                              "待写入的新内容。" * 20)
-        source = os.path.relpath(path, self.tmpdir)
+        path = self.write_vault_doc(os.path.join("notes", "alpha.txt"),
+                                    "待写入的新内容。" * 20)
+        source = "notes/alpha.txt"
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [{
             "text": "必须保留的旧内容。" * 20,
@@ -417,7 +514,7 @@ class TestWriteFailureKeepsOldRows(IngestDbTestBase):
 
         with mock.patch.object(kb_ingest, "add_chunks",
                                side_effect=RuntimeError("injected failure")):
-            result = kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
+            result = kb_ingest.add_single_document(path)
 
         self.assertIn("[ERROR]", result)
         self.assertIn("injected failure", result)
@@ -427,9 +524,9 @@ class TestWriteFailureKeepsOldRows(IngestDbTestBase):
         self.assertTrue(any("必须保留的旧内容" in t for t in texts))
 
     def test_update_failure_keeps_old_rows(self):
-        path = self.write_doc(os.path.join("notes", "beta.txt"),
-                              "待更新的新内容。" * 20)
-        source = os.path.relpath(path, self.tmpdir)
+        path = self.write_vault_doc(os.path.join("notes", "beta.txt"),
+                                    "待更新的新内容。" * 20)
+        source = "notes/beta.txt"
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [{
             "text": "必须保留的旧内容。" * 20,
@@ -663,6 +760,18 @@ class TestResolveWritableSource(IngestDbTestBase):
             ("", ""),
         )
 
+    def test_top_level_vault_file_with_basename_source_is_writable(self):
+        path = self.write_vault_doc("top.md", "顶层文件内容。" * 20)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "top", "source": "top.md", "chunk_index": 0},
+        ])
+
+        self.assertEqual(
+            kb_ingest.resolve_writable_source(path),
+            ("top.md", ""),
+        )
+
     def test_multiple_path_suffix_matches_are_ambiguous(self):
         table = kb_schema.get_or_create_table()
         kb_ingest.add_chunks(table, [
@@ -694,6 +803,299 @@ class TestAddChunksBatchDedupe(IngestDbTestBase):
         self.assertEqual(texts, ["keep", "keep2"])
 
 
+class TestVaultSourceIngest(IngestDbTestBase):
+    def test_add_single_external_pdf_uses_vault_markdown_source(self):
+        pdf = self.write_doc("paper.pdf", "%PDF-1.4 fake")
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            result = kb_ingest.add_single_document(pdf)
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertIn("原始文件:", result)
+        self.assertIn("转换后 md:", result)
+        expected = os.path.normpath("raw-素材/converted-转换/paper.md")
+        fresh = kb_schema.get_or_create_table()
+        self.assertEqual(kb_schema.existing_sources(fresh), {expected})
+        self.assertNotIn(".pdf", expected.lower())
+        sources = fresh.to_lance().to_table(
+            columns=["source"]).column("source").to_pylist()
+        self.assertTrue(all(src == expected for src in sources))
+
+    def test_export_markdown_dir_is_extra_copy_only(self):
+        pdf = self.write_doc("extra.pdf", "%PDF-1.4 fake")
+        export_dir = os.path.join(self.tmpdir, "export")
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            result = kb_ingest.add_single_document(
+                pdf, export_markdown_dir=export_dir)
+
+        self.assertNotIn("[ERROR]", result)
+        expected = os.path.normpath("raw-素材/converted-转换/extra.md")
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected},
+        )
+        self.assertTrue(os.path.isfile(os.path.join(export_dir, "extra.md")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(export_dir, "extra_images", "img-001.png")))
+
+    def test_update_document_pdf_goes_through_conversion(self):
+        pdf = self.write_doc("update.pdf", "%PDF-1.4 fake")
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            result = kb_ingest.update_document(pdf)
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertIn("文档已入库", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {os.path.normpath("raw-素材/converted-转换/update.md")},
+        )
+
+    def test_add_documents_rejects_directory_outside_vault(self):
+        self.write_doc("outside.md", "库外目录。" * 20)
+        result = kb_ingest.add_documents(self.tmpdir)
+
+        self.assertIn("[ERROR]", result)
+        self.assertIn("只接受 vault 内目录", result)
+        self.assertIn("add_single_document", result)
+        self.assertEqual(kb_schema.row_count(), 0)
+
+    def test_add_documents_scans_vault_relative_sources(self):
+        self.write_vault_doc(os.path.join("sub", "a.md"),
+                             "库内目录内容。" * 40)
+        result = kb_ingest.add_documents(os.path.join(self.vault, "sub"))
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {os.path.normpath("sub/a.md")},
+        )
+
+    def test_add_documents_converts_binary_and_skips_generated_md(self):
+        self.write_vault_binary(os.path.join("inbox", "paper.pdf"))
+        target = mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf)
+
+        with target as converter:
+            first = kb_ingest.add_documents(self.vault)
+            self.assertNotIn("[ERROR]", first)
+            self.assertEqual(converter.call_count, 1)
+
+            expected = os.path.normpath("raw-素材/converted-转换/paper.md")
+            fresh = kb_schema.get_or_create_table()
+            self.assertEqual(kb_schema.existing_sources(fresh), {expected})
+            count = kb_schema.row_count()
+            self.assertGreater(count, 0)
+
+            # reindex_all 会清库，但已有生成的 md 仍在扫描范围内；
+            # 本次转换后必须跳过该 md，不能产生重复切片。
+            second = kb_ingest.add_documents(self.vault, reindex_all=True)
+
+        self.assertNotIn("[ERROR]", second)
+        fresh = kb_schema.get_or_create_table()
+        self.assertEqual(kb_schema.existing_sources(fresh), {expected})
+        arrow = fresh.to_lance().to_table(columns=["doc_id", "source"])
+        ids = arrow.column("doc_id").to_pylist()
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(ids), count)
+        self.assertTrue(all(src == expected
+                            for src in arrow.column("source").to_pylist()))
+
+    def test_reindex_all_outside_vault_root_is_refused(self):
+        self.write_vault_doc(os.path.join("sub", "a.md"), "已有内容。" * 30)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "必须保留。" * 30, "source": "keep.md", "chunk_index": 0,
+        }])
+        before = kb_schema.row_count()
+
+        result = kb_ingest.add_documents(
+            os.path.join(self.vault, "sub"), reindex_all=True)
+
+        self.assertIn("[ERROR]", result)
+        self.assertIn("只允许扫描 vault 根目录", result)
+        self.assertEqual(kb_schema.row_count(), before)
+
+    def test_reindex_all_with_empty_scan_is_refused(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "必须保留。" * 30, "source": "keep.md", "chunk_index": 0,
+        }])
+        before = kb_schema.row_count()
+
+        result = kb_ingest.add_documents(self.vault, reindex_all=True)
+
+        self.assertIn("[ERROR]", result)
+        self.assertIn("没有任何可入库文件", result)
+        self.assertEqual(kb_schema.row_count(), before)
+
+    def test_reindex_all_text_only_replaces_database(self):
+        self.write_vault_doc("a.md", "# 标题\n\n新内容。" * 40)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "旧库内容。" * 30, "source": "keep.md", "chunk_index": 0,
+        }])
+
+        result = kb_ingest.add_documents(self.vault, reindex_all=True)
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertIn("文档添加完成", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {"a.md"},
+        )
+
+    def test_reindex_all_with_unreadable_text_is_refused_before_drop(self):
+        self.write_vault_doc("short.md", "太短")
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "必须保留。" * 30, "source": "keep.md", "chunk_index": 0,
+        }])
+        before = kb_schema.row_count()
+
+        result = kb_ingest.add_documents(self.vault, reindex_all=True)
+
+        self.assertIn("没有成功入库", result)
+        self.assertEqual(kb_schema.row_count(), before)
+
+    def test_converted_pdf_replaces_old_pdf_source(self):
+        pdf = self.write_vault_binary(os.path.join("inbox", "paper.pdf"))
+        old_source = os.path.normpath("inbox/paper.pdf")
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "旧 PDF 直接切片内容。" * 20,
+            "source": old_source,
+            "chunk_index": 0,
+            "doc_id": "old-pdf",
+        }])
+
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            result = kb_ingest.add_single_document(pdf)
+
+        self.assertNotIn("[ERROR]", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {os.path.normpath("raw-素材/converted-转换/paper.md")},
+        )
+        self.assertEqual(kb_schema.row_count(), 1)
+
+    def test_add_documents_counts_conversion_failure_and_skips_old_md(self):
+        pdf = self.write_vault_binary(os.path.join("inbox", "paper.pdf"))
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            first = kb_ingest.add_documents(self.vault)
+        self.assertNotIn("[ERROR]", first)
+        expected = os.path.normpath("raw-素材/converted-转换/paper.md")
+        before = kb_schema.row_count()
+        self.assertGreater(before, 0)
+
+        future = time.time() + 30
+        os.utime(pdf, (future, future))
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf",
+            side_effect=RuntimeError("mineru down"),
+        ):
+            second = kb_ingest.add_documents(self.vault, reindex_all=True)
+
+        self.assertIn("没有成功入库", second)
+        self.assertIn("转换/写入失败: 1", second)
+        self.assertIn("mineru down", second)
+        self.assertNotIn("✅", second)
+        # 转换全部失败时不清库；旧 paper.md 同一次扫描中也必须跳过，
+        # 不能因为它还在磁盘上就再当普通文本写一份。
+        self.assertEqual(kb_schema.row_count(), before)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected},
+        )
+
+    def test_add_documents_reindexes_regenerated_binary(self):
+        pdf = self.write_vault_binary(os.path.join("inbox", "paper.pdf"))
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            first = kb_ingest.add_documents(self.vault)
+        self.assertNotIn("[ERROR]", first)
+        expected = os.path.normpath("raw-素材/converted-转换/paper.md")
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected},
+        )
+
+        future = time.time() + 30
+        os.utime(pdf, (future, future))
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf",
+            side_effect=fake_convert_pdf_with_markdown(
+                "# paper\n\n重新生成后的正文 " + ("新内容" * 40)),
+        ):
+            second = kb_ingest.add_documents(self.vault)
+
+        self.assertNotIn("[ERROR]", second)
+        self.assertIn("文档添加完成", second)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {expected},
+        )
+        texts = kb_schema.get_or_create_table().to_lance().to_table(
+            columns=["text"]).column("text").to_pylist()
+        self.assertTrue(any("重新生成后的正文" in t for t in texts))
+        self.assertFalse(any("正文内容" in t for t in texts))
+
+    def test_converted_category_comes_from_original_path(self):
+        pdf = self.write_doc(os.path.join("docs", "manual.pdf"),
+                             "%PDF-1.4 fake")
+        with mock.patch.object(
+            kb_pdf_convert, "convert_pdf", side_effect=fake_convert_pdf
+        ):
+            result = kb_ingest.add_single_document(pdf)
+
+        self.assertNotIn("[ERROR]", result)
+        categories = kb_schema.get_or_create_table().to_lance().to_table(
+            columns=["category"]).column("category").to_pylist()
+        self.assertEqual(set(categories), {"documentation"})
+
+    def test_scan_files_skips_symlink_files_and_dirs(self):
+        outside = tempfile.mkdtemp(prefix="kb_link_target_")
+        self.addCleanup(shutil.rmtree, outside, True)
+        outside_file = os.path.join(outside, "outside.md")
+        with open(outside_file, "w", encoding="utf-8") as handle:
+            handle.write("外部内容。" * 20)
+        file_link = os.path.join(self.vault, "linked.md")
+        dir_link = os.path.join(self.vault, "linked-dir")
+        file_link_created = True
+        try:
+            os.symlink(outside_file, file_link)
+        except (OSError, NotImplementedError):
+            file_link_created = False
+        dir_link_created = True
+        try:
+            os.symlink(outside, dir_link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            # Windows 无开发者模式时退回 junction（无需管理员权限）。
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", dir_link, outside],
+                capture_output=True,
+            )
+            dir_link_created = result.returncode == 0
+        if not file_link_created and not dir_link_created:
+            self.skipTest("当前环境不允许创建符号链接或 junction")
+
+        found = kb_ingest.scan_files(self.vault)
+
+        if file_link_created:
+            self.assertNotIn(file_link, found)
+        if dir_link_created:
+            self.assertFalse(any(path.startswith(dir_link) for path in found))
+
+
 class TestGuessCategory(unittest.TestCase):
     def test_path_mapping(self):
         self.assertEqual(kb_ingest.guess_category(r"D:\work\论文\2024\a.pdf"), "paper")
@@ -720,6 +1122,16 @@ class TestExtractText(unittest.TestCase):
             path = f.name
         try:
             self.assertEqual(kb_ingest.extract_text(path), "")
+        finally:
+            os.unlink(path)
+
+    def test_md_frontmatter_is_stripped(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                         encoding="utf-8") as f:
+            f.write("---\ntitle: '笔记'\ntags: [literature]\n---\n\n正文内容。")
+            path = f.name
+        try:
+            self.assertEqual(kb_ingest.extract_text(path), "正文内容。")
         finally:
             os.unlink(path)
 

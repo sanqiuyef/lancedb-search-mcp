@@ -40,9 +40,42 @@ def activate_fake_embedding() -> None:
     kb_schema._chunk_model = None
 
 
-def temp_db_env(monkey_target=None) -> str:
-    """创建临时库路径并写入环境变量，返回路径。"""
+_TEMP_ENV_KEYS = (
+    "LANCEDB_DB_PATH",
+    "LANCEDB_VAULT_ROOT",
+    "WIKI_ENABLED",
+    "WIKI_DB_PATH",
+    "WIKI_VAULT_PATH",
+)
+
+
+def temp_db_env(testcase=None) -> str:
+    """创建临时库与临时 vault，并写入隔离环境变量，返回临时库路径。
+
+    vault 固定为 ``<临时库>/vault``，确保入库测试绝不会读写真实 Obsidian
+    vault；``WIKI_ENABLED=0`` 且 WIKI_* 路径也指向临时目录，Wiki 钩子即
+    使被误调用也不会碰真实 DB。传入 unittest.TestCase 时用 addCleanup
+    保存/恢复全部相关环境变量，避免测试之间互相污染。
+    """
     db_path = tempfile.mkdtemp(prefix="kb_test_")
+    vault_path = os.path.join(db_path, "vault")
+    os.makedirs(vault_path, exist_ok=True)
+    saved = {key: os.environ.get(key) for key in _TEMP_ENV_KEYS}
     os.environ["LANCEDB_DB_PATH"] = db_path
+    os.environ["LANCEDB_VAULT_ROOT"] = vault_path
+    os.environ["WIKI_ENABLED"] = "0"
+    os.environ["WIKI_DB_PATH"] = os.path.join(db_path, "wiki.sqlite3")
+    os.environ["WIKI_VAULT_PATH"] = vault_path
     kb_schema.reset_db()
+
+    if testcase is not None and hasattr(testcase, "addCleanup"):
+        def _restore() -> None:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            kb_schema.reset_db()
+
+        testcase.addCleanup(_restore)
     return db_path
