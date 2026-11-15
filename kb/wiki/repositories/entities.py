@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """``entities`` / ``entity_aliases`` / ``page_entities`` 表的 SQL 读写。
 
-Phase 1 的 ``entities.status`` CHECK 只允许 proposed/accepted/rejected/archived，
-没有 ``merged`` 状态列；显式合并的持久化方式见 ``entity_resolver.merge_entity``：
-source 记录保留、status 置 archived，source 上写一条 ``alias_type=redirect`` 的
-记录指向 target，target 上接收 source 的名称与别名（同样标 redirect）。
+``entities.status`` 只允许 active/merged/deprecated；显式合并由
+``entity_resolver.merge_entity`` 把 source 置为 ``merged`` 并写入
+``merged_into_entity_id``，target 接收 source 的名称与别名。
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ _UPDATE_ENTITY_FIELDS = {
     "confidence",
     "status",
     "updated_at",
+    "merged_into_entity_id",
 }
 
 
@@ -113,7 +113,7 @@ def find_entities_by_normalized(
     conn: sqlite3.Connection,
     normalized_name: str,
     entity_type: str | None = None,
-    statuses: tuple[str, ...] = ("proposed", "accepted"),
+    statuses: tuple[str, ...] = ("active",),
     limit: int = 20,
 ) -> list[EntityRecord]:
     """按规范化 canonical_name 精确匹配。"""
@@ -127,7 +127,7 @@ def find_entities_by_normalized(
         sql += f" AND status IN ({placeholders})"
         params.extend(statuses)
     sql += (
-        " ORDER BY CASE status WHEN 'accepted' THEN 0 ELSE 1 END, "
+        " ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, "
         "canonical_name ASC, entity_id ASC LIMIT ?"
     )
     params.append(limit)
@@ -138,7 +138,7 @@ def find_aliases_by_normalized(
     conn: sqlite3.Connection,
     normalized_alias: str,
     entity_type: str | None = None,
-    statuses: tuple[str, ...] = ("proposed", "accepted"),
+    statuses: tuple[str, ...] = ("active",),
     limit: int = 20,
 ) -> list[tuple[EntityRecord, EntityAliasRecord]]:
     """按规范化 alias 精确匹配，返回 (entity, alias) 列表。"""
@@ -157,7 +157,7 @@ def find_aliases_by_normalized(
         sql += f" AND e.status IN ({placeholders})"
         params.extend(statuses)
     sql += (
-        " ORDER BY CASE e.status WHEN 'accepted' THEN 0 ELSE 1 END, "
+        " ORDER BY CASE e.status WHEN 'active' THEN 0 ELSE 1 END, "
         "e.canonical_name ASC, e.entity_id ASC LIMIT ?"
     )
     params.append(limit)
@@ -223,36 +223,17 @@ def insert_alias(
     return cursor.rowcount > 0
 
 
-def set_redirect_alias(
-    conn: sqlite3.Connection,
-    entity_id: str,
-    target_entity_id: str,
-    normalized_target: str,
-    created_at: str | None = None,
-) -> None:
-    """在 source 实体上持久化 redirect 标记（alias 字段存 target entity_id）。"""
-    conn.execute(
-        "INSERT INTO entity_aliases "
-        "(entity_id, alias, normalized_alias, alias_type, created_at) "
-        "VALUES (?, ?, ?, 'redirect', ?) "
-        "ON CONFLICT (entity_id, normalized_alias) DO UPDATE SET "
-        "alias = excluded.alias, alias_type = 'redirect'",
-        (entity_id, target_entity_id, normalized_target, created_at or utc_now()),
-    )
-
-
-def get_redirect_target(
+def get_merge_target(
     conn: sqlite3.Connection, entity_id: str
 ) -> str | None:
-    """返回 source 实体 redirect 标记指向的 target entity_id。"""
+    """返回实体 ``merged_into_entity_id``；未合并或实体不存在返回 None。"""
     row = conn.execute(
-        "SELECT alias FROM entity_aliases "
-        "WHERE entity_id = ? AND alias_type = 'redirect' "
-        "AND alias IN (SELECT entity_id FROM entities) "
-        "ORDER BY created_at ASC LIMIT 1",
+        "SELECT merged_into_entity_id FROM entities WHERE entity_id = ?",
         (entity_id,),
     ).fetchone()
-    return str(row[0]) if row is not None else None
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])
 
 
 def add_page_entity(
@@ -309,12 +290,11 @@ __all__ = [
     "find_entities_by_normalized",
     "get_entity",
     "get_entity_pages",
+    "get_merge_target",
     "get_page_entities",
-    "get_redirect_target",
     "insert_alias",
     "insert_entity",
     "list_entities",
-    "set_redirect_alias",
     "update_entity",
     "utc_now",
 ]

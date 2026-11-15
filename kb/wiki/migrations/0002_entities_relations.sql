@@ -8,17 +8,20 @@ CREATE TABLE IF NOT EXISTS entities (
     description TEXT NOT NULL DEFAULT '',
     confidence REAL NOT NULL DEFAULT 0.0
         CHECK (confidence >= 0.0 AND confidence <= 1.0),
-    status TEXT NOT NULL DEFAULT 'proposed'
-        CHECK (status IN ('proposed', 'accepted', 'rejected', 'archived')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'merged', 'deprecated')),
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    merged_into_entity_id TEXT REFERENCES entities (entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_entities_normalized_name
     ON entities (normalized_name);
 CREATE INDEX IF NOT EXISTS idx_entities_entity_type ON entities (entity_type);
 CREATE INDEX IF NOT EXISTS idx_entities_status ON entities (status);
+CREATE INDEX IF NOT EXISTS idx_entities_merged_into
+    ON entities (merged_into_entity_id);
 
 CREATE TABLE IF NOT EXISTS entity_aliases (
     entity_id TEXT NOT NULL
@@ -72,7 +75,7 @@ CREATE TABLE IF NOT EXISTS relations (
     object_entity_id TEXT NOT NULL
         REFERENCES entities (entity_id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'proposed'
-        CHECK (status IN ('proposed', 'accepted', 'rejected', 'archived')),
+        CHECK (status IN ('proposed', 'verified', 'rejected', 'deprecated')),
     confidence REAL NOT NULL DEFAULT 0.0
         CHECK (confidence >= 0.0 AND confidence <= 1.0),
     source_page_id TEXT
@@ -81,7 +84,8 @@ CREATE TABLE IF NOT EXISTS relations (
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    CHECK (subject_entity_id <> object_entity_id)
+    CHECK (subject_entity_id <> object_entity_id),
+    UNIQUE (subject_entity_id, predicate, object_entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations (subject_entity_id);

@@ -5,8 +5,8 @@
 绝不写入 vault 页面目录；只有 ``apply_proposal(approve=True)`` 通过 PageStore
 更新页面。
 
-状态机：pending → rejected / stale / approved → applied；``cancelled`` 仅存在于
-服务层状态常量（Phase 1 schema 的 proposals.status CHECK 未包含该值，无法持久化）。
+状态机：pending → rejected / stale / cancelled / approved → applied；
+``cancel_proposal`` 只允许取消 pending 提案。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from . import constants as C
 from .config import WikiConfig, ensure_within
 from .db import transaction
 from .ids import new_ulid
@@ -33,15 +34,8 @@ from .page_store import (
 )
 from .repositories import proposals as proposals_repo
 
-PROPOSAL_STATES = (
-    "pending",
-    "rejected",
-    "stale",
-    "approved",
-    "applied",
-    "cancelled",
-)
-PERSISTED_PROPOSAL_STATES = ("pending", "rejected", "stale", "approved", "applied")
+PROPOSAL_STATES = C.PROPOSAL_STATUSES
+PERSISTED_PROPOSAL_STATES = C.PROPOSAL_STATUSES
 
 
 class ProposalError(RuntimeError):
@@ -234,6 +228,52 @@ class ProposalService:
         return proposals_repo.list_proposals(self.conn, status=status)
 
     # ── 审核 ──
+    def cancel_proposal(
+        self,
+        proposal_id: str,
+        *,
+        actor: str = "agent",
+        reason: str = "",
+    ) -> ProposalDecision:
+        """取消 pending 提案；不修改页面，也不删除 draft/diff。"""
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("actor 必须是非空字符串")
+        if not isinstance(reason, str):
+            raise ValueError("reason 必须是字符串")
+        record = proposals_repo.get_proposal(self.conn, proposal_id)
+        if record is None:
+            raise ProposalNotFoundError(f"提案不存在: {proposal_id}")
+        if record.status != "pending":
+            return ProposalDecision(
+                ok=False,
+                status=str(record.status),
+                message=f"提案状态为 {record.status}，只有 pending 可取消",
+                proposal=record,
+            )
+
+        payload = _payload(record)
+        if reason:
+            payload["cancel_reason"] = reason
+        reviewed_at = proposals_repo.utc_now()
+        with transaction(self.conn):
+            proposals_repo.update_proposal(
+                self.conn,
+                proposal_id,
+                status="cancelled",
+                reviewed_by=actor,
+                reviewed_at=reviewed_at,
+                payload_json=_dump_payload(payload),
+                error_message="",
+            )
+        updated = proposals_repo.get_proposal(self.conn, proposal_id)
+        assert updated is not None
+        return ProposalDecision(
+            ok=True,
+            status="cancelled",
+            message="提案已取消，页面未修改",
+            proposal=updated,
+        )
+
     def apply_proposal(
         self,
         proposal_id: str,

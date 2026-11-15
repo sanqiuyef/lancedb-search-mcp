@@ -5,14 +5,11 @@
 或 alias 规范化后完全相等）；相似名称保留为独立实体，交给 ``merge_entity``
 显式处理。
 
-Phase 1 的 ``entities.status`` CHECK 没有 merged 值，也没有 merged_into 列。
-因此显式合并的持久化约定为：
-- source 记录保留，``status`` 置 ``archived``；
-- source 上写一条 ``alias_type='redirect'`` 的别名行，``alias`` 存 target_id
-  （``get_merge_target`` 可读回，等价于 merged_into）；
-- target 接收 source 的 canonical_name 与全部别名（沿用原 alias_type，
-  canonical_name 否则记为 redirect）；
+显式合并的持久化约定为：
+- source 记录保留，``status`` 置 ``merged``，``merged_into_entity_id`` 写 target_id；
+- target 接收 source 的 canonical_name 与全部别名（别名沿用原 alias_type）；
 - 返回值 ``MergeResult.status == "merged"``、``merged_into == target_id``。
+合并拒绝自环与合并链成环；已合并的 source 只能重复合并到同一 target。
 """
 
 from __future__ import annotations
@@ -29,7 +26,7 @@ from .ids import new_ulid
 from .models import EntityRecord, PageEntityRecord
 from .repositories import entities as entities_repo
 
-_ACTIVE_STATUSES = ("proposed", "accepted")
+_ACTIVE_STATUSES = ("active",)
 
 
 class EntityResolutionError(RuntimeError):
@@ -54,7 +51,7 @@ class EntityMergeError(EntityResolutionError):
 
 @dataclass(frozen=True, slots=True)
 class MergeResult:
-    """显式合并结果；``status`` 是逻辑合并状态，DB 里 source 为 archived。"""
+    """显式合并结果；``status`` 与 ``source_status`` 均为 ``merged``。"""
 
     source_id: str
     target_id: str
@@ -125,10 +122,11 @@ def find_candidates(
             candidates.append(entity)
 
     pattern = f"%{_escape_like(normalized)}%"
+    status_placeholders = ", ".join("?" for _ in _ACTIVE_STATUSES)
     sql = (
         "SELECT DISTINCT e.* FROM entities AS e "
         "LEFT JOIN entity_aliases AS a ON a.entity_id = e.entity_id "
-        "WHERE e.status IN (?, ?) "
+        f"WHERE e.status IN ({status_placeholders}) "
         "AND (e.normalized_name LIKE ? ESCAPE '\\' "
         "     OR a.normalized_alias LIKE ? ESCAPE '\\')"
     )
@@ -137,7 +135,7 @@ def find_candidates(
         sql += " AND e.entity_type = ?"
         params.append(type_filter)
     sql += (
-        " ORDER BY CASE e.status WHEN 'accepted' THEN 0 ELSE 1 END, "
+        " ORDER BY CASE e.status WHEN 'active' THEN 0 ELSE 1 END, "
         "e.canonical_name ASC, e.entity_id ASC LIMIT ?"
     )
     params.append(20)
@@ -180,7 +178,7 @@ def get_merge_target(
     conn: sqlite3.Connection, entity_id: str
 ) -> str | None:
     """source 实体显式合并后的 target_id；未合并返回 None。"""
-    return entities_repo.get_redirect_target(conn, entity_id)
+    return entities_repo.get_merge_target(conn, entity_id)
 
 
 def _assert_alias_not_taken(
@@ -213,7 +211,7 @@ def upsert_entity(
     entity_type: str = "",
     description: str = "",
     confidence: float = 0.0,
-    status: str = "proposed",
+    status: str = "active",
     aliases: list[str] | tuple[str, ...] | None = None,
     page_id: str | None = None,
     role: str = "mention",
@@ -307,7 +305,7 @@ def merge_entity(
     target_id: str,
     actor: str = "agent",
 ) -> MergeResult:
-    """显式合并 source → target；不自动调用，拒绝自环与 redirect 环。"""
+    """显式合并 source → target；不自动调用，拒绝自环与合并链环。"""
     if not source_id or not target_id:
         raise ValueError("source_id 与 target_id 必须非空")
     if source_id == target_id:
@@ -320,9 +318,9 @@ def merge_entity(
     if target is None:
         raise LookupError(f"target 实体不存在: {target_id}")
 
-    existing_redirect = entities_repo.get_redirect_target(conn, source_id)
-    if existing_redirect is not None:
-        if existing_redirect == target_id:
+    existing_target = entities_repo.get_merge_target(conn, source_id)
+    if existing_target is not None:
+        if existing_target == target_id:
             return MergeResult(
                 source_id=source_id,
                 target_id=target_id,
@@ -341,26 +339,26 @@ def merge_entity(
                 target=target,
             )
         raise EntityMergeError(
-            f"source 已合并到 {existing_redirect}，不能重复合并到 {target_id}"
+            f"source 已合并到 {existing_target}，不能重复合并到 {target_id}"
         )
 
-    # 沿 target 的 redirect 链检查环；target 本身是 redirect 时拒绝隐式穿透。
+    # 沿 target 的合并链检查环；target 本身已合并时拒绝隐式穿透。
     cursor = target_id
     visited: set[str] = set()
     for _ in range(50):
         if cursor == source_id:
             raise EntityMergeError(
-                f"合并会形成 redirect 环: {source_id} -> {target_id}"
+                f"合并会形成合并链环: {source_id} -> {target_id}"
             )
         if cursor in visited:
-            raise EntityMergeError(f"target redirect 链存在环: {target_id}")
+            raise EntityMergeError(f"target 合并链存在环: {target_id}")
         visited.add(cursor)
-        next_id = entities_repo.get_redirect_target(conn, cursor)
+        next_id = entities_repo.get_merge_target(conn, cursor)
         if next_id is None:
             break
         cursor = next_id
     else:  # pragma: no cover - 50 跳保护
-        raise EntityMergeError("target redirect 链过长")
+        raise EntityMergeError("target 合并链过长")
     if cursor != target_id:
         raise EntityMergeError(
             f"target 已合并到 {cursor}，请直接合并到最终目标"
@@ -370,8 +368,6 @@ def merge_entity(
     migrated = 0
     with _transactional(conn):
         for alias_record in entities_repo.find_aliases_by_entity(conn, source_id):
-            if alias_record.alias_type == "redirect":
-                continue
             inserted = entities_repo.insert_alias(
                 conn,
                 target_id,
@@ -388,23 +384,17 @@ def merge_entity(
             target_id,
             source.canonical_name,
             source.normalized_name,
-            alias_type="redirect",
+            alias_type="alias",
             created_at=now,
             ignore=True,
         ):
             migrated += 1
 
-        entities_repo.set_redirect_alias(
-            conn,
-            source_id,
-            target_id,
-            normalize_name(target_id),
-            created_at=now,
-        )
         entities_repo.update_entity(
             conn,
             source_id,
-            status="archived",
+            status="merged",
+            merged_into_entity_id=target_id,
             updated_at=now,
         )
 

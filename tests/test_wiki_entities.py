@@ -83,7 +83,7 @@ class TestUpsertAndCandidates(WikiEntityTestBase):
             entity_type="software",
             description="向量数据库",
             confidence=0.9,
-            status="accepted",
+            status="active",
             aliases=["Lance 数据库", "Lance"],
             page_id=page_id,
             role="tool",
@@ -94,7 +94,8 @@ class TestUpsertAndCandidates(WikiEntityTestBase):
         self.assertEqual(entity.canonical_name, "LanceDB")
         self.assertEqual(entity.normalized_name, "lancedb")
         self.assertEqual(entity.entity_type, "software")
-        self.assertEqual(str(entity.status), "accepted")
+        self.assertEqual(str(entity.status), "active")
+        self.assertIsNone(entity.merged_into_entity_id)
         self.assertIn(("Lance 数据库", "alias"), self.alias_pairs(entity.entity_id))
         page_entities = entities_repo.get_page_entities(self.conn, page_id)
         self.assertEqual(len(page_entities), 1)
@@ -174,7 +175,7 @@ class TestUpsertAndCandidates(WikiEntityTestBase):
 
 
 class TestMergeEntity(WikiEntityTestBase):
-    def test_explicit_merge_keeps_source_and_redirects_aliases(self):
+    def test_explicit_merge_writes_merged_status_and_target(self):
         source = upsert_entity(
             self.conn,
             "Lance Database",
@@ -189,7 +190,7 @@ class TestMergeEntity(WikiEntityTestBase):
 
         self.assertEqual(result.status, "merged")
         self.assertEqual(result.merged_into, target.entity_id)
-        self.assertEqual(result.source_status, "archived")
+        self.assertEqual(result.source_status, "merged")
         self.assertEqual(result.redirect["to"], "LanceDB")
         self.assertEqual(
             get_merge_target(self.conn, source.entity_id), target.entity_id
@@ -197,20 +198,21 @@ class TestMergeEntity(WikiEntityTestBase):
 
         kept = entities_repo.get_entity(self.conn, source.entity_id)
         self.assertIsNotNone(kept)
-        self.assertEqual(str(kept.status), "archived")
+        self.assertEqual(str(kept.status), "merged")
+        self.assertEqual(kept.merged_into_entity_id, target.entity_id)
         self.assertEqual(kept.canonical_name, "Lance Database")
 
         target_aliases = self.alias_pairs(target.entity_id)
-        self.assertIn(("Lance Database", "redirect"), target_aliases)
+        self.assertIn(("Lance Database", "alias"), target_aliases)
         self.assertIn(("Lance 数据库", "alias"), target_aliases)
         self.assertIn(("Lance Data", "alias"), target_aliases)
 
         # source 别名仍保留（保留 source 记录），target 迁移了别名。
         source_aliases = self.alias_pairs(source.entity_id)
         self.assertIn(("Lance 数据库", "alias"), source_aliases)
-        self.assertIn((target.entity_id, "redirect"), source_aliases)
+        self.assertNotIn(target.entity_id, {alias for alias, _type in source_aliases})
 
-        # 旧名称重新解析时命中 target，而不是已归档的 source。
+        # 旧名称重新解析时命中 target，而不是已合并的 source。
         candidates = find_candidates(self.conn, "Lance Database")
         self.assertEqual([item.entity_id for item in candidates], [target.entity_id])
         resolved = upsert_entity(self.conn, "Lance Database")
@@ -232,7 +234,7 @@ class TestMergeEntity(WikiEntityTestBase):
         with self.assertRaises(EntityMergeError):
             merge_entity(self.conn, entity.entity_id, entity.entity_id)
 
-    def test_redirect_cycle_rejected(self):
+    def test_merge_cycle_rejected(self):
         first = upsert_entity(self.conn, "A")
         second = upsert_entity(self.conn, "B")
         merge_entity(self.conn, first.entity_id, second.entity_id)
@@ -241,7 +243,7 @@ class TestMergeEntity(WikiEntityTestBase):
         self.assertIsNone(get_merge_target(self.conn, second.entity_id))
         self.assertEqual(
             str(entities_repo.get_entity(self.conn, second.entity_id).status),
-            "proposed",
+            "active",
         )
 
     def test_merge_missing_entity_rejected(self):
@@ -304,6 +306,28 @@ class TestRelationsAndNeighbourhood(WikiEntityTestBase):
         )
         self.assertEqual(first.relation_id, second.relation_id)
 
+    def test_verified_relation_is_traversed(self):
+        relation = relations_repo.create_relation(
+            self.conn, self.a.entity_id, "improves", self.b.entity_id
+        )
+        relations_repo.update_relation_status(
+            self.conn, relation.relation_id, "verified"
+        )
+        related = relations_repo.get_related(
+            self.conn, entity_id=self.a.entity_id, depth=1
+        )
+        self.assertEqual([item.entity.canonical_name for item in related], ["B"])
+
+        relations_repo.update_relation_status(
+            self.conn, relation.relation_id, "deprecated"
+        )
+        self.assertEqual(
+            relations_repo.get_related(
+                self.conn, entity_id=self.a.entity_id, depth=1
+            ),
+            [],
+        )
+
     def test_get_related_depth_and_page_seed(self):
         relations_repo.create_relation(
             self.conn, self.a.entity_id, "uses", self.b.entity_id
@@ -334,17 +358,25 @@ class TestRelationsAndNeighbourhood(WikiEntityTestBase):
         with self.assertRaises(ValueError):
             relations_repo.get_related(self.conn, depth=1)
 
-    def test_get_related_excludes_archived_and_rejected(self):
-        archived = upsert_entity(self.conn, "Archived")
-        entities_repo.update_entity(self.conn, archived.entity_id, status="archived")
+    def test_get_related_excludes_merged_and_deprecated(self):
+        merged = upsert_entity(self.conn, "Merged")
+        merged_target = upsert_entity(self.conn, "Merged Target")
+        merge_entity(self.conn, merged.entity_id, merged_target.entity_id)
         relations_repo.create_relation(
-            self.conn, self.a.entity_id, "supports", archived.entity_id
+            self.conn, self.a.entity_id, "supports", merged.entity_id
+        )
+        deprecated = upsert_entity(self.conn, "Deprecated")
+        entities_repo.update_entity(
+            self.conn, deprecated.entity_id, status="deprecated"
+        )
+        relations_repo.create_relation(
+            self.conn, self.a.entity_id, "contradicts", deprecated.entity_id
         )
         rejected = upsert_entity(self.conn, "Rejected")
         relations_repo.update_relation_status(
             self.conn,
             relations_repo.create_relation(
-                self.conn, self.a.entity_id, "contradicts", rejected.entity_id
+                self.conn, self.a.entity_id, "related_to", rejected.entity_id
             ).relation_id,
             "rejected",
         )

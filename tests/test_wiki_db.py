@@ -243,6 +243,78 @@ class TestConstraints(WikiDBTestBase):
                 "VALUES ('rel-1', 'entity-1', 'same_as', 'entity-1')"
             )
 
+    def test_relation_identity_unique_at_db_level(self):
+        self.insert_entity("entity-1", "One")
+        self.insert_entity("entity-2", "Two")
+        self.conn.execute(
+            "INSERT INTO relations "
+            "(relation_id, subject_entity_id, predicate, object_entity_id, status) "
+            "VALUES ('rel-1', 'entity-1', 'related_to', 'entity-2', 'proposed')"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO relations "
+                "(relation_id, subject_entity_id, predicate, object_entity_id, status) "
+                "VALUES ('rel-2', 'entity-1', 'related_to', 'entity-2', 'verified')"
+            )
+        # 任一身份字段不同即允许共存。
+        self.conn.execute(
+            "INSERT INTO relations "
+            "(relation_id, subject_entity_id, predicate, object_entity_id) "
+            "VALUES ('rel-3', 'entity-2', 'related_to', 'entity-1')"
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0], 2
+        )
+
+    def test_relation_status_values(self):
+        self.insert_entity("entity-1", "One")
+        self.insert_entity("entity-2", "Two")
+        self.conn.execute(
+            "INSERT INTO relations "
+            "(relation_id, subject_entity_id, predicate, object_entity_id, status) "
+            "VALUES ('rel-1', 'entity-1', 'uses', 'entity-2', 'verified')"
+        )
+        self.conn.execute(
+            "INSERT INTO relations "
+            "(relation_id, subject_entity_id, predicate, object_entity_id, status) "
+            "VALUES ('rel-2', 'entity-2', 'uses', 'entity-1', 'deprecated')"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO relations "
+                "(relation_id, subject_entity_id, predicate, object_entity_id, status) "
+                "VALUES ('rel-3', 'entity-1', 'part_of', 'entity-2', 'accepted')"
+            )
+
+    def test_entity_status_and_merged_target_fk(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO entities (entity_id, canonical_name, normalized_name, "
+                "status) VALUES ('entity-x', 'X', 'x', 'accepted')"
+            )
+        self.insert_entity("entity-1", "One")
+        self.insert_entity("entity-2", "Two")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE entities SET status = 'merged', "
+                "merged_into_entity_id = 'missing' WHERE entity_id = 'entity-1'"
+            )
+
+    def test_entity_merged_target_round_trip(self):
+        self.insert_entity("entity-1", "One")
+        self.insert_entity("entity-2", "Two")
+        self.conn.execute(
+            "UPDATE entities SET status = 'merged', "
+            "merged_into_entity_id = 'entity-2' WHERE entity_id = 'entity-1'"
+        )
+        row = self.conn.execute(
+            "SELECT status, merged_into_entity_id FROM entities "
+            "WHERE entity_id = 'entity-1'"
+        ).fetchone()
+        self.assertEqual(row["status"], "merged")
+        self.assertEqual(row["merged_into_entity_id"], "entity-2")
+
     def test_relation_invalid_status_rejected(self):
         self.insert_entity("entity-1", "One")
         self.insert_entity("entity-2", "Two")

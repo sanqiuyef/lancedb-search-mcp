@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS proposals (
     proposal_id TEXT PRIMARY KEY,
     proposal_type TEXT NOT NULL DEFAULT 'update_page',
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'rejected', 'stale', 'approved', 'applied')),
+        CHECK (status IN ('pending', 'rejected', 'stale', 'approved', 'applied', 'cancelled')),
     page_id TEXT
         REFERENCES pages (page_id) ON DELETE SET NULL,
     expected_revision_id TEXT NOT NULL DEFAULT '',
