@@ -6,6 +6,8 @@
 防抖计时器通过注入模块常量、手动 Timer 或 flush_pending() 控制，不真等 5 秒。
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -36,8 +38,28 @@ def _temp_dir(testcase):
 
 
 def _write(path, text="这是足够长的测试内容，用于通过 watcher 的文件检查。\n"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def _relative_resolver(root):
+    """模拟库中 source 为监听根下相对路径的解析器（不访问真实库）。"""
+    def resolve(path):
+        try:
+            return os.path.relpath(path, root), ""
+        except ValueError:  # Windows 跨盘
+            return "", ""
+    return resolve
+
+
+def _patch_resolver(testcase, resolver):
+    """替换 ingest.resolve_writable_source，watcher 单元测试不触碰 LanceDB。"""
+    patcher = mock.patch.object(
+        kb_watcher.kb_ingest, "resolve_writable_source", side_effect=resolver)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    return patcher
 
 
 class _ManualTimer:
@@ -65,10 +87,15 @@ class _ManualTimer:
 class TestEventHandlers(unittest.TestCase):
     def setUp(self):
         self.dir = _temp_dir(self)
-        self.path = os.path.join(self.dir, "note.md")
+        # 文件放在监听根的子目录里：source 含分隔符，属可自动管理的相对路径
+        self.path = os.path.join(self.dir, "notes", "note.md")
         _write(self.path)
+        _patch_resolver(self, _relative_resolver(self.dir))
         self.handler = kb_watcher._AutoIndexHandler(self.dir)
         self.addCleanup(self.handler.cancel_pending)
+
+    def _rel(self, path):
+        return os.path.relpath(path, self.dir)
 
     def test_created_event_reindexes_without_is_dir_attribute(self):
         event = _file_event(src_path=self.path)  # 无 is_dir 属性
@@ -77,7 +104,7 @@ class TestEventHandlers(unittest.TestCase):
         ) as update:
             self.handler.on_created(event)
             self.handler.flush_pending()
-        update.assert_called_once_with(self.path)
+        update.assert_called_once_with(self.path, source=self._rel(self.path))
 
     def test_modified_event_reindexes_without_is_dir_attribute(self):
         event = _file_event(src_path=self.path)
@@ -86,15 +113,17 @@ class TestEventHandlers(unittest.TestCase):
         ) as update:
             self.handler.on_modified(event)
             self.handler.flush_pending()
-        update.assert_called_once_with(self.path)
+        update.assert_called_once_with(self.path, source=self._rel(self.path))
 
     def test_directory_events_are_ignored(self):
         event = _file_event(src_path=self.dir, dest_path=self.path, is_directory=True)
         with mock.patch.object(
             kb_watcher.kb_ingest, "update_document", return_value="ok"
         ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
-        ) as delete:
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=0
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
             self.handler.on_created(event)
             self.handler.on_modified(event)
             self.handler.on_moved(event)
@@ -102,11 +131,12 @@ class TestEventHandlers(unittest.TestCase):
             self.handler.flush_pending()
         update.assert_not_called()
         delete.assert_not_called()
+        add.assert_not_called()
         self.assertEqual(self.handler._TIMERS, {})
         self.assertEqual(self.handler._pending_deletes, set())
 
     def test_created_and_modified_share_debounce_per_path(self):
-        other = os.path.join(self.dir, "other.md")
+        other = os.path.join(self.dir, "notes", "other.md")
         _write(other)
         key = kb_watcher._normalize_path(self.path)
         with mock.patch.object(
@@ -138,58 +168,60 @@ class TestEventHandlers(unittest.TestCase):
             self.assertIn(key, self.handler._TIMERS)
             update.assert_not_called()
             self.handler.flush_pending()
-        update.assert_called_once_with(self.path)
+        update.assert_called_once_with(self.path, source=self._rel(self.path))
 
-    def test_moved_deletes_old_source_then_reindexes_dest(self):
-        src = os.path.join(self.dir, "old.md")
-        dest = os.path.join(self.dir, "new.md")
+    def test_moved_deletes_old_source_then_indexes_dest(self):
+        src = os.path.join(self.dir, "notes", "old.md")
+        dest = os.path.join(self.dir, "notes", "new.md")
         _write(dest)
         calls = []
 
-        def delete_side_effect(**kwargs):
-            calls.append(("delete", kwargs.get("source_pattern")))
-            return "ok"
+        def delete_side_effect(source, **kwargs):
+            calls.append(("delete", source))
+            return 1
 
-        def update_side_effect(path):
-            calls.append(("update", path))
+        def add_side_effect(path, **kwargs):
+            calls.append(("add", path))
             return "ok"
 
         with mock.patch.object(
-            kb_watcher.kb_ingest, "update_document", side_effect=update_side_effect
-        ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", side_effect=delete_side_effect
-        ) as delete:
+            kb_watcher.kb_ingest, "delete_source_exact",
+            side_effect=delete_side_effect,
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document",
+            side_effect=add_side_effect,
+        ) as add:
             self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
             self.handler.flush_pending()
 
-        self.assertEqual(calls, [("delete", "old.md"), ("update", dest)])
-        delete.assert_called_once_with(source_pattern="old.md")
-        update.assert_called_once_with(dest)
+        self.assertEqual(calls, [("delete", self._rel(src)), ("add", dest)])
+        delete.assert_called_once_with(self._rel(src))
+        add.assert_called_once_with(dest, scan_dir=self.handler._watch_root_path)
 
     def test_moved_is_debounced_by_dest_path(self):
-        src = os.path.join(self.dir, "old.md")
-        dest = os.path.join(self.dir, "new.md")
+        src = os.path.join(self.dir, "notes", "old.md")
+        dest = os.path.join(self.dir, "notes", "new.md")
         _write(dest)
         event = _file_event(src_path=src, dest_path=dest)
         with mock.patch.object(
-            kb_watcher.kb_ingest, "update_document", return_value="ok"
-        ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
-        ) as delete:
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
             self.handler.on_moved(event)
             self.handler.on_moved(event)
             self.handler.flush_pending()
         # 整个 move 操作按 src+dest 组合键防抖：删旧 + 重建都只执行一次
-        delete.assert_called_once_with(source_pattern="old.md")
-        update.assert_called_once_with(dest)
+        delete.assert_called_once_with(self._rel(src))
+        add.assert_called_once_with(dest, scan_dir=self.handler._watch_root_path)
 
     def test_deleted_immediately_removes_source_even_if_debounced(self):
-        src = os.path.join(self.dir, "gone.md")
+        src = os.path.join(self.dir, "notes", "gone.md")
         key = kb_watcher._normalize_path(src)
         with mock.patch.object(
             kb_watcher.kb_ingest, "update_document", return_value="ok"
         ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
         ) as delete:
             # 该路径有待执行的重索引时，删除事件先取消它，再排队删除
             self.handler.on_created(_file_event(src_path=src))
@@ -197,14 +229,14 @@ class TestEventHandlers(unittest.TestCase):
             self.handler.on_deleted(_file_event(src_path=src))
             self.assertNotIn(key, self.handler._TIMERS)
             self.handler.flush_pending()
-        delete.assert_called_once_with(source_pattern="gone.md")
+        delete.assert_called_once_with(self._rel(src))
         update.assert_not_called()
 
     def test_handler_swallows_ingest_exceptions(self):
-        src = os.path.join(self.dir, "old.md")
-        src2 = os.path.join(self.dir, "old2.md")
-        dest = os.path.join(self.dir, "new.md")
-        other = os.path.join(self.dir, "other.md")
+        src = os.path.join(self.dir, "notes", "old.md")
+        src2 = os.path.join(self.dir, "notes", "old2.md")
+        dest = os.path.join(self.dir, "notes", "new.md")
+        other = os.path.join(self.dir, "notes", "other.md")
         _write(dest)
         _write(other)
         with mock.patch.object(
@@ -213,9 +245,13 @@ class TestEventHandlers(unittest.TestCase):
             side_effect=RuntimeError("boom"),
         ) as update, mock.patch.object(
             kb_watcher.kb_ingest,
-            "delete_documents",
+            "delete_source_exact",
             side_effect=RuntimeError("boom"),
-        ) as delete:
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest,
+            "add_single_document",
+            side_effect=RuntimeError("boom"),
+        ) as add:
             # 任何 ingest 异常都不能从 handler 冒出（否则 watchdog 线程退出）
             self.handler.on_created(_file_event(src_path=self.path))
             self.handler.on_modified(_file_event(src_path=other))
@@ -223,7 +259,175 @@ class TestEventHandlers(unittest.TestCase):
             self.handler.on_moved(_file_event(src_path=src2, dest_path=dest))
             self.handler.flush_pending()
         self.assertGreaterEqual(update.call_count, 2)
-        self.assertGreaterEqual(delete.call_count, 2)
+        self.assertGreaterEqual(delete.call_count, 1)
+        self.assertGreaterEqual(add.call_count, 1)
+
+
+class TestLegacyBasenameGuard(unittest.TestCase):
+    """库中只有 basename 的旧来源无法反推绝对路径，watcher 必须整体跳过事件。"""
+
+    def setUp(self):
+        self.dir = _temp_dir(self)
+        self.path = os.path.join(self.dir, "notes", "note.md")
+        _write(self.path)
+        _patch_resolver(self, lambda path: ("note.md", ""))
+        self.handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(self.handler.cancel_pending)
+
+    def _write_patches(self):
+        return (
+            mock.patch.object(kb_watcher.kb_ingest, "update_document"),
+            mock.patch.object(kb_watcher.kb_ingest, "add_single_document"),
+            mock.patch.object(kb_watcher.kb_ingest, "delete_source_exact"),
+            mock.patch.object(kb_watcher.kb_ingest, "delete_documents"),
+        )
+
+    def test_create_and_modify_skip_without_any_write(self):
+        event = _file_event(src_path=self.path)
+        patches = self._write_patches()
+        with patches[0] as update, patches[1] as add, patches[2] as delete, \
+                patches[3] as delete_glob:
+            self.handler.on_created(event)
+            self.handler.on_modified(event)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.handler.flush_pending()
+        update.assert_not_called()
+        add.assert_not_called()
+        delete.assert_not_called()
+        delete_glob.assert_not_called()
+        self.assertIn("legacy basename source", stderr.getvalue())
+        self.assertIn("需人工确认", stderr.getvalue())
+
+    def test_delete_skips_without_any_write(self):
+        event = _file_event(src_path=self.path)
+        patches = self._write_patches()
+        with patches[0] as update, patches[1] as add, patches[2] as delete, \
+                patches[3] as delete_glob:
+            self.handler.on_deleted(event)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.handler.flush_pending()
+        update.assert_not_called()
+        add.assert_not_called()
+        delete.assert_not_called()
+        delete_glob.assert_not_called()
+        self.assertIn("legacy basename source", stderr.getvalue())
+
+    def test_move_skips_whole_event_without_any_write(self):
+        dest = os.path.join(self.dir, "notes", "new.md")
+        _write(dest)
+        patches = self._write_patches()
+        with patches[0] as update, patches[1] as add, patches[2] as delete, \
+                patches[3] as delete_glob:
+            self.handler.on_moved(
+                _file_event(src_path=self.path, dest_path=dest))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.handler.flush_pending()
+        update.assert_not_called()
+        add.assert_not_called()
+        delete.assert_not_called()
+        delete_glob.assert_not_called()
+        self.assertIn("跳过移动事件", stderr.getvalue())
+        self.assertIn("legacy basename source", stderr.getvalue())
+
+
+class TestSourceResolutionBehavior(unittest.TestCase):
+    """相对路径来源自动管理；新文件按监听根相对路径入库。"""
+
+    def setUp(self):
+        self.dir = _temp_dir(self)
+        self.handler = kb_watcher._AutoIndexHandler(self.dir)
+        self.addCleanup(self.handler.cancel_pending)
+
+    def test_relative_existing_source_updates_via_update_document(self):
+        path = os.path.join(self.dir, "notes", "a.md")
+        _write(path)
+        _patch_resolver(self, lambda p: ("notes/a.md", ""))
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
+            self.handler.on_modified(_file_event(src_path=path))
+            self.handler.flush_pending()
+        update.assert_called_once_with(path, source="notes/a.md")
+        add.assert_not_called()
+
+    def test_new_nested_file_is_added_with_scan_dir(self):
+        path = os.path.join(self.dir, "notes", "new.md")
+        _write(path)
+        _patch_resolver(self, lambda p: ("", ""))
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
+            self.handler.on_created(_file_event(src_path=path))
+            self.handler.flush_pending()
+        add.assert_called_once_with(path, scan_dir=self.handler._watch_root_path)
+        update.assert_not_called()
+
+    def test_same_basename_with_unrelated_suffix_is_treated_as_new(self):
+        path = os.path.join(self.dir, "notes", "report.md")
+        _write(path)
+        _patch_resolver(
+            self, lambda p: (os.path.join("other", "report.md"), ""))
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
+            self.handler.on_modified(_file_event(src_path=path))
+            self.handler.flush_pending()
+        update.assert_not_called()
+        add.assert_called_once_with(path, scan_dir=self.handler._watch_root_path)
+
+    def test_new_root_level_file_is_skipped_as_legacy_basename(self):
+        path = os.path.join(self.dir, "new.md")
+        _write(path)
+        _patch_resolver(self, lambda p: ("", ""))
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
+            self.handler.on_created(_file_event(src_path=path))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.handler.flush_pending()
+        add.assert_not_called()
+        update.assert_not_called()
+        self.assertIn("legacy basename source", stderr.getvalue())
+
+    def test_relative_delete_uses_exact_source_not_glob(self):
+        path = os.path.join(self.dir, "notes", "gone.md")
+        _patch_resolver(self, lambda p: ("notes/gone.md", ""))
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+        ) as delete_glob:
+            self.handler.on_deleted(_file_event(src_path=path))
+            self.handler.flush_pending()
+        delete.assert_called_once_with("notes/gone.md")
+        delete_glob.assert_not_called()
+
+    def test_ambiguous_source_skips_event(self):
+        path = os.path.join(self.dir, "notes", "a.md")
+        _write(path)
+        _patch_resolver(
+            self, lambda p: ("", "[ERROR] 匹配到多个知识库来源，无法唯一确定"))
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "update_document", return_value="ok"
+        ) as update:
+            self.handler.on_modified(_file_event(src_path=path))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.handler.flush_pending()
+        update.assert_not_called()
+        self.assertIn("匹配到多个知识库来源", stderr.getvalue())
 
 
 class TestIsIndexable(unittest.TestCase):
@@ -291,8 +495,9 @@ class TestEventFiltering(unittest.TestCase):
 class TestTrailingEdgeDebounce(unittest.TestCase):
     def setUp(self):
         self.dir = _temp_dir(self)
-        self.path = os.path.join(self.dir, "note.md")
+        self.path = os.path.join(self.dir, "notes", "note.md")
         _write(self.path)
+        _patch_resolver(self, _relative_resolver(self.dir))
 
     def test_only_latest_timer_survives_and_stale_timer_is_ignored(self):
         with mock.patch.object(kb_watcher.threading, "Timer", _ManualTimer):
@@ -315,7 +520,7 @@ class TestTrailingEdgeDebounce(unittest.TestCase):
                 self.assertEqual(update.call_count, 0)
                 second.fire()
                 self.assertEqual(update.call_count, 1)
-                self.assertEqual(update.call_args_list, [mock.call(self.path)])
+                self.assertEqual(update.call_args_list, [mock.call(self.path, source=os.path.relpath(self.path, self.dir))])
 
     def test_rapid_events_execute_once_after_quiet_period(self):
         with mock.patch.object(kb_watcher, "_DEBOUNCE_SECONDS", 0.1):
@@ -356,69 +561,90 @@ class TestTrailingEdgeDebounce(unittest.TestCase):
             handler.flush_pending()
         self.assertEqual(update.call_count, 2)
         self.assertEqual(update.call_args_list,
-                         [mock.call(self.path), mock.call(self.path)])
+                         [mock.call(self.path, source=os.path.relpath(self.path, self.dir)), mock.call(self.path, source=os.path.relpath(self.path, self.dir))])
 
 
 class TestMovedRootBoundary(unittest.TestCase):
     def setUp(self):
         self.dir = _temp_dir(self)
+        _patch_resolver(self, _relative_resolver(self.dir))
         self.handler = kb_watcher._AutoIndexHandler(self.dir)
         self.addCleanup(self.handler.cancel_pending)
 
-    def test_moved_within_root_deletes_source_and_reindexes_dest(self):
-        src = os.path.join(self.dir, "old.md")
-        dest = os.path.join(self.dir, "new.md")
+    def _rel(self, path):
+        return os.path.relpath(path, self.dir)
+
+    def test_moved_within_root_deletes_source_then_indexes_dest(self):
+        src = os.path.join(self.dir, "notes", "old.md")
+        dest = os.path.join(self.dir, "notes", "new.md")
         _write(dest)
         with mock.patch.object(
-            kb_watcher.kb_ingest, "update_document", return_value="ok"
-        ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
-        ) as delete:
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
             self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
             self.handler.flush_pending()
-        delete.assert_called_once_with(source_pattern="old.md")
-        update.assert_called_once_with(dest)
+        delete.assert_called_once_with(self._rel(src))
+        add.assert_called_once_with(dest, scan_dir=self.handler._watch_root_path)
 
     def test_moved_outside_root_only_deletes_source(self):
         outside = _temp_dir(self)
-        src = os.path.join(self.dir, "old.md")
+        src = os.path.join(self.dir, "notes", "old.md")
         dest = os.path.join(outside, "new.md")
         _write(dest)
         with mock.patch.object(
-            kb_watcher.kb_ingest, "update_document", return_value="ok"
-        ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
-        ) as delete:
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
             self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
             self.handler.flush_pending()
-        delete.assert_called_once_with(source_pattern="old.md")
-        update.assert_not_called()
+        delete.assert_called_once_with(self._rel(src))
+        add.assert_not_called()
 
     def test_moved_into_excluded_subdir_is_not_reindexed(self):
-        src = os.path.join(self.dir, "old.md")
+        src = os.path.join(self.dir, "notes", "old.md")
         dest = os.path.join(self.dir, ".git", "new.md")
         with mock.patch.object(
-            kb_watcher.kb_ingest, "update_document", return_value="ok"
-        ) as update, mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
-        ) as delete:
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
             self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
             self.handler.flush_pending()
-        delete.assert_called_once_with(source_pattern="old.md")
-        update.assert_not_called()
+        delete.assert_called_once_with(self._rel(src))
+        add.assert_not_called()
+
+    def test_moved_from_outside_root_only_indexes_dest(self):
+        outside = _temp_dir(self)
+        src = os.path.join(outside, "old.md")
+        dest = os.path.join(self.dir, "notes", "new.md")
+        _write(dest)
+        with mock.patch.object(
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
+        ) as delete, mock.patch.object(
+            kb_watcher.kb_ingest, "add_single_document", return_value="ok"
+        ) as add:
+            self.handler.on_moved(_file_event(src_path=src, dest_path=dest))
+            self.handler.flush_pending()
+        # 根外旧路径不归本监听器管理，不得按 basename 误删库中来源
+        delete.assert_not_called()
+        add.assert_called_once_with(dest, scan_dir=self.handler._watch_root_path)
 
 
 class TestDeleteBatching(unittest.TestCase):
     def setUp(self):
         self.dir = _temp_dir(self)
+        _patch_resolver(self, _relative_resolver(self.dir))
         self.handler = kb_watcher._AutoIndexHandler(self.dir)
         self.addCleanup(self.handler.cancel_pending)
 
     def test_repeated_deletes_are_deduplicated_and_batched(self):
-        first = os.path.join(self.dir, "a.md")
-        second = os.path.join(self.dir, "b.md")
+        first = os.path.join(self.dir, "notes", "a.md")
+        second = os.path.join(self.dir, "notes", "b.md")
         with mock.patch.object(
-            kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+            kb_watcher.kb_ingest, "delete_source_exact", return_value=1
         ) as delete:
             self.handler.on_deleted(_file_event(src_path=first))
             self.handler.on_deleted(_file_event(src_path=first))
@@ -427,18 +653,23 @@ class TestDeleteBatching(unittest.TestCase):
             delete.assert_not_called()
             self.handler.flush_pending()
         self.assertEqual(delete.call_count, 2)
-        patterns = {c.kwargs["source_pattern"] for c in delete.call_args_list}
-        self.assertEqual(patterns, {"a.md", "b.md"})
+        sources = {c.args[0] for c in delete.call_args_list}
+        self.assertEqual(
+            sources,
+            {os.path.relpath(first, self.dir), os.path.relpath(second, self.dir)},
+        )
 
     def test_delete_flush_timer_batches_within_window(self):
         with mock.patch.object(kb_watcher, "_DELETE_FLUSH_SECONDS", 0.1):
             handler = kb_watcher._AutoIndexHandler(self.dir)
             self.addCleanup(handler.cancel_pending)
             with mock.patch.object(
-                kb_watcher.kb_ingest, "delete_documents", return_value="ok"
+                kb_watcher.kb_ingest, "delete_source_exact", return_value=1
             ) as delete:
-                handler.on_deleted(_file_event(src_path=os.path.join(self.dir, "a.md")))
-                handler.on_deleted(_file_event(src_path=os.path.join(self.dir, "b.md")))
+                handler.on_deleted(
+                    _file_event(src_path=os.path.join(self.dir, "notes", "a.md")))
+                handler.on_deleted(
+                    _file_event(src_path=os.path.join(self.dir, "notes", "b.md")))
                 delete.assert_not_called()
                 deadline = time.time() + 2.0
                 while delete.call_count < 2 and time.time() < deadline:

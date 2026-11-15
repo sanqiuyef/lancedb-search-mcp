@@ -406,10 +406,18 @@ def ingest_images(
 
 
 # =============================================================
-# Wiki V1（默认关闭）：WIKI_ENABLED=1 时追加 14 个工具
+# Wiki V1（默认关闭）：WIKI_ENABLED 为 1/true/yes/on 时追加 14 个工具
 # =============================================================
 
-if os.environ.get("WIKI_ENABLED", "0") == "1":
+_WIKI_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _wiki_enabled() -> bool:
+    """与 kb.ingest / WikiConfig 一致的布尔解析（大小写不敏感、去空白）。"""
+    return os.environ.get("WIKI_ENABLED", "").strip().lower() in _WIKI_TRUE_VALUES
+
+
+if _wiki_enabled():
     from kb.wiki import service as wiki_service
 
     def _wiki_json(payload) -> str:

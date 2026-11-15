@@ -95,6 +95,20 @@ class TestChunkOverlap(unittest.TestCase):
         self.assertFalse(chunks[1]["text"].startswith(chunks[0]["text"][-10:]))
 
 
+class TestLegacyBasenameClassification(unittest.TestCase):
+    def test_basename_without_separator_is_legacy(self):
+        self.assertTrue(kb_ingest.source_is_legacy_basename("report.md"))
+        self.assertTrue(kb_ingest.source_is_legacy_basename("论文.pdf"))
+
+    def test_relative_path_with_either_separator_is_not_legacy(self):
+        self.assertFalse(kb_ingest.source_is_legacy_basename("notes/report.md"))
+        self.assertFalse(kb_ingest.source_is_legacy_basename(r"notes\report.md"))
+
+    def test_empty_source_is_not_legacy(self):
+        self.assertFalse(kb_ingest.source_is_legacy_basename(""))
+        self.assertFalse(kb_ingest.source_is_legacy_basename(None))
+
+
 class IngestDbTestBase(unittest.TestCase):
     """临时库 + 假 embedding，覆盖入库身份/幂等/删除语义。"""
 
@@ -165,6 +179,57 @@ class TestAddSingleDocumentIdentity(IngestDbTestBase):
             kb_schema.existing_sources(kb_schema.get_or_create_table()),
             {expected},
         )
+
+    def test_same_basename_at_scan_dir_root_refused(self):
+        path = self.write_doc("rootreport.txt", "scan_dir 根目录新内容。" * 20)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "旧 legacy 根目录内容。" * 20,
+            "source": "rootreport.txt",
+            "chunk_index": 0,
+            "doc_id": "legacy-root",
+        }])
+        before = kb_schema.row_count()
+
+        # 文件直接位于 scan_dir 根目录，最终 source 仍是 basename；
+        # 即使传了 scan_dir 也必须拒绝覆盖已有同名来源。
+        result = kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
+
+        self.assertIn("[ERROR]", result)
+        self.assertIn("已存在", result)
+        self.assertEqual(kb_schema.row_count(), before)
+        texts = kb_schema.get_or_create_table().to_lance().to_table(
+            columns=["text"]).column("text").to_pylist()
+        self.assertTrue(any("旧 legacy 根目录内容" in text for text in texts))
+        self.assertFalse(any("scan_dir 根目录新内容" in text for text in texts))
+
+    def test_relative_source_writes_new_source_without_touching_legacy(self):
+        path = self.write_doc(os.path.join("sub", "report.txt"),
+                              "子目录新内容。" * 20)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "旧 legacy 内容。" * 20,
+            "source": "report.txt",
+            "chunk_index": 0,
+            "doc_id": "legacy-report",
+        }])
+
+        result = kb_ingest.add_single_document(path, scan_dir=self.tmpdir)
+        self.assertNotIn("[ERROR]", result)
+
+        fresh = kb_schema.get_or_create_table()
+        sources = kb_schema.existing_sources(fresh)
+        self.assertIn("report.txt", sources)
+        self.assertIn(os.path.join("sub", "report.txt"), sources)
+        arrow = fresh.to_lance().to_table(columns=["source", "text"])
+        by_source: dict[str, list[str]] = {}
+        for src, text in zip(arrow.column("source").to_pylist(),
+                             arrow.column("text").to_pylist()):
+            by_source.setdefault(src, []).append(text)
+        self.assertTrue(any("旧 legacy 内容" in t for t in by_source["report.txt"]))
+        self.assertTrue(any(
+            "子目录新内容" in t for t in by_source[os.path.join("sub", "report.txt")]
+        ))
 
 
 class TestUpdateDocumentSource(IngestDbTestBase):
@@ -238,6 +303,64 @@ class TestUpdateDocumentSource(IngestDbTestBase):
         texts = kb_schema.get_or_create_table().to_lance().to_table(
             columns=["text"]).column("text").to_pylist()
         self.assertFalse(any("无法消歧的新内容" in t for t in texts))
+
+
+class TestUpdateDocumentExplicitSource(IngestDbTestBase):
+    def test_explicit_relative_source_updates_it_and_keeps_legacy(self):
+        path = self.write_doc(os.path.join("notes", "note.md"),
+                              "新的相对来源内容。" * 20)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "旧 legacy 内容。" * 20, "source": "note.md",
+             "chunk_index": 0, "doc_id": "legacy-note"},
+            {"text": "旧相对来源内容。" * 20, "source": "notes/note.md",
+             "chunk_index": 0, "doc_id": "relative-note"},
+        ])
+
+        result = kb_ingest.update_document(path, source="notes/note.md")
+
+        self.assertNotIn("[ERROR]", result)
+        fresh = kb_schema.get_or_create_table()
+        self.assertEqual(kb_schema.existing_sources(fresh),
+                         {"note.md", "notes/note.md"})
+        arrow = fresh.to_lance().to_table(columns=["source", "text"])
+        by_source: dict[str, list[str]] = {}
+        for src, text in zip(arrow.column("source").to_pylist(),
+                             arrow.column("text").to_pylist()):
+            by_source.setdefault(src, []).append(text)
+        self.assertTrue(any("旧 legacy 内容" in t for t in by_source["note.md"]))
+        self.assertTrue(any("新的相对来源内容" in t for t in by_source["notes/note.md"]))
+
+    def test_explicit_legacy_source_is_refused(self):
+        path = self.write_doc(os.path.join("notes", "note.md"),
+                              "不应写入的内容。" * 20)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "旧 legacy 内容。" * 20, "source": "note.md",
+            "chunk_index": 0, "doc_id": "legacy-note",
+        }])
+        before = kb_schema.row_count()
+
+        result = kb_ingest.update_document(path, source="note.md")
+
+        self.assertIn("[ERROR]", result)
+        self.assertIn("legacy basename source", result)
+        self.assertEqual(kb_schema.row_count(), before)
+
+    def test_explicit_source_must_be_path_suffix(self):
+        path = self.write_doc(os.path.join("notes", "note.md"),
+                              "不应写入的内容。" * 20)
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "其他来源旧内容。" * 20, "source": "other/note.md",
+            "chunk_index": 0, "doc_id": "other-note",
+        }])
+        before = kb_schema.row_count()
+
+        result = kb_ingest.update_document(path, source="other/note.md")
+
+        self.assertIn("[ERROR]", result)
+        self.assertEqual(kb_schema.row_count(), before)
 
 
 class TestWriteThenCleanup(IngestDbTestBase):
@@ -381,6 +504,21 @@ class TestDeleteDocumentsMatching(IngestDbTestBase):
         self.assertIn("知识库已清空", result)
         self.assertEqual(kb_schema.row_count(), 0)
 
+    def test_brackets_are_literal_not_glob(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "a1", "source": "a1.md", "chunk_index": 0},
+            {"text": "a[1]", "source": "a[1].md", "chunk_index": 0},
+        ])
+
+        result = kb_ingest.delete_documents("a[1].md")
+
+        self.assertIn("删除记录数: 1", result)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {"a1.md"},
+        )
+
 
 class TestSourceMatchingCase(IngestDbTestBase):
     def test_exact_delete_uses_normcase(self):
@@ -417,6 +555,126 @@ class TestSourceMatchingCase(IngestDbTestBase):
             glob,
             {src for src in sources if fnmatch.fnmatch(src, "*.PDF")},
         )
+
+    def test_bracket_is_not_a_wildcard(self):
+        self.assertEqual(
+            kb_ingest._match_sources_for_delete({"a1.md"}, "a[1].md"), set())
+        self.assertEqual(
+            kb_ingest._match_sources_for_delete({"a[1].md"}, "a[1].md"),
+            {"a[1].md"},
+        )
+
+
+class TestDeleteSourceExact(IngestDbTestBase):
+    def test_can_delete_last_source_without_confirm_all(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "唯一来源", "source": "only.md", "chunk_index": 0,
+        }])
+
+        removed = kb_ingest.delete_source_exact("only.md")
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(kb_schema.row_count(), 0)
+
+    def test_allow_last_false_refuses_to_empty_library(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [{
+            "text": "唯一来源", "source": "only.md", "chunk_index": 0,
+        }])
+
+        removed = kb_ingest.delete_source_exact("only.md", allow_last=False)
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(kb_schema.row_count(), 1)
+
+    def test_exact_delete_ignores_substring_and_other_sources(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "a", "source": "a.pdf", "chunk_index": 0},
+            {"text": "d", "source": "docs/a.pdf", "chunk_index": 0},
+            {"text": "x", "source": "data.pdf", "chunk_index": 0},
+        ])
+
+        removed = kb_ingest.delete_source_exact("a.pdf")
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            kb_schema.existing_sources(kb_schema.get_or_create_table()),
+            {"docs/a.pdf", "data.pdf"},
+        )
+
+
+class TestResolveWritableSource(IngestDbTestBase):
+    def test_no_match_returns_empty_source(self):
+        self.assertEqual(
+            kb_ingest.resolve_writable_source(
+                os.path.join(self.tmpdir, "missing.md")),
+            ("", ""),
+        )
+
+    def test_legacy_basename_is_reported_for_manual_confirmation(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "legacy", "source": "legacy.md", "chunk_index": 0},
+        ])
+
+        source, reason = kb_ingest.resolve_writable_source(
+            os.path.join(self.tmpdir, "legacy.md"))
+
+        self.assertEqual(source, "")
+        self.assertIn("legacy basename source", reason)
+        self.assertIn("需人工确认", reason)
+
+    def test_relative_source_resolved_by_path_suffix(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "relative", "source": "notes/a.md", "chunk_index": 0},
+        ])
+
+        self.assertEqual(
+            kb_ingest.resolve_writable_source(
+                os.path.join(self.tmpdir, "notes", "a.md")),
+            ("notes/a.md", ""),
+        )
+
+    def test_relative_source_wins_over_same_basename_legacy(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "legacy", "source": "note.md", "chunk_index": 0},
+            {"text": "relative", "source": "notes/note.md", "chunk_index": 0},
+        ])
+
+        self.assertEqual(
+            kb_ingest.resolve_writable_source(
+                os.path.join(self.tmpdir, "notes", "note.md")),
+            ("notes/note.md", ""),
+        )
+
+    def test_unrelated_relative_source_is_not_matched(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "other", "source": "other/report.md", "chunk_index": 0},
+        ])
+
+        self.assertEqual(
+            kb_ingest.resolve_writable_source(
+                os.path.join(self.tmpdir, "notes", "report.md")),
+            ("", ""),
+        )
+
+    def test_multiple_path_suffix_matches_are_ambiguous(self):
+        table = kb_schema.get_or_create_table()
+        kb_ingest.add_chunks(table, [
+            {"text": "a", "source": "a/report.md", "chunk_index": 0},
+            {"text": "b", "source": "nested/a/report.md", "chunk_index": 0},
+        ])
+
+        source, error = kb_ingest.resolve_writable_source(
+            os.path.join(self.tmpdir, "nested", "a", "report.md"))
+
+        self.assertEqual(source, "")
+        self.assertIn("[ERROR]", error)
 
 
 class TestAddChunksBatchDedupe(IngestDbTestBase):
