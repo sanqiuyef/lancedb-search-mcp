@@ -106,6 +106,32 @@ class WikiMcpRegistrationTest(unittest.TestCase):
         self.assertEqual(len(names), 15)
         self.assertEqual(names, EXISTING_TOOLS)
 
+    def test_truthy_values_register_14_wiki_tools(self):
+        for value in ("1", "true", "TRUE", " yes ", "on"):
+            with self.subTest(value=value):
+                module = self.reload_with(value)
+                names = self.tool_names(module)
+                self.assertEqual(len(names), 29)
+                self.assertEqual(
+                    {name for name in names if name.startswith("wiki_")},
+                    WIKI_TOOLS,
+                )
+
+    def test_falsy_or_empty_values_do_not_register_wiki_tools(self):
+        for value in ("0", "false", "FALSE", "off", "", "  "):
+            with self.subTest(value=value):
+                module = self.reload_with(value)
+                names = self.tool_names(module)
+                self.assertEqual(len(names), 15)
+                self.assertFalse(any(name.startswith("wiki_") for name in names))
+
+    def test_unset_env_does_not_register_wiki_tools(self):
+        os.environ.pop("WIKI_ENABLED", None)
+        module = importlib.reload(server)
+        names = self.tool_names(module)
+        self.assertEqual(len(names), 15)
+        self.assertFalse(any(name.startswith("wiki_") for name in names))
+
 
 class WikiMcpHandlerTest(unittest.TestCase):
     def setUp(self):

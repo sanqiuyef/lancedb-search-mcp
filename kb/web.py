@@ -158,20 +158,23 @@ def ingest_url(url: str) -> str:
         ch["ingested_at"] = kb_ingest.datetime_now_iso()
     new_doc_ids = {ch["doc_id"] for ch in chunks}
 
-    table = kb_schema.get_or_create_table()
-    # 只补写库里还没有的块：内容未变的重复抓取不产生重复行。
-    existing_ids = _existing_doc_ids(table, source)
-    pending = [ch for ch in chunks if ch["doc_id"] not in existing_ids]
-    added = kb_ingest.add_chunks(table, pending) if pending else 0
-    # add 成功后才收敛旧行；失败会直接抛出，旧行保持不变。
-    replaced = 0
-    if existing_ids - new_doc_ids:
-        stale = table.delete(_stale_rows_where(source, new_doc_ids))
-        replaced = int(getattr(stale, "num_deleted_rows", 0) or 0)
-    kb_schema.ensure_vector_index(table)
-    kb_schema.ensure_fts_index(table)
-    kb_schema.fold_new_rows(table)
-    kb_schema.update_db_readme()
+    with kb_ingest._write_lock:
+        # 检查已有 doc_id → 写入新块 → 清理旧块整段串行，避免与 watcher
+        # 的 update/delete 交错删除对方刚写入的行。
+        table = kb_schema.get_or_create_table()
+        # 只补写库里还没有的块：内容未变的重复抓取不产生重复行。
+        existing_ids = _existing_doc_ids(table, source)
+        pending = [ch for ch in chunks if ch["doc_id"] not in existing_ids]
+        added = kb_ingest.add_chunks(table, pending) if pending else 0
+        # add 成功后才收敛旧行；失败会直接抛出，旧行保持不变。
+        replaced = 0
+        if existing_ids - new_doc_ids:
+            stale = table.delete(_stale_rows_where(source, new_doc_ids))
+            replaced = int(getattr(stale, "num_deleted_rows", 0) or 0)
+        kb_schema.ensure_vector_index(table)
+        kb_schema.ensure_fts_index(table)
+        kb_schema.fold_new_rows(table)
+        kb_schema.update_db_readme()
     kb_ingest._register_wiki_safely(
         source,
         canonical,

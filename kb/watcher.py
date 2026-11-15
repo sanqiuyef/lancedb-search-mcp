@@ -11,6 +11,9 @@
 - 所有事件先经 _is_indexable 过滤扩展名与排除目录；目录事件直接忽略
   （限制：整目录移入/移出不会递归迁移其中文件的索引，依赖 watchdog
   对目录内文件产生的独立事件兜底）。
+- 只自动改写含目录分隔符的相对 source。库中只有 basename 的旧来源
+  （无法反推绝对路径）一律跳过并写 stderr，要求人工确认，避免按
+  basename 误替换/误删同名文档。
 """
 
 from __future__ import annotations
@@ -74,6 +77,26 @@ def _is_indexable(path: str) -> bool:
     return not any(segment.lower() in excluded for segment in segments[:-1])
 
 
+def _relative_source(root: str, filepath: str) -> str:
+    """事件路径 → 监听根下的相对 source；根外/空路径退回 basename。"""
+    try:
+        rel = os.path.relpath(filepath, root)
+    except (TypeError, ValueError):
+        rel = ""
+    if not rel or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return os.path.basename(filepath or "")
+    return rel
+
+
+def _source_matches_path(filepath: str, source: str) -> bool:
+    """source 是否是该文件路径的完整后缀（按目录边界，不区分大小写/分隔符）。"""
+    file_norm = os.path.normcase(os.path.abspath(filepath)).replace("\\", "/").rstrip("/")
+    source_norm = os.path.normcase(source or "").replace("\\", "/").rstrip("/")
+    if not source_norm or source_norm in (".", ".."):
+        return False
+    return file_norm == source_norm or file_norm.endswith("/" + source_norm)
+
+
 def _observer_alive(observer) -> bool:
     """observer 是否仍存活；没有 is_alive 的测试替身按存活处理。"""
     is_alive = getattr(observer, "is_alive", None)
@@ -93,6 +116,8 @@ class _AutoIndexHandler(_FileSystemEventHandler):
 
     def __init__(self, watch_root: str) -> None:
         self._watch_root = _normalize_path(watch_root)
+        # 原始大小写/分隔符的根路径，用于把事件路径还原成库里的相对 source
+        self._watch_root_path = os.path.realpath(os.path.abspath(watch_root))
         self._lock = threading.RLock()
         # key -> 待执行 Timer；同一 key 新事件会取消旧 Timer 并重置计时
         self._TIMERS: dict[str, threading.Timer] = {}
@@ -180,34 +205,91 @@ class _AutoIndexHandler(_FileSystemEventHandler):
 
     # ── ingest 动作 ────────────────────────────────────────
 
-    def _reindex(self, filepath: str) -> None:
+    def _existing_source_for_write(self, filepath: str) -> "tuple[str, str]":
+        """解析库中已存在的目标 source，返回 (source, skip_reason)。
+
+        无匹配时返回 ("", "")，由调用方按新文件处理。匹配到 legacy
+        basename（库中只有 `a.md` 这类无法反推绝对路径的来源）或存在
+        同名歧义时返回非空 skip_reason，调用方不得写库。
+        """
+        try:
+            source, error = kb_ingest.resolve_writable_source(filepath)
+        except Exception as exc:
+            return "", f"解析来源失败: {exc}"
+        if error:
+            return "", error
+        if source and kb_ingest.source_is_legacy_basename(source):
+            return "", (
+                f"legacy basename source，需人工确认: {source}（{filepath}）"
+            )
+        if source and not _source_matches_path(filepath, source):
+            # 同 basename 但不是该路径的后缀：不能确认是同一文件，按新文件处理，
+            # 避免把同名的其他目录来源当作本文件的旧版本替换掉。
+            return "", ""
+        return source, ""
+
+    def _legacy_new_source_reason(self, filepath: str) -> str:
+        """新文件按监听根相对路径算出的 source 若是纯 basename，返回跳过原因。"""
+        planned = _relative_source(self._watch_root_path, filepath)
+        if kb_ingest.source_is_legacy_basename(planned):
+            return (
+                f"legacy basename source，需人工确认: {planned}（{filepath}）"
+            )
+        return ""
+
+    def _reindex(self, filepath: str, existing_source: "str | None" = None) -> None:
+        """更新已有相对路径来源，或把监听根下的新文件按相对路径入库。
+
+        ``existing_source`` 为 None 时现场解析；显式传入 "" 表示按新文件处理。
+        legacy basename 来源一律跳过并写 stderr，不调用任何写函数。
+        """
         if not _is_indexable(filepath):
             return
+        if existing_source is None:
+            existing_source, skip_reason = self._existing_source_for_write(filepath)
+            if skip_reason:
+                _log(f"跳过更新 {filepath}: {skip_reason}")
+                return
+        if not existing_source:
+            skip_reason = self._legacy_new_source_reason(filepath)
+            if skip_reason:
+                _log(f"跳过更新 {filepath}: {skip_reason}")
+                return
         try:
             if os.path.getsize(filepath) > cfg.MAX_FILE_SIZE:
                 return
         except OSError:
             return
         try:
-            result = kb_ingest.update_document(filepath)
+            if existing_source:
+                result = kb_ingest.update_document(filepath, source=existing_source)
+                label = "已更新"
+            else:
+                result = kb_ingest.add_single_document(
+                    filepath, scan_dir=self._watch_root_path)
+                label = "已新增"
             first_line = result.splitlines()[0] if result else ""
-            _log(f"已更新: {filepath}\n{first_line}")
+            _log(f"{label}: {filepath}\n{first_line}")
         except Exception as e:
             _log(f"更新失败 {filepath}: {e}")
 
-    def _delete_source(self, filepath: str) -> None:
-        """按旧路径的文件名删除库中对应来源。"""
+    def _delete_source(self, filepath: str,
+                       existing_source: "str | None" = None) -> None:
+        """按库中解析出的 source 精确删除；legacy basename 来源跳过并提示。"""
         if not _is_indexable(filepath):
             return
-        source = os.path.basename(filepath)
-        if not source:
+        if existing_source is None:
+            existing_source, skip_reason = self._existing_source_for_write(filepath)
+            if skip_reason:
+                _log(f"跳过删除 {filepath}: {skip_reason}")
+                return
+        if not existing_source:
             return
         try:
-            result = kb_ingest.delete_documents(source_pattern=source)
-            first_line = result.splitlines()[0] if result else ""
-            _log(f"已删除旧索引: {source}\n{first_line}")
+            removed = kb_ingest.delete_source_exact(existing_source)
+            _log(f"已删除旧索引: {existing_source}（{removed} 行）")
         except Exception as e:
-            _log(f"删除失败 {source}: {e}")
+            _log(f"删除失败 {existing_source}: {e}")
 
     def _queue_delete(self, filepath: str) -> None:
         """删除事件入队，首个事件启动 1.5 秒批量 flush；同路径去重。"""
@@ -237,13 +319,35 @@ class _AutoIndexHandler(_FileSystemEventHandler):
             self._delete_source(path)
 
     def _handle_moved(self, src_path: str, dest_path: str) -> None:
-        # 移出监听根：旧来源仍要清理，但不得把根外文件重新索引进来
-        if _is_indexable(src_path):
-            self._delete_source(src_path)
-        if _is_indexable(dest_path) and _is_within(
+        # 只清理监听根内的旧路径；从根外移入时不得按 basename 误删库中来源
+        src_in_root = _is_indexable(src_path) and _is_within(
+            _normalize_path(src_path), self._watch_root
+        )
+        dest_in_root = _is_indexable(dest_path) and _is_within(
             _normalize_path(dest_path), self._watch_root
-        ):
-            self._reindex(dest_path)
+        )
+
+        src_source = ""
+        if src_in_root:
+            src_source, src_reason = self._existing_source_for_write(src_path)
+        else:
+            src_reason = ""
+        dest_reason = (
+            self._legacy_new_source_reason(dest_path) if dest_in_root else ""
+        )
+        skip_reason = src_reason or dest_reason
+        if skip_reason:
+            # 移动是「删旧 + 建新」两步：任一侧是 legacy basename 就整体跳过，
+            # 避免只删不建或只建不删的半完成状态。
+            _log(f"跳过移动事件 {src_path} -> {dest_path}: {skip_reason}")
+            return
+
+        if src_in_root:
+            self._delete_source(src_path, existing_source=src_source)
+        if dest_in_root:
+            # 目标按新文件处理，用监听根相对路径作 source；若同一相对 source
+            # 已存在，add_single_document 会幂等替换。
+            self._reindex(dest_path, existing_source="")
 
     # ── 事件入口 ───────────────────────────────────────────
 

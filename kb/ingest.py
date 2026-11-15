@@ -622,6 +622,16 @@ def _basename_of(value: str) -> str:
     return os.path.basename((value or "").replace("\\", "/"))
 
 
+def source_is_legacy_basename(source: str) -> bool:
+    """source 是否为旧版纯文件名（无任何目录分隔符且非空）。
+
+    旧库只保存 basename，无法从 source 反推出文件所在目录；同名文件之间
+    无法安全区分。watcher 与显式工具在处理这类来源前必须先要求人工确认。
+    """
+    value = source or ""
+    return bool(value) and "/" not in value and "\\" not in value
+
+
 def _normalized_path(value: str) -> str:
     """路径后缀比较用归一：normcase 后统一为 / 分隔。"""
     return os.path.normcase(value or "").replace("\\", "/")
@@ -700,15 +710,71 @@ def _match_existing_source(all_sources: set[str], filepath: str) -> "tuple[str, 
     return "", ""
 
 
-def _match_sources_for_delete(all_sources: set[str], pattern: str) -> set[str]:
-    """删除用来源匹配：先 normcase 精确相等，未命中且含通配符时走 fnmatch。
+def resolve_writable_source(filepath: str) -> "tuple[str, str]":
+    """只读解析 watcher 可安全自动改写的库中 source，返回 ``(source, reason)``。
 
-    不使用子串匹配；pattern 无 * ? [ 且不精确相等时不删除任何行。
+    与 update_document 的 basename 匹配不同：不含分隔符的 legacy basename
+    不参与路径后缀匹配，避免被当成任意同名文件的可更新来源。
+
+    优先级：
+    1. 整值精确匹配 → 非 legacy 时直接返回；
+    2. 唯一「含分隔符且是 filepath 路径后缀」的来源 → 返回它
+       （即使库中还有同名 legacy basename，也能安全更新相对来源）；
+    3. 仅有同名 legacy basename → 返回空 source 与人工确认提示；
+    4. 无匹配 → ``("", "")``（调用方按新文件处理）；
+       多个可写来源无法唯一判定 → 返回空 source 与歧义错误。
+    """
+    if not filepath or not kb_schema.table_exists():
+        return "", ""
+    table = kb_schema.get_or_create_table()
+    sources = kb_schema.existing_sources(table)
+    if not sources:
+        return "", ""
+
+    target_norm = os.path.normcase(filepath)
+    exact = [src for src in sources if os.path.normcase(src) == target_norm]
+    if len(exact) == 1:
+        if source_is_legacy_basename(exact[0]):
+            return "", _legacy_source_message(exact[0], filepath)
+        return exact[0], ""
+    if len(exact) > 1:
+        return "", _ambiguity_message(filepath, exact)
+
+    managed = [
+        src for src in sources
+        if not source_is_legacy_basename(src) and _path_is_suffix(filepath, src)
+    ]
+    if len(managed) == 1:
+        return managed[0], ""
+    if len(managed) > 1:
+        return "", _ambiguity_message(filepath, managed)
+
+    fname = _basename_of(filepath)
+    legacy_same = [
+        src for src in sources
+        if source_is_legacy_basename(src)
+        and os.path.normcase(_basename_of(src)) == os.path.normcase(fname)
+    ]
+    if legacy_same:
+        return "", _legacy_source_message(
+            "、".join(sorted(legacy_same)), filepath)
+    return "", ""
+
+
+def _legacy_source_message(source: str, filepath: str) -> str:
+    return f"legacy basename source，需人工确认: {source}（{filepath}）"
+
+
+def _match_sources_for_delete(all_sources: set[str], pattern: str) -> set[str]:
+    """删除用来源匹配：先 normcase 精确相等，未命中且含 * ? 时走 fnmatch。
+
+    不使用子串匹配；`[` 不是通配符（避免 ``a[1].md`` 误匹配 ``a1.md``）。
+    pattern 无 * ? 且不精确相等时不删除任何行。
     fnmatch 保持原有平台语义（Windows 下不区分大小写）。
     """
     target = os.path.normcase(pattern)
     matched = {src for src in all_sources if os.path.normcase(src) == target}
-    if not matched and any(ch in pattern for ch in "*?["):
+    if not matched and any(ch in pattern for ch in "*?"):
         matched = {src for src in all_sources if fnmatch.fnmatch(src, pattern)}
     return matched
 
@@ -761,6 +827,30 @@ def _delete_source_exact(table, source: str) -> int:
     return int(table.delete(where).num_deleted_rows)
 
 
+def delete_source_exact(source: str, allow_last: bool = True) -> int:
+    """按 source 精确删除并返回删除行数（内部入口，不走通配/confirm_all）。
+
+    - 只删除 ``source`` 完全相等的行，不做 fnmatch、后缀或 basename 匹配；
+    - 不受 delete_documents 的「匹配全部来源需 confirm_all」保护，默认
+      允许删除库中最后一个 source（watcher 清理已删除文件）；
+    - ``allow_last=False`` 时，若库中仅剩这一个来源则拒绝删除并返回 0，
+      供需要保留非空知识库的显式工具使用。
+    """
+    if not source:
+        return 0
+    with _write_lock:
+        if not kb_schema.table_exists():
+            return 0
+        table = kb_schema.get_or_create_table()
+        if not allow_last and len(kb_schema.existing_sources(table)) <= 1:
+            return 0
+        deleted = _delete_source_exact(table, source)
+        if deleted:
+            kb_schema.fold_new_rows(table)
+            kb_schema.update_db_readme()
+        return deleted
+
+
 def scan_files(scan_dir: str) -> List[str]:
     """按扩展名扫描目录（跳过排除目录与超限文件）。"""
     filepaths = []
@@ -784,55 +874,58 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     """扫描目录并增量入库。progress: optional callable(done_files, total_files)。
 
     export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
+    「检查已有来源 → 写入新行 → 更新索引」整段持有模块级写锁；reindex_all 的
+    drop 也在锁内，避免与 watcher 的更新/删除交错。
     """
     if not os.path.isdir(scan_dir):
         return f"❌ 目录不存在: {scan_dir}"
 
-    table = kb_schema.get_or_create_table()
-    existing = kb_schema.existing_sources(table) if not reindex_all else set()
-
-    if reindex_all:
-        db = kb_schema.get_db()
-        db.drop_table(cfg.TABLE_NAME)
+    with _write_lock:
         table = kb_schema.get_or_create_table()
+        existing = kb_schema.existing_sources(table) if not reindex_all else set()
 
-    filepaths = scan_files(scan_dir)
-    new_files = [
-        fp for fp in filepaths
-        if os.path.relpath(fp, scan_dir) not in existing
-    ]
-    if not new_files:
-        msg = f"扫描「{scan_dir}」，共 {len(filepaths)} 个文件，没有新文件需要添加。"
-        if existing:
-            msg += f"（已有 {len(existing)} 个文件在库中）"
-        return msg
+        if reindex_all:
+            db = kb_schema.get_db()
+            db.drop_table(cfg.TABLE_NAME)
+            table = kb_schema.get_or_create_table()
 
-    all_chunks: List[Dict] = []
-    skipped: List[str] = []
-    source_filepaths: Dict[str, str] = {}
-    for done, fp in enumerate(new_files, 1):
-        text, is_md = extract_content(fp, export_markdown_dir=export_markdown_dir)
-        if not text or len(text) < 20:
-            skipped.append(os.path.basename(fp))
-            continue
-        rel_path = os.path.relpath(fp, scan_dir)
-        source_filepaths[rel_path] = fp
-        chunks = chunk_text(text, rel_path, is_md)
-        for ch in chunks:
-            ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
-            ch["ingested_at"] = datetime_now_iso()
-        all_chunks.extend(chunks)
-        if progress:
-            progress(done, len(new_files))
+        filepaths = scan_files(scan_dir)
+        new_files = [
+            fp for fp in filepaths
+            if os.path.relpath(fp, scan_dir) not in existing
+        ]
+        if not new_files:
+            msg = f"扫描「{scan_dir}」，共 {len(filepaths)} 个文件，没有新文件需要添加。"
+            if existing:
+                msg += f"（已有 {len(existing)} 个文件在库中）"
+            return msg
 
-    if not all_chunks:
-        return "扫描完成，但没有提取到有效文本内容。"
+        all_chunks: List[Dict] = []
+        skipped: List[str] = []
+        source_filepaths: Dict[str, str] = {}
+        for done, fp in enumerate(new_files, 1):
+            text, is_md = extract_content(fp, export_markdown_dir=export_markdown_dir)
+            if not text or len(text) < 20:
+                skipped.append(os.path.basename(fp))
+                continue
+            rel_path = os.path.relpath(fp, scan_dir)
+            source_filepaths[rel_path] = fp
+            chunks = chunk_text(text, rel_path, is_md)
+            for ch in chunks:
+                ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
+                ch["ingested_at"] = datetime_now_iso()
+            all_chunks.extend(chunks)
+            if progress:
+                progress(done, len(new_files))
 
-    added = add_chunks(table, all_chunks)
-    kb_schema.ensure_vector_index(table)
-    kb_schema.ensure_fts_index(table)
-    kb_schema.fold_new_rows(table)
-    kb_schema.update_db_readme()
+        if not all_chunks:
+            return "扫描完成，但没有提取到有效文本内容。"
+
+        added = add_chunks(table, all_chunks)
+        kb_schema.ensure_vector_index(table)
+        kb_schema.ensure_fts_index(table)
+        kb_schema.fold_new_rows(table)
+        kb_schema.update_db_readme()
 
     chunks_by_source: Dict[str, List[Dict]] = {}
     for chunk in all_chunks:
@@ -870,9 +963,10 @@ def add_single_document(filepath: str, scan_dir: str = "",
                         export_markdown_dir: str = "") -> str:
     """向量化单个文档；先成功写入新行，再清理该 source 的旧行。
 
-    source 为 scan_dir 下的相对路径时按其幂等替换旧版本；未传 scan_dir
-    （或文件不在其中）时 source 退化为 basename，若库中已有同名 source
-    则拒绝覆盖，避免两个目录下的同名文件静默互相替换。
+    source 为 scan_dir 下的相对路径时按其幂等替换旧版本。只要最终 source
+    是纯 basename（未传 scan_dir，或文件直接位于 scan_dir 根目录），且库中
+    已有同名 source，就拒绝覆盖：basename 无法唯一确定原文件，静默替换会
+    误伤其他目录下的同名文档。
 
     export_markdown_dir 非空时，PDF 的 MinerU 转换产物（md + 图片）同步导出到该目录。
     """
@@ -885,12 +979,10 @@ def add_single_document(filepath: str, scan_dir: str = "",
         return f"[ERROR] 文件过大: {os.path.getsize(filepath) / 1024 / 1024:.1f}MB"
 
     source = os.path.basename(filepath)
-    source_is_relative = False
     if scan_dir and os.path.isdir(scan_dir):
         rel = os.path.relpath(filepath, scan_dir)
         if not rel.startswith(".." + os.sep) and rel != "..":
             source = rel
-            source_is_relative = True
 
     text, is_md = extract_content(filepath, export_markdown_dir=export_markdown_dir)
     if not text or len(text) < 20:
@@ -905,13 +997,13 @@ def add_single_document(filepath: str, scan_dir: str = "",
 
     with _write_lock:
         table = kb_schema.get_or_create_table()
-        if not source_is_relative:
+        if source_is_legacy_basename(source):
             existing = kb_schema.existing_sources(table)
             if any(os.path.normcase(src) == os.path.normcase(source) for src in existing):
                 return (
                     f"[ERROR] 来源「{source}」已存在于知识库，未执行覆盖。"
-                    "请传入包含该文件的 scan_dir（以相对路径区分同名文件），"
-                    "或使用 update_document 更新已有文档。"
+                    "basename 来源无法唯一确定对应文件；请把文件放到 scan_dir 的"
+                    "子目录中按相对路径入库，或使用 update_document 更新已有文档。"
                 )
 
         old_doc_ids = _source_doc_ids(table, source)
@@ -944,8 +1036,12 @@ def add_single_document(filepath: str, scan_dir: str = "",
     )
 
 
-def update_document(filepath: str) -> str:
-    """更新文档：按完整路径唯一匹配已有 source，写入新行后再清理旧行。
+def update_document(filepath: str, source: str = "") -> str:
+    """更新文档：默认按完整路径唯一匹配已有 source，写入新行后再清理旧行。
+
+    ``source`` 非空时按该来源精确更新（供 watcher 使用已解析出的目标），
+    跳过再次 basename 匹配，避免同名 legacy 来源造成歧义；该 source 必须
+    是 filepath 的完整路径后缀。legacy basename 仍需人工确认，拒绝更新。
 
     同名 basename 匹配到多个 source 且无法用路径后缀判定唯一时返回
     [ERROR] 并列出候选，不执行任何删除/写入。
@@ -963,8 +1059,21 @@ def update_document(filepath: str) -> str:
 
     with _write_lock:
         table = kb_schema.get_or_create_table()
-        matched_source, error = _match_existing_source(
-            kb_schema.existing_sources(table), filepath)
+        if source:
+            if source_is_legacy_basename(source):
+                return (
+                    f"[ERROR] legacy basename source，需人工确认: {source}"
+                    f"（{filepath}）"
+                )
+            if not _path_is_suffix(filepath, source):
+                return (
+                    f"[ERROR] source「{source}」不是文件「{filepath}」的路径后缀，"
+                    "未执行更新。"
+                )
+            matched_source, error = source, ""
+        else:
+            matched_source, error = _match_existing_source(
+                kb_schema.existing_sources(table), filepath)
         if error:
             return error
 
@@ -1009,7 +1118,7 @@ def update_document(filepath: str) -> str:
 
 def delete_documents(source_pattern: str = "",
                      confirm_all: bool = False) -> str:
-    """按来源精确匹配删除（支持 * ? [ 通配），或 confirm_all=True 清空整个知识库。
+    """按来源精确匹配删除（支持 * ? 通配），或 confirm_all=True 清空整个知识库。
 
     匹配集合若覆盖全部 distinct source，必须显式 confirm_all=True，
     避免用 "*" 等通配绕过清空确认。
