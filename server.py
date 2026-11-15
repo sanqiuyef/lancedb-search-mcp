@@ -12,6 +12,7 @@
 自建模块（待后期单独优化，文件头有标记）：kb_web（网页入库）/ kb_watcher（目录监听）。
 """
 
+import json
 import os
 from typing import Annotated
 
@@ -402,6 +403,265 @@ def ingest_images(
         return kb_img.ingest_images(scan_dir=scan_dir, rebuild=rebuild)
     except Exception as error:
         return f"❌ 图像入库失败: {error}"
+
+
+# =============================================================
+# Wiki V1（默认关闭）：WIKI_ENABLED=1 时追加 14 个工具
+# =============================================================
+
+if os.environ.get("WIKI_ENABLED", "0") == "1":
+    from kb.wiki import service as wiki_service
+
+    def _wiki_json(payload) -> str:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _wiki_dispatch(func, *args, **kwargs) -> str:
+        try:
+            return _wiki_json(func(*args, **kwargs))
+        except Exception as error:  # 不把异常抛到 MCP 层
+            return _wiki_json({"ok": False, "error": str(error)})
+
+    def _wiki_list(value: str) -> list[str]:
+        """逗号/顿号/分号分隔字符串 → 去空去重列表。"""
+        if not isinstance(value, str):
+            return []
+        text = value
+        for separator in ("，", "；", "、", ";"):
+            text = text.replace(separator, ",")
+        result: list[str] = []
+        for item in text.split(","):
+            cleaned = item.strip()
+            if cleaned and cleaned not in result:
+                result.append(cleaned)
+        return result
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_status",
+        description="查看 Wiki 配置（脱敏）、DB 版本、业务表计数、页面/提案/任务统计、页面索引状态与未收敛 journal。",
+    )
+    def wiki_status() -> str:
+        return _wiki_dispatch(wiki_service.status)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_search",
+        description="Wiki 统一检索：page（页面索引）/ evidence（知识库证据）/ hybrid（两者）/ related（图谱邻域）。",
+    )
+    def wiki_search(
+        query: Annotated[str, "检索词或问题"],
+        mode: Annotated[str, "检索模式 - page / evidence / hybrid / related"] = "page",
+        limit: Annotated[int, "返回条数（1-100）"] = 10,
+        page_type: Annotated[str, "页面类型过滤 - concept / entity / topic"] = "",
+        tags: Annotated[str, "标签过滤（逗号分隔）"] = "",
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.search,
+            query,
+            mode=mode,
+            limit=limit,
+            page_type=page_type,
+            tags=_wiki_list(tags),
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_get_page",
+        description="读取 Wiki 页面全文、当前修订、出链/反链与证据摘要（page_id 或 slug）。",
+    )
+    def wiki_get_page(
+        page_id_or_slug: Annotated[str, "page_id 或 slug"],
+        include_sources: Annotated[bool, "是否包含来源/证据摘要"] = True,
+        include_backlinks: Annotated[bool, "是否包含反链"] = True,
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.get_page,
+            page_id_or_slug,
+            include_sources=include_sources,
+            include_backlinks=include_backlinks,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_list_pages",
+        description="分页列出 Wiki 页面（按 updated_at 倒序），返回条目与 next_cursor。",
+    )
+    def wiki_list_pages(
+        page_type: Annotated[str, "页面类型 - concept / entity / topic（留空不过滤）"] = "",
+        status: Annotated[str, "页面状态 - draft/review/published/archived（留空不过滤）"] = "published",
+        limit: Annotated[int, "每页条数（1-200）"] = 50,
+        cursor: Annotated[str, "上一页返回的 next_cursor"] = "",
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.list_pages,
+            page_type=page_type,
+            status=status,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_get_related",
+        description="从页面或实体出发，BFS 返回 1-2 跳的页面链接与关系邻域实体。",
+    )
+    def wiki_get_related(
+        page_id: Annotated[str, "起始 page_id（与 entity_id 至少一个）"] = "",
+        entity_id: Annotated[str, "起始 entity_id（与 page_id 至少一个）"] = "",
+        depth: Annotated[int, "跳数 - 1 或 2"] = 1,
+        limit: Annotated[int, "最多返回条数（1-200）"] = 30,
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.get_related,
+            page_id=page_id,
+            entity_id=entity_id,
+            depth=depth,
+            limit=limit,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_get_evidence",
+        description="按 claim_id 查看证据链与来源，或按 chunk_id 查看 evidence_bundle。",
+    )
+    def wiki_get_evidence(
+        claim_id: Annotated[str, "claim_id（与 chunk_id 至少一个）"] = "",
+        chunk_id: Annotated[str, "chunk_id（与 claim_id 至少一个）"] = "",
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.get_evidence, claim_id=claim_id, chunk_id=chunk_id
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_search_evidence",
+        description="直接检索知识库原始切片证据（透传 kb.search），结果标注 score_source=rag。",
+    )
+    def wiki_search_evidence(
+        query: Annotated[str, "检索词或问题"],
+        limit: Annotated[int, "返回条数（1-20）"] = 5,
+        source_filter: Annotated[str, "来源过滤（文件名或目录片段）"] = "",
+        category_filter: Annotated[str, "类别过滤（如 paper/code）"] = "",
+        search_mode: Annotated[str, "搜索模式 - vector / text / hybrid"] = "hybrid",
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.search_evidence,
+            query,
+            limit=limit,
+            source_filter=source_filter,
+            category_filter=category_filter,
+            search_mode=search_mode,
+        )
+
+    @mcp.tool(
+        name="wiki_create_page",
+        description="创建 Wiki 草稿页面（只接受 concept/entity/topic，status=draft，不发布）。",
+    )
+    def wiki_create_page(
+        title: Annotated[str, "页面标题"],
+        page_type: Annotated[str, "页面类型 - concept / entity / topic"],
+        content_md: Annotated[str, "Markdown 正文"],
+        slug: Annotated[str, "可选 slug（留空自动生成）"] = "",
+        aliases: Annotated[str, "别名（逗号分隔）"] = "",
+        tags: Annotated[str, "标签（逗号分隔）"] = "",
+        summary: Annotated[str, "摘要（留空自动从正文提取）"] = "",
+        sources: Annotated[str, "来源（逗号分隔）"] = "",
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.create_page,
+            title,
+            page_type,
+            content_md,
+            slug=slug,
+            aliases=_wiki_list(aliases),
+            tags=_wiki_list(tags),
+            summary=summary,
+            sources=_wiki_list(sources),
+        )
+
+    @mcp.tool(
+        name="wiki_propose_update",
+        description="为已有页面创建 update_page 提案（写 draft/diff，不改页面、不发布）。",
+    )
+    def wiki_propose_update(
+        page_id: Annotated[str, "目标页面 page_id"],
+        proposed_content_md: Annotated[str, "提议的新内容（完整文档或仅正文）"],
+        rationale: Annotated[str, "修改理由"],
+        expected_revision_id: Annotated[str, "基于的当前 revision_id（用于冲突检测）"],
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.propose_update,
+            page_id,
+            proposed_content_md,
+            rationale,
+            expected_revision_id,
+        )
+
+    @mcp.tool(
+        name="wiki_submit_extraction",
+        description="提交 Agent 抽取结果（实体/断言/关系/页面建议），服务端校验并落库；不直接发布页面。",
+    )
+    def wiki_submit_extraction(
+        payload_json: Annotated[str, "ExtractionPayload JSON 字符串（见 agent-extraction-contract.md）"],
+    ) -> str:
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError) as error:
+            return _wiki_json(
+                {"ok": False, "error": f"payload_json 不是合法 JSON: {error}"}
+            )
+        if not isinstance(payload, dict):
+            return _wiki_json({"ok": False, "error": "payload_json 必须是 JSON 对象"})
+        return _wiki_dispatch(wiki_service.submit_extraction, payload)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_get_proposal",
+        description="查看提案全文、diff、payload 与目标页当前 revision。",
+    )
+    def wiki_get_proposal(
+        proposal_id: Annotated[str, "提案 ID"],
+    ) -> str:
+        return _wiki_dispatch(wiki_service.get_proposal, proposal_id)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_review_queue",
+        description="列出指定状态的提案审核队列（默认 pending）。",
+    )
+    def wiki_review_queue(
+        status: Annotated[str, "提案状态 - pending/rejected/stale/approved/applied/cancelled"] = "pending",
+        limit: Annotated[int, "最多返回条数（1-200）"] = 20,
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.review_queue, status=status, limit=limit
+        )
+
+    @mcp.tool(
+        name="wiki_apply_proposal",
+        description="审核提案：approve 写入页面并刷新导航/索引；reject 不改页面。",
+    )
+    def wiki_apply_proposal(
+        proposal_id: Annotated[str, "提案 ID"],
+        decision: Annotated[str, "approve 或 reject"] = "approve",
+        review_note: Annotated[str, "审核备注"] = "",
+    ) -> str:
+        return _wiki_dispatch(
+            wiki_service.apply_proposal,
+            proposal_id,
+            decision=decision,
+            review_note=review_note,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True),
+        name="wiki_validate",
+        description="运行 Wiki 一致性校验并返回分组问题与未收敛 journal（scope: all/pages/links/claims/documents/entities/relations/journal）。",
+    )
+    def wiki_validate(
+        scope: Annotated[str, "校验范围"] = "all",
+    ) -> str:
+        return _wiki_dispatch(wiki_service.validate, scope=scope)
 
 
 if __name__ == "__main__":
