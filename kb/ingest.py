@@ -12,6 +12,7 @@ OCR 链（云 MinerU → 本地 Tesseract）。
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import re
 import sys
@@ -29,6 +30,166 @@ def datetime_now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# =============================================================
+# Wiki 登记钩子（可选，失败不影响入库）
+# =============================================================
+
+_WIKI_TRUE_VALUES = {"1", "true", "yes", "on"}
+_WIKI_PARSER_NAME = "kb_ingest"
+_WIKI_WEB_PARSER_NAME = "kb.web"
+_WIKI_PARSER_VERSION = "1"
+
+
+def _wiki_enabled() -> bool:
+    return os.environ.get("WIKI_ENABLED", "").strip().lower() in _WIKI_TRUE_VALUES
+
+
+def _file_sha256(filepath: str) -> str:
+    digest = hashlib.sha256()
+    with open(filepath, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _wiki_parser_config_sha256() -> str:
+    raw = f"{cfg.CHUNK_SIZE}\x00{cfg.CHUNK_OVERLAP}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _is_web_source(value: str) -> bool:
+    return (value or "").strip().lower().startswith(("http://", "https://"))
+
+
+def _register_wiki_safely(source: str, filepath: str, chunks: List[Dict],
+                          category: str = "") -> "str | None":
+    """成功入库后把 source/修订/切片引用登记进 Wiki SQLite。
+
+    仅当 ``WIKI_ENABLED=1`` 且 Wiki 模块可导入时执行；任何异常只写 stderr，
+    不改变入库返回值与统计。返回 document_id（未启用/失败时为 None）。
+    """
+    if not _wiki_enabled() or not chunks:
+        return None
+    try:
+        return _register_wiki(source, filepath, chunks, category)
+    except Exception as exc:  # 登记失败绝不影响入库结果
+        print(f"[wiki] 登记失败（已忽略）: {source}: {exc}", file=sys.stderr)
+        _record_wiki_failure(source, filepath, exc)
+        return None
+
+
+def _register_wiki(source: str, filepath: str, chunks: List[Dict],
+                   category: str = "") -> str:
+    from .wiki import config as wiki_config
+    from .wiki import db as wiki_db
+    from .wiki import document_registry as registry
+    from .wiki.ids import content_sha256
+
+    config = wiki_config.WikiConfig.from_env()
+    config.require_enabled()
+    conn = wiki_db.connect(config.db_path, config)
+    try:
+        wiki_db.run_migrations(conn)
+
+        is_web = _is_web_source(filepath)
+        if is_web:
+            source_type = "web"
+            canonical_uri = registry.canonical_web_source(filepath)
+            parser_name = _WIKI_WEB_PARSER_NAME
+        else:
+            source_type = "file"
+            canonical_uri = registry.canonical_local_source(source)
+            parser_name = _WIKI_PARSER_NAME
+
+        display_name = os.path.basename(source.replace("\\", "/")) or source
+        if not category:
+            category = next(
+                (str(ch.get("category", "")) for ch in chunks if ch.get("category")),
+                "",
+            )
+        descriptor = registry.SourceDescriptor(
+            source_type=source_type,
+            canonical_uri=canonical_uri,
+            display_name=display_name,
+            category=category,
+            source_path=str(filepath),
+        )
+
+        raw_sha256 = (
+            _file_sha256(filepath)
+            if os.path.isfile(filepath)
+            else content_sha256(str(filepath))
+        )
+        parsed_sha256 = content_sha256(
+            "\n\n".join(str(ch.get("text", "")) for ch in chunks)
+        )
+        revision_input = registry.RevisionInput(
+            raw_sha256=raw_sha256,
+            parsed_sha256=parsed_sha256,
+            parser_name=parser_name,
+            parser_version=_WIKI_PARSER_VERSION,
+            parser_config_sha256=_wiki_parser_config_sha256(),
+            source_path=str(filepath),
+        )
+        descriptors = []
+        for index, chunk in enumerate(chunks):
+            descriptors.append(
+                registry.ChunkDescriptor.from_text(
+                    int(chunk.get("chunk_index", index)),
+                    str(chunk.get("text", "")),
+                    legacy_doc_id=str(chunk.get("doc_id", "")),
+                    source_value=str(chunk.get("source", source)),
+                    section_path=str(chunk.get("section_path", "")),
+                    page_number=chunk.get("page_number"),
+                )
+            )
+
+        with wiki_db.transaction(conn):
+            document_id = registry.register_source(conn, descriptor)
+            handle = registry.begin_revision(conn, document_id, revision_input)
+            registry.register_chunk_refs(conn, handle.revision_id, descriptors)
+            registry.complete_revision(
+                conn,
+                handle.revision_id,
+                len(chunks),
+                parsed_sha256=parsed_sha256,
+            )
+        return document_id
+    finally:
+        conn.close()
+
+
+def _record_wiki_failure(source: str, filepath: str, error: BaseException) -> None:
+    """登记失败时尽量写一条 wiki_jobs；DB 不可用则只记日志。"""
+    try:
+        import json
+
+        from .wiki import config as wiki_config
+        from .wiki import db as wiki_db
+        from .wiki.ids import new_ulid
+
+        config = wiki_config.WikiConfig.from_env()
+        conn = wiki_db.connect(config.db_path, config)
+        try:
+            wiki_db.run_migrations(conn)
+            now = datetime_now_iso()
+            payload = json.dumps(
+                {"source": source, "filepath": str(filepath)}, ensure_ascii=False
+            )
+            with wiki_db.transaction(conn):
+                conn.execute(
+                    "INSERT INTO wiki_jobs "
+                    "(job_id, job_type, status, payload_json, error_message, "
+                    " attempts, created_at, updated_at, finished_at) "
+                    "VALUES (?, 'ingest_registration', 'failed', ?, ?, 1, ?, ?, ?)",
+                    (new_ulid(), payload, str(error)[:2000], now, now, now),
+                )
+        finally:
+            conn.close()
+    except Exception as record_error:
+        print(f"[wiki] 失败任务也无法写入 wiki_jobs: {record_error}", file=sys.stderr)
 
 
 # =============================================================
@@ -648,12 +809,14 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
 
     all_chunks: List[Dict] = []
     skipped: List[str] = []
+    source_filepaths: Dict[str, str] = {}
     for done, fp in enumerate(new_files, 1):
         text, is_md = extract_content(fp, export_markdown_dir=export_markdown_dir)
         if not text or len(text) < 20:
             skipped.append(os.path.basename(fp))
             continue
         rel_path = os.path.relpath(fp, scan_dir)
+        source_filepaths[rel_path] = fp
         chunks = chunk_text(text, rel_path, is_md)
         for ch in chunks:
             ch["doc_id"] = kb_schema.chunk_doc_id(ch["text"], ch["source"], ch["chunk_index"])
@@ -670,6 +833,19 @@ def add_documents(scan_dir: str, reindex_all: bool = False,
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
     kb_schema.update_db_readme()
+
+    chunks_by_source: Dict[str, List[Dict]] = {}
+    for chunk in all_chunks:
+        chunks_by_source.setdefault(str(chunk.get("source", "")), []).append(chunk)
+    for batch_source, batch_chunks in chunks_by_source.items():
+        if not batch_source:
+            continue
+        _register_wiki_safely(
+            batch_source,
+            source_filepaths.get(batch_source, batch_source),
+            batch_chunks,
+            str(batch_chunks[0].get("category", "")) if batch_chunks else "",
+        )
 
     extra = f"（跳过 {len(existing)} 个已有文件）" if existing and not reindex_all else ""
     if export_markdown_dir:
@@ -751,6 +927,13 @@ def add_single_document(filepath: str, scan_dir: str = "",
         kb_schema.fold_new_rows(table)
         kb_schema.update_db_readme()
 
+    _register_wiki_safely(
+        source,
+        filepath,
+        chunks,
+        str(chunks[0].get("category", "")) if chunks else "",
+    )
+
     extra = f"\nMarkdown 导出: {export_markdown_dir}" if export_markdown_dir else ""
     return (
         f"✅ 文档已入库!\n"
@@ -807,6 +990,13 @@ def update_document(filepath: str) -> str:
         kb_schema.ensure_fts_index(table)
         kb_schema.fold_new_rows(table)
         kb_schema.update_db_readme()
+
+    _register_wiki_safely(
+        source,
+        filepath,
+        chunks,
+        str(chunks[0].get("category", "")) if chunks else "",
+    )
 
     return (
         f"✅ 文档已更新!\n"

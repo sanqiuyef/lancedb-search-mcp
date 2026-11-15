@@ -172,6 +172,12 @@ def ingest_url(url: str) -> str:
     kb_schema.ensure_fts_index(table)
     kb_schema.fold_new_rows(table)
     kb_schema.update_db_readme()
+    kb_ingest._register_wiki_safely(
+        source,
+        canonical,
+        chunks,
+        str(chunks[0].get("category", "")) if chunks else "",
+    )
     return (
         f"✅ **网页已索引**\n{'─' * 40}\n"
         f"标题: {title}\nURL: {url}\n"
