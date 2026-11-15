@@ -125,11 +125,47 @@ class KBEndToEnd(unittest.TestCase):
         kb_schema.reset_db()
 
     def test_delete_and_row_count(self):
-        kb_ingest.delete_documents("flood.md")
+        kb_ingest.delete_documents("doc/flood.md")
         self.assertEqual(kb_schema.row_count(), 2)
         fresh = kb_schema.get_or_create_table()  # 重开表避免旧对象缓存
         sources = kb_schema.existing_sources(fresh)
         self.assertNotIn("doc/flood.md", sources)
+
+
+class TestDedupeByDocId(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        activate_fake_embedding()
+        cls.db_path = temp_db_env()
+        cls.table = kb_schema.get_or_create_table()
+        chunks = [
+            {"text": "first", "source": "s1", "chunk_index": 0, "doc_id": "dup"},
+            {"text": "second", "source": "s1", "chunk_index": 1, "doc_id": "dup"},
+            {"text": "unique", "source": "s2", "chunk_index": 0, "doc_id": "uniq"},
+            {"text": "third", "source": "s1", "chunk_index": 2, "doc_id": "dup"},
+            {"text": "legacy-1", "source": "s3", "chunk_index": 0, "doc_id": ""},
+            {"text": "legacy-2", "source": "s4", "chunk_index": 0, "doc_id": ""},
+        ]
+        # 绕过 add_chunks 的批内去重，直接写入重复行
+        rows = kb_ingest._rows_with_vectors(kb_ingest._rows_from_chunks(chunks))
+        cls.table.add(rows)
+        cls.removed = kb_schema.dedupe_by_doc_id(cls.table)
+
+    def test_removed_count(self):
+        self.assertEqual(self.removed, 2)
+
+    def test_keeps_first_row_per_doc_id(self):
+        arrow = self.table.to_lance().to_table(columns=["doc_id", "text"])
+        pairs = list(zip(
+            arrow.column("doc_id").to_pylist(),
+            arrow.column("text").to_pylist(),
+        ))
+        self.assertEqual([text for doc_id, text in pairs if doc_id == "dup"],
+                         ["first"])
+        self.assertIn(("uniq", "unique"), pairs)
+        # 空 doc_id（历史数据）不参与去重
+        self.assertEqual([text for doc_id, text in pairs if doc_id == ""],
+                         ["legacy-1", "legacy-2"])
 
 
 if __name__ == "__main__":

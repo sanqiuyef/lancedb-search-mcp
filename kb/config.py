@@ -51,6 +51,7 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 
 # ── 分块 ──
 CHUNK_SIZE = 800
+# 实际重叠字符数（上限为 CHUNK_SIZE // 2）；0 表示不重叠
 CHUNK_OVERLAP = 100
 
 # ── 扫描 PDF OCR 回退（默认关闭） ──

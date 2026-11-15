@@ -147,27 +147,33 @@ def fold_new_rows(table) -> None:
 
 
 def dedupe_by_doc_id(table) -> int:
-    """按 doc_id（内容指纹：source+chunk_index+text）去重，保留首次出现。
+    """按 doc_id（内容指纹：source+chunk_index+text）去重，每组保留首条。
 
-    用于清理中断/重跑批量入库留下的重复行；返回删除行数。
+    只删除同组中后续的重复行（按 Lance _rowid 精确定位），空 doc_id 的
+    历史行不参与去重。用于清理中断/重跑批量入库留下的重复行；返回删除行数。
     """
-    arrow = table.to_lance().to_table(columns=["doc_id"])
+    arrow = table.to_lance().to_table(columns=["doc_id"], with_row_id=True)
     ids = arrow.column("doc_id").to_pylist()
+    row_ids = arrow.column("_rowid").to_pylist()
     seen: set = set()
-    dups: list = []
-    for v in ids:
-        key = v or ""
+    duplicate_row_ids: list = []
+    for doc_id, row_id in zip(ids, row_ids):
+        key = doc_id or ""
+        if not key:
+            continue
         if key in seen:
-            dups.append(key)
+            duplicate_row_ids.append(int(row_id))
         else:
             seen.add(key)
-    dups = [d for d in dict.fromkeys(dups) if d]
+
     removed = 0
-    for i in range(0, len(dups), 500):
-        chunk_keys = dups[i:i + 500]
+    for i in range(0, len(duplicate_row_ids), 500):
+        chunk_ids = duplicate_row_ids[i:i + 500]
+        where = "_rowid IN (" + ",".join(str(x) for x in chunk_ids) + ")"
         before = len(table)
-        table.delete("doc_id IN (" + ",".join(f"'{k}'" for k in chunk_keys) + ")")
-        removed += before - len(table)
+        result = table.delete(where)
+        deleted = getattr(result, "num_deleted_rows", None)
+        removed += deleted if deleted is not None else before - len(table)
     if removed:
         print(f"[schema] 按 doc_id 去重删除 {removed} 行", file=sys.stderr)
     return removed
